@@ -486,6 +486,10 @@ class SettingsWindow(QDialog):
     # GUI thread by Qt's queued connection, so the bar/summary update live.
     jopt_progress = pyqtSignal(int, str)
     jopt_done = pyqtSignal(bool, str, str)
+    # Camera discovery runs on a worker thread — a cold DirectShow open costs
+    # 8-20 s and four of them used to freeze the HUD when Settings first
+    # opened. The signal marshals the found indexes back to the GUI thread.
+    camera_scan_found = pyqtSignal(list)
 
     def __init__(self, config_path: str | Path | None = None, parent=None):
         super().__init__(parent)
@@ -5008,24 +5012,62 @@ class SettingsWindow(QDialog):
         lay.addStretch(1)
         self.tabs.addTab(scroll, "3D")
 
-    def _scan_camera_indexes(self) -> list[int]:
-        """Probe short-lived opens so the picker shows only live sources, and
-        always expose 0/1 (built-in webcam / OBS virtual camera convention)."""
-        idxs: list[int] = []
+    def _scan_camera_indexes_quick(self) -> None:
+        """Probe camera indexes on a WORKER thread; results arrive by signal.
+
+        A cold DirectShow open costs 8-20 s (the HUD's own note), and the old
+        synchronous scan ran four of them inside ``_build_video_tab`` with the
+        full 12-frame warm-up each — opening Settings froze the whole HUD.
+        Probes use the short (2-read) variant; ``camera_scan_found`` marshals
+        the answer back onto the GUI thread, and ``_on_camera_scan_found``
+        only ever ADDS entries to the picker.
+        """
+        def _work():
+            idxs: list[int] = []
+            try:
+                from vision.camera import probe_camera
+                for i in range(4):
+                    try:
+                        if probe_camera(i, quick=True):
+                            idxs.append(i)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self.camera_scan_found.emit(idxs)
+            except Exception:
+                pass
+
+        import threading as _threading
         try:
-            from vision.camera import probe_camera
-            for i in range(4):
-                try:
-                    if probe_camera(i):
-                        idxs.append(i)
-                except Exception:
-                    pass
+            _threading.Thread(target=_work, name="settings-camera-scan",
+                              daemon=True).start()
         except Exception:
             pass
-        for fallback in (0, 1):
-            if fallback not in idxs:
-                idxs.append(fallback)
-        return idxs
+
+    def _on_camera_scan_found(self, idxs) -> None:
+        """Add any newly discovered devices to the picker (GUI thread only)."""
+        try:
+            combo = getattr(self, "camera_source", None)
+            if combo is None:
+                return
+            existing = {str(combo.itemData(i)) for i in range(combo.count())}
+            selected = str(combo.currentData())
+            added = False
+            for raw in sorted({int(i) for i in (idxs or []) if str(i).lstrip("-").isdigit()}):
+                if str(raw) not in existing:
+                    tag = "OBS VIRTUAL CAMERA" if raw == 1 else "WEBCAM" if raw == 0 else f"DEVICE {raw}"
+                    combo.addItem(f"{tag} (INDEX {raw})", str(raw))
+                    added = True
+            if added:
+                # A late arrival must not steal a selection the user (or the
+                # saved config) already made.
+                i = combo.findData(selected)
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+        except Exception:
+            pass
 
     def _build_video_tab(self):
         page, lay, scroll = self._scroll_tab()
@@ -5039,7 +5081,14 @@ class SettingsWindow(QDialog):
         self.camera_source = QComboBox()
         self.camera_source.setMinimumWidth(250)
         current = str((self._data or {}).get("camera_index", "auto"))
-        found = self._scan_camera_indexes()
+        # Built instantly with the always-present sources (index 0 = built-in
+        # webcam, 1 = OBS virtual camera convention) plus the configured one.
+        # Probing real devices happens on a worker thread — see
+        # _scan_camera_indexes_quick: four cold DirectShow opens on the GUI
+        # thread used to freeze the whole HUD when Settings was first opened.
+        found = [0, 1]
+        if str(current).lstrip("-").isdigit() and int(current) not in found:
+            found.append(int(current))
         source_labels = [("auto", "AUTO DETECT")]
         for idx in found:
             tag = "OBS VIRTUAL CAMERA" if idx == 1 else "WEBCAM" if idx == 0 else "CAMERA"
@@ -5054,6 +5103,10 @@ class SettingsWindow(QDialog):
         elif str(current).lstrip("-").isdigit():
             self.camera_source.addItem(f"CAMERA (INDEX {current})", str(current))
             self.camera_source.setCurrentIndex(self.camera_source.count() - 1)
+        if not getattr(self, "_camera_scan_connected", False):
+            self.camera_scan_found.connect(self._on_camera_scan_found)
+            self._camera_scan_connected = True
+        self._scan_camera_indexes_quick()
         cam_form.addRow("Video source", self.camera_source)
         src_hint = QLabel("Choose the live camera for vision and the webcam button. "
                           "Index 0 is the built-in webcam; authors using OBS should "

@@ -379,7 +379,22 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         if not new_name:
             return "No new name provided."
 
+        # new_name arrives from model output. A rename is a rename: reject
+        # anything that is not a plain file name. On Windows an ABSOLUTE
+        # operand makes `parent / new_name` REPLACE the base entirely, and a
+        # bare ".." or "sub/name" would silently MOVE the file — either could
+        # step outside the folder (and the safe roots) with no move consent.
+        if (
+            new_name in (".", "..")
+            or Path(new_name).is_absolute()
+            or "/" in new_name
+            or "\\" in new_name
+        ):
+            return (f"Access denied: '{new_name}' is not a plain file name — "
+                    f"a rename cannot change the folder.")
         new_path = target.parent / new_name
+        if not _is_safe_path(new_path):
+            return f"Access denied: '{new_name}' would leave the safe folders."
         if new_path.exists():
             return f"A file named '{new_name}' already exists here."
 

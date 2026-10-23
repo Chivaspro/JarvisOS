@@ -5842,12 +5842,18 @@ class JarvisLive:
                         for t in _threats[:4]
                     ) or ("the threat I detected" if threat_id else
                           "every active threat Defender reports")
+                    # The exact file the model asked to delete is named on the
+                    # banner: remove_threat() only touches paths Defender's own
+                    # telemetry lists, and the human should see the target.
+                    _detail = f"J.A.R.V.I.S. will quarantine/delete: {_names}\n"
+                    if target_path:
+                        _detail += f"Target file: {target_path}\n"
+                    _detail += ("This removes files or quarantines threats and "
+                                "cannot be undone.")
                     result = _confirm.request(
                         key="malware_remove",
                         title="Remove detected malware?",
-                        detail=(f"J.A.R.V.I.S. will quarantine/delete: {_names}\n"
-                                "This removes files or quarantines threats and "
-                                "cannot be undone."),
+                        detail=_detail,
                         run=lambda: malware_scanner.remove_threat(
                             threat_id=threat_id, path=target_path,
                             confirmed=True,
@@ -5857,11 +5863,12 @@ class JarvisLive:
                     res = await loop.run_in_executor(
                         None, lambda: malware_scanner.get_defender_status()
                     )
+                    result = res.get("message") if isinstance(res, dict) and "message" in res else str(res)
                 else:
                     res = await loop.run_in_executor(
                         None, lambda: malware_scanner.scan_device(scan_type=scan_type, target_path=target_path)
                     )
-                result = res.get("message") if isinstance(res, dict) and "message" in res else str(res)
+                    result = res.get("message") if isinstance(res, dict) and "message" in res else str(res)
 
             else:
                 if self._plugin_registry.has(name):
@@ -7686,10 +7693,16 @@ class JarvisLive:
                     # client in the background; build under the same lock it
                     # uses, so only one side ever constructs it.
                     with self._client_lock:
-                        if self._client is not None:
+                        if (self._client is not None
+                                and self._client_key == _key
+                                and self._client_version == _version):
                             # Prewarm landed while _build_config ran — use it.
                             client = self._client
                         else:
+                            # Rebuild whenever the key or API version differs:
+                            # a stale client would keep sending the REFUSED key
+                            # forever, recreating the endless NEEDS-KEY loop
+                            # that a key change is supposed to end.
                             client = genai.Client(
                                 api_key=_key,
                                 http_options={"api_version": _version},

@@ -18,6 +18,7 @@ Supported types:
 
 import os
 import re
+import sys
 import json
 import shutil
 import subprocess
@@ -292,6 +293,20 @@ def _process_text_doc(path: Path, file_type: str, action: str,
         return content[:2000]
 
     instruction = params.get("instruction", "")
+
+    # Normalise the action BEFORE the prompts are built: the "custom" prompt
+    # embeds the instruction, and a string built earlier cannot see a later
+    # reassignment. The old code also ran `action = "custom"` first and then
+    # `instruction = action`, so "translate this" reached the model as the
+    # meaningless instruction "custom" (or, after a partial fix, as an empty
+    # instruction with the real request dropped entirely).
+    _KNOWN_TEXT_ACTIONS = {
+        "summarize", "analyze", "reformat", "fix", "translate_hint", "to_bullet",
+    }
+    if action not in _KNOWN_TEXT_ACTIONS:
+        instruction = instruction or action
+        action      = "custom"
+
     prompt_map  = {
         "summarize":  f"Summarize this document concisely:\n\n{content[:40000]}",
         "analyze":    f"Analyze this document:\n\n{content[:40000]}",
@@ -301,11 +316,6 @@ def _process_text_doc(path: Path, file_type: str, action: str,
         "to_bullet":  f"Convert this text into a clear bullet-point summary:\n\n{content[:40000]}",
         "custom":     f"{instruction}\n\n{content[:40000]}",
     }
-
-    if action not in prompt_map:
-
-        action  = "custom"
-        instruction = action
 
     try:
         model    = _gemini_client()
@@ -331,7 +341,10 @@ def _process_data(path: Path, file_type: str, action: str,
 
     try:
         if file_type == "csv":
-            df = pd.read_csv(path, encoding="utf-8", errors="replace")
+            # pandas has no `errors` parameter (it is `encoding_errors`, since
+            # 1.3) — the old kwarg raised TypeError on every read, so analyze/
+            # filter/sort/convert on CSV never worked once pandas was installed.
+            df = pd.read_csv(path, encoding="utf-8", encoding_errors="replace")
         else:
             df = pd.read_excel(path)
     except Exception as e:
@@ -467,13 +480,37 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "run":
         if ext == "py":
+            # Executing a file is a coding action: code_helper and dev_agent
+            # both gate "run" behind the chatlog Approve/Decline card and the
+            # coding_agents switch. This parallel path did neither — any
+            # Python file at the user's privileges ran without an approval.
             try:
+                from config.settings import get_feature
+                if not get_feature("coding_agents", True):
+                    return "Coding is switched off in Settings, so I have not run that."
+            except Exception:
+                pass
+            try:
+                from security.coding_approval import request_approval
+                if not request_approval(
+                    f"Run: {path.name}",
+                    f"Action: run\nTarget: {path}\n\n"
+                    f"The file will execute with your user privileges.",
+                ):
+                    return "Understood, sir — I have not run that file."
+            except Exception as exc:
+                return (f"The coding approval gate is unavailable ({exc}); "
+                        f"I have not run that file.")
+            try:
+                # sys.executable, not "python" from PATH — the interpreter
+                # running J.A.R.V.I.S. is the one with the project's packages.
                 result = subprocess.run(
-                    ["python", str(path)],
-                    capture_output=True, text=True, timeout=30
+                    [sys.executable, str(path)],
+                    capture_output=True, text=True, timeout=30,
+                    encoding="utf-8", errors="replace",
                 )
-                out = result.stdout or result.stderr
-                return f"Output:\n{out[:2000]}" if out else "No output."
+                out = (result.stdout or "") + (result.stderr or "")
+                return f"Output:\n{out[:2000]}" if out.strip() else "No output."
             except subprocess.TimeoutExpired:
                 return "Execution timed out (30s)."
             except Exception as e:

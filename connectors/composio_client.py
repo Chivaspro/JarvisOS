@@ -37,8 +37,14 @@ PACKAGE_HINT = ("The Composio connector needs the optional 'composio' package, "
                 "setup_jarvis --install-missing) and ask me again. Nothing was "
                 "sent to Composio.")
 
-ENV_API_KEY = os.getenv("ENV_API_KEY", "")
-CONFIG_API_KEY = os.getenv("CONFIG_API_KEY", "")
+#: The env var that carries the project key and the config field that stores
+#: it. Both NAMES remain redirectable through the environment, but the
+#: DEFAULTS are the real ones — the old defaults were literally
+#: ``os.getenv("ENV_API_KEY", "")`` / ``os.getenv("CONFIG_API_KEY", "")``, so
+#: the lookup could never find a key no matter what the user saved and every
+#: connector verb reported "not configured" forever.
+ENV_API_KEY = os.getenv("ENV_API_KEY", "COMPOSIO_API_KEY")
+CONFIG_API_KEY = os.getenv("CONFIG_API_KEY", "composio_api_key")
 CONFIG_USER_ID = "composio_user_id"
 DEFAULT_USER_ID = "default"
 

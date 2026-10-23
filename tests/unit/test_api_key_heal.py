@@ -134,3 +134,17 @@ def test_the_connect_loop_resolves_the_live_key_and_heals_before_prompting():
         "a refused key must try the stored key before asking for a new one")
     assert branch.index("_adopt_stored_key()") < branch.index("_auth_fail_count"), (
         "the heal must run before the refusal count that triggers the prompt")
+
+
+def test_the_locked_client_reuse_branch_rechecks_key_and_version():
+    """A prewarm-era client may be reused ONLY when it matches the requested key
+    and API version. The old code reused any non-None client, so a key change
+    (prompt_reconfig / Settings ▸ API edit) kept sending the REFUSED key and
+    recreated the endless NEEDS-KEY loop the heal exists to end."""
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    idx = source.index("# Prewarm landed while _build_config ran")
+    condition = source[max(0, idx - 420):idx]
+    assert "self._client_key == _key" in condition, (
+        "the locked reuse branch must compare _client_key with _key")
+    assert "self._client_version == _version" in condition, (
+        "the locked reuse branch must compare _client_version with _version")

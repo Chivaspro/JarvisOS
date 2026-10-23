@@ -120,7 +120,15 @@ def check_all() -> list[str]:
 
         topic = data.get("topic", slug)
         try:
-            results = _ddg_news(topic, max_results=5)
+            # _ddg_news returns (results, error). Unpacking it as a list made
+            # results[0] the LIST itself, so top.get() raised on every check,
+            # last_check was never recorded and no alert could ever fire.
+            results, error = _ddg_news(topic, max_results=5)
+            if error:
+                print(f"[Monitor] ⚠️ Check failed for '{topic}': {error}")
+                monitors[slug]["last_check"] = today
+                changed = True
+                continue
             if not results:
                 monitors[slug]["last_check"] = today
                 changed = True

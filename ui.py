@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import types
 import weakref
 from datetime import datetime, timedelta, timezone
@@ -5585,24 +5586,11 @@ class _CommandWindow(QFrame):
             f'QScrollBar:horizontal {{ background:transparent;height:0px;border:none; }}'
             f'QScrollBar::handle:horizontal {{ background:transparent;border:none; }}'
         )
-        self.chat.setHtml(
-            self._bubble_html(
-                "YOU",
-                "What's the status of my system?",
-                True,
-                C.WHITE,
-                "11:32 AM",
-                self._chat_avatar_html(True, C.WHITE),
-            )
-            + self._bubble_html(
-                "J.A.R.V.I.S.",
-                "Everything appears to be in order, sir.",
-                False,
-                C.PRI,
-                "11:32 AM",
-                self._chat_avatar_html(False, C.PRI),
-            )
-        )
+        # No fabricated starter conversation: this build is the crash-fallback
+        # host, and the old seeded sample ("What's the status of my system?" /
+        # "Everything appears to be in order, sir.") put words in the user's
+        # mouth before they had typed anything.
+        self.chat.clear()
         lay.addWidget(self.chat, 1)
 
         # Real-time activity status indicator — shows what J.A.R.V.I.S. is
@@ -5623,7 +5611,9 @@ class _CommandWindow(QFrame):
         # existing command textbox below (`self.input`) — there is no separate
         # transcription widget. See set_live_transcript().
 
-        self.chips = QLabel('CPU 24%  |  RAM 41%  |  GPU 18%  |  TEMP 42°C')
+        # Unknown until set_metrics_text() receives real samples — the old
+        # build printed invented numbers ("CPU 24% | RAM 41% | GPU 18% ...").
+        self.chips = QLabel('CPU —  |  RAM —  |  GPU —  |  TEMP —')
         self.chips.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.chips.setStyleSheet(
             f'color:{C.PRI};font:700 8pt "Exo 2";background:rgba(0,24,36,140);'
@@ -5700,7 +5690,7 @@ class _CommandWindow(QFrame):
         except Exception:
             return
         if not p.exists() or not p.is_file():
-            self.append_msg('FILE', f'Could not attach {p} — not a file.')
+            self._import_failed(f'Could not attach {p} — not a file.')
             return
         try:
             size = _fmt_size(p.stat().st_size)
@@ -5722,12 +5712,28 @@ class _CommandWindow(QFrame):
             try:
                 host.import_file(str(p))
             except Exception as exc:
-                self.append_msg('ERR', f'Import failed — {exc}')
+                self._import_failed(f'Import failed — {exc}')
         # Show the file above the input box so it is obvious the attach landed
         # (only the live Chat Panel has the chip — hasattr guard for other hosts).
         try:
             if hasattr(self, '_set_attached'):
                 self._set_attached(p)
+        except Exception:
+            pass
+
+    def _import_failed(self, message: str) -> None:
+        """Surface an attach failure where a person can actually see it.
+
+        The old callers used ``append_msg('FILE'/'ERR', ...)``, but both
+        append_msg implementations drop every non-user/non-assistant identity
+        by design — so dropping a folder onto the chat produced ZERO feedback.
+        The host's activity log is the accepted channel for internal notes.
+        """
+        try:
+            host = getattr(self, '_host', None)
+            if host is not None and hasattr(host, 'write_log'):
+                host.write_log(message)
+                return
         except Exception:
             pass
 
@@ -14581,6 +14587,11 @@ class RefinedCommandWindow(_CommandWindow):
 
 _ArcLogo = RefinedArcLogo
 _ArcLogoButton = RefinedArcLogoButton
+#: The genuine base class, kept reachable for the chat-panel crash fallback.
+#: Captured BEFORE the alias below overwrites _CommandWindow: the fallback
+#: used to construct ``_CommandWindow(self)``, which IS RefinedCommandWindow —
+#: the exact class that had just failed, so the "recovery" could never work.
+_CommandWindowBase = _CommandWindow
 _CommandWindow = RefinedCommandWindow
 
 
@@ -21026,14 +21037,16 @@ class MainWindow(QMainWindow):
                 try:
                     win = RefinedCommandWindow(self)
                 except Exception as exc:
-                    # Never leave the user with a dead CHAT action.  Retry with
-                    # the base command window, which has the same frameless
-                    # host contract, so the panel can still open while the
-                    # construction problem is reported to the activity log.
+                    # Never leave the user with a dead CHAT action. Retry with
+                    # the genuine BASE command window (a different class), so
+                    # the panel can still open while the construction problem
+                    # is reported to the activity log. `_CommandWindow` here
+                    # would be RefinedCommandWindow again — the class that just
+                    # failed — which is why the fallback never recovered.
                     self.write_log(f'ERR: Refined chat panel construction — {exc}')
                     traceback.print_exc()
                     try:
-                        win = _CommandWindow(self)
+                        win = _CommandWindowBase(self)
                         self.write_log('SYS: Chat panel recovered using the safe command-window host.')
                     except Exception as fallback_exc:
                         self.write_log(f'ERR: Chat panel recovery failed — {fallback_exc}')

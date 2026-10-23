@@ -131,12 +131,37 @@ def _ask_for_url(prompt_text: str = "YouTube video URL:") -> str | None:
 def _get_transcript(video_id: str) -> str | None:
     if not _TRANSCRIPT_OK:
         return None
+
+    lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
+
+    def _join(fetched) -> str:
+        """Join snippet text from either API generation.
+
+        Recent releases yield FetchedTranscriptSnippet DATACLASSES (no
+        __getitem__); 0.6.x handed out raw dicts. ``entry["text"]`` raised
+        TypeError on the dataclasses and every summarize attempt reported
+        "no transcript" even when the fetch had actually succeeded.
+        """
+        parts = []
+        for entry in fetched:
+            text = getattr(entry, "text", None)
+            if text is None and isinstance(entry, dict):
+                text = entry.get("text")
+            if text:
+                parts.append(str(text))
+        return " ".join(parts)
+
     try:
+        # v1.x exposes the instance API: fetch() selects a transcript itself,
+        # preferring the requested languages (manual before generated).
+        api = YouTubeTranscriptApi()
+        _fetch = getattr(api, "fetch", None)
+        if callable(_fetch):
+            return _join(_fetch(video_id, languages=list(lang_priority)))
+
+        # 0.6.x fallback: class-level list_transcripts + manual/generated pick.
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         transcript      = None
-
-        lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
-
         try:
             transcript = transcript_list.find_manually_created_transcript(lang_priority)
         except Exception:
@@ -153,8 +178,7 @@ def _get_transcript(video_id: str) -> str | None:
         if transcript is None:
             return None
 
-        fetched = transcript.fetch()
-        return " ".join(entry["text"] for entry in fetched)
+        return _join(transcript.fetch())
 
     except Exception as e:
         print(f"[YouTube] ⚠️ Transcript fetch failed: {e}")

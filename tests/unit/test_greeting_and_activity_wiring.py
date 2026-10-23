@@ -120,3 +120,19 @@ def test_malware_tool_description_forbids_false_claims():
     body = MAIN[start:start + 900]
     assert "Never claim malware was found" in body
     assert "never claim the device is clean" in body
+
+
+# ── morning briefing news ─────────────────────────────────────────────────────
+
+def test_the_news_briefing_consumes_a_text_payload():
+    """``_fetch_news_sync`` is ``actions.web_search._news``, which returns a
+    formatted STRING (pinned by ``test_web_search_honesty``). The briefing
+    calls ``.startswith`` on the awaited value — when the payload was briefly a
+    ``(text, raw)`` tuple, that raised AttributeError inside ``_deliver_news``
+    and the news was silently never read. This tripwire keeps the consumer and
+    the producer in step."""
+    start = MAIN.index("async def _send_startup_briefing")
+    end = MAIN.index("def _greeting_release_later")
+    body = MAIN[start:end]
+    assert "news_text.startswith(" in body
+    assert "await asyncio.wait_for(news_done, timeout=8.0)" in body
