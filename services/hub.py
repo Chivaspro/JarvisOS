@@ -1016,7 +1016,10 @@ def status_all(config: dict | None = None, timeout: float = 3.0) -> list[dict]:
     Used to paint the status pills when the Settings window opens; the TEST
     button is what performs the real round trip. Nothing here touches a socket.
     """
-    config = dict(config or _config())
+    # ``None`` means "read the live store"; an explicitly passed config (even
+    # an empty one) is used verbatim — ``config or _config()`` would collapse
+    # the two and silently consult the machine's real credentials.
+    config = dict(config) if config is not None else _config()
     out: list[dict] = []
     for service in SERVICES:
         state, detail = _service_state(service, config, timeout)
@@ -1116,7 +1119,7 @@ def probe_target(target: str, config: dict | None = None,
                                  + ", ".join(s.id for s in SERVICES)
                                  + ". Providers: "
                                  + ", ".join(p.id for p in PROVIDERS) + ".")
-    config = dict(config or _config())
+    config = dict(config) if config is not None else _config()
     name = _provider_probe_name(provider)
     if not name:
         state, detail = _row_state(key_meta(provider.field), config)

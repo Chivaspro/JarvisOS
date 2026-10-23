@@ -167,7 +167,11 @@ def test_the_summary_carries_both_links_and_keys():
 
 # ── the tool ──────────────────────────────────────────────────────────────────
 
-def test_the_tool_can_name_a_key_by_its_config_field():
+def test_the_tool_can_name_a_key_by_its_config_field(monkeypatch):
+    # The tool reads the live config store in production; pin it to an empty
+    # store so the test is deterministic on a machine that has real keys
+    # configured (and never performs a live API call from the suite).
+    monkeypatch.setattr(hub, "_config", lambda: {})
     out = hub_tool.handler({"action": "test", "field": "openai_api_key"})
     assert out.startswith("OpenAI:")
     assert "No OpenAI key is set" in out

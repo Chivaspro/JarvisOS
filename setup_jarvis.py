@@ -3076,10 +3076,11 @@ def _menu_line(key: str, title: str, desc: str, selected: bool = False) -> str:
 def render_menu(rows=None, selected: int = 0, title: str = "ACTIONS") -> str:
     """One menu level as a framed panel.
 
-    ``rows`` defaults to the main menu, so the no-argument form (used by the
-    tests) still renders a complete menu."""
+    ``rows`` may be full menu entries (key, title, desc, action) or plain
+    (key, title, desc) rows; the no-argument form renders the main menu."""
     rows = (list(rows) if rows is not None
             else [(k, t, d) for k, t, d, _x in MAIN_MENU])
+    rows = [(row[0], row[1], row[2]) for row in rows]
     lines = [_panel_top(title, "SELECT")]
     for index, (key, mtitle, desc) in enumerate(rows):
         lines.append(_menu_line(key, mtitle, desc, index == selected))

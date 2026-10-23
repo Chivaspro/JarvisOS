@@ -594,7 +594,8 @@ def test_latency_report_parses_the_last_session(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert report["turns"] == 2
     assert report["vad_downgraded"] is True
-    assert "812" in out and "95" in out
+    # avg of 812 + 1200 = 1006; last = 1200; Laya load = 95 s
+    assert "1006" in out and "1200" in out and "95" in out
     assert "LATENCY" in out
 
 
