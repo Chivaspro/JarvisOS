@@ -3338,10 +3338,7 @@ class JarvisLive:
 
         async def _say():
             try:
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": instruction}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(instruction)
             except Exception as e:
                 print(f"[PluginSay] {e}")
 
@@ -3651,10 +3648,7 @@ class JarvisLive:
         except Exception:
             pass
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self._send_text_turn(text),
             self._loop
         )
 
@@ -4358,10 +4352,7 @@ class JarvisLive:
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
+            self._send_text_turn(text),
             self._loop
         )
 
@@ -4579,8 +4570,7 @@ class JarvisLive:
 
         async def _inject():
             try:
-                await session.send_client_content(
-                    turns={"parts": [{"text": text}]}, turn_complete=True)
+                await self._send_text_turn(text)
             except Exception as exc:
                 print(f"[Vision] turn not injected: {exc}")
 
@@ -6053,10 +6043,8 @@ class JarvisLive:
                     _release_vision_resources()
                     if self.session:
                         try:
-                            await self.session.send_client_content(
-                                turns={"parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
+                            await self._send_text_turn(
+                                "Say a brief natural goodbye to the user.")
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
@@ -6389,6 +6377,28 @@ class JarvisLive:
                 setattr(session, name, _tracked(original, name))
             except Exception:
                 continue
+
+    async def _send_text_turn(self, text: str, *, turn_complete: bool = True) -> None:
+        """Send one text turn through the path this session actually accepts.
+
+        The enhanced v1alpha + proactive session closes with 1007 "Request
+        contains an invalid argument" after ANY clientContent turn: measured
+        2026-10-24 with the greeting, a greeting without turn_complete, a
+        trivial "Hello there!", and a client turn on a warm session (see the
+        outbound journal, AUDIT_REPORT.md section 12). Realtime text input is
+        accepted and answered on the same session. The plain v1beta session
+        keeps the deterministic client turn.
+        """
+        payload = str(text or "")
+        if not payload or not self.session:
+            return
+        if getattr(self, "_live_version", "") == "v1alpha":
+            await self.session.send_realtime_input(text=payload)
+        else:
+            await self.session.send_client_content(
+                turns={"parts": [{"text": payload}]},
+                turn_complete=turn_complete,
+            )
 
     async def _send_realtime(self):
         """Forward queued realtime input (PC mic PCM, phone-relay PCM) to Gemini.
@@ -7308,16 +7318,14 @@ class JarvisLive:
 
         # Gemini native audio: the realtime Live voice speaks the greeting
         # itself. Only claim it on screen once the send actually succeeded.
+        # Routed through _send_text_turn: the enhanced v1alpha session refuses
+        # a clientContent turn with 1007 (measured 2026-10-24); realtime text
+        # is the path it accepts.
         try:
-            await self.session.send_client_content(
-                turns={"parts": [{
-                    "text": (
-                        f'Speak the following greeting word for word, completely and without omission: '
-                        f'"{greeting}" '
-                        f'Do not summarise, do not shorten, do not add anything, do not call any tools.'
-                    )
-                }]},
-                turn_complete=True,
+            await self._send_text_turn(
+                f'Speak the following greeting word for word, completely and without omission: '
+                f'"{greeting}" '
+                f'Do not summarise, do not shorten, do not add anything, do not call any tools.'
             )
         except Exception as e:
             self._greeting_in_flight = False
@@ -7522,9 +7530,7 @@ class JarvisLive:
                     else:
                         suffix = (" Confirm it now, in one short sentence, as your "
                                   "own words; do not explain how memory works.")
-                    await self.session.send_client_content(
-                        turns={"parts": [{"text": notice + suffix}]},
-                        turn_complete=True)
+                    await self._send_text_turn(notice + suffix)
                 except Exception:
                     pass
         except Exception as exc:
@@ -7720,10 +7726,7 @@ class JarvisLive:
             if speaking or (time.monotonic() - self._last_user_speech) < 10:
                 continue
             try:
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": alert}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(alert)
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
@@ -7750,10 +7753,7 @@ class JarvisLive:
                                 f"Inform the user about this development naturally in {lang}. "
                                 "One brief sentence only."
                             )
-                            await self.session.send_client_content(
-                                turns={"parts": [{"text": msg}]},
-                                turn_complete=True,
-                            )
+                            await self._send_text_turn(msg)
                             self.ui.write_log(f"SYS: Monitor alert sent.")
                             await asyncio.sleep(6)   # gap between consecutive alerts
                     except Exception as e:
@@ -7826,10 +7826,7 @@ class JarvisLive:
                     monitors     = monitors or None,
                     recent_turns = recent_turns or None,
                 )
-                await self.session.send_client_content(
-                    turns={"parts": [{"text": prompt}]},
-                    turn_complete=True,
-                )
+                await self._send_text_turn(prompt)
                 self.ui.write_log("SYS: Proactive check-in.")
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
@@ -7909,10 +7906,7 @@ class JarvisLive:
                         break
                     await asyncio.sleep(0.1)
                 if self.session:
-                    await self.session.send_client_content(
-                        turns={"parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
+                    await self._send_text_turn(text)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
@@ -8088,6 +8082,9 @@ class JarvisLive:
                 # handle with no sockets — recreating it per attempt wasted work
                 # and forced re-reading the API key from disk every retry.
                 _version = "v1alpha" if self._enhanced_live else "v1beta"
+                # Remember which API the CURRENT session runs on: text turns
+                # are routed by it (see _send_text_turn).
+                self._live_version = _version
                 _key     = self._live_api_key()
                 # No key at all: a live session is impossible. Say so and back
                 # off, instead of retrying forever with nothing to connect with —
