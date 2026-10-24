@@ -1,7 +1,9 @@
 """Tests for the refactored SetupOverlay initialization panel."""
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PyQt6.QtWidgets")
 
 from PyQt6.QtWidgets import QLabel, QLineEdit, QPushButton
-from ui import SetupOverlay
+
+# When this file runs on its own, pytest puts ``tests`` on sys.path and the
+# empty ``tests/ui`` package shadows the application's ``ui.py``. Load the real
+# module by path and register it under ``ui`` so every import below (including
+# the lazy ``import ui`` in the last test) means the app, not the test package.
+ROOT = Path(__file__).resolve().parent.parent.parent
+_spec = importlib.util.spec_from_file_location("ui", ROOT / "ui.py")
+_ui = importlib.util.module_from_spec(_spec)
+sys.modules["ui"] = _ui
+_spec.loader.exec_module(_ui)
+SetupOverlay = _ui.SetupOverlay
 
 
 def test_setup_overlay_initialization_fields(shared_qapplication):
