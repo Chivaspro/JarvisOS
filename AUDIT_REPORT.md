@@ -473,7 +473,7 @@ git log --oneline -10
 
 ---
 
-## 12. Post-audit update - the `1007` frame is identified
+## 12. Post-audit update - both open items are fixed
 
 *Added after the report commit; sections 1-11 remain the audit-close
 snapshot.*
@@ -506,21 +506,53 @@ What it means:
   session holds; the false "Gemini rejected the API key" reporting is gone
   (`422ff1a`).
 
-The open question in section 8.2 is now narrow: why does the first session
-refuse the greeting turn? The candidates are all behaviour-visible, so they
-still need your decision:
+### 12.1 The `1007` - any clientContent turn kills the enhanced session
 
-1. Wait for the model's first response to finish before injecting the
-   greeting, or skip the greeting when `AI_FIRST_RESPONSE` already fired.
-2. Send the greeting without `turn_complete=True`.
-3. Connect with the plain config from the start (no proactivity/enhanced
-   audio), as the reconnect path already does.
-4. Leave it: the reconnect recovers and the user sees `RECONNECTING`.
+The journal identified the last frame; four live experiments then narrowed
+the cause:
 
-Section 8.1 (shutdown camera race) is unchanged and still needs a decision.
+| Experiment | Result |
+|---|---|
+| Greeting via `send_client_content(turns=..., turn_complete=True)` | 1007 ~3 s later |
+| Greeting without `turn_complete` | 1007 ~4 s later |
+| Trivial "Hello there!" via `send_client_content` | 1007 ~3.6 s later |
+| A client turn on a warm session (+27 s) | 1007 ~2.7 s later |
+| Same session with NO clientContent turn | survived 30+ s, spoke on its own |
+| Greeting via `send_realtime_input(text=...)` | model spoke in <1 s, no drop |
 
-Suite note: re-running `tests/unit` after the journal change collected 1890
-tests (the concurrent work added files) with **3 unrelated failures**
-(`test_home_assistant`, `test_library`, `test_meeting_notes`); all three
-reproduce standalone and none of those files import `main`, so they are not
-from this instrumentation. 1890 passed, 5 skipped.
+So the enhanced **v1alpha + proactive** session refuses *any* clientContent
+turn - not the greeting text, not `turn_complete`, not the timing. That
+meant typed commands, `speak()`, plugin announcements, memory notices and
+monitor alerts were all broken the same way.
+
+Commit `434b975` adds `_send_text_turn()` and routes every text turn through
+it: `send_realtime_input(text=...)` on v1alpha, the deterministic client
+turn on v1beta. Verified live after the change: greeting sent at READY+0.9 s,
+model spoke at +1.4 s, no 1007, no reconnect, clean exit.
+
+Still open in this area: the one-shot photo path (`_pending_vision`) sends
+an inline image plus text through `send_client_content`, so it is broken on
+v1alpha too. Converting it means splitting it into a realtime media frame
+plus a text call, and it needs a real camera test to verify - left for your
+decision rather than changed blind.
+
+### 12.2 The shutdown access violation - fixed in `e1a665d`
+
+`vision/camera.py` gains `begin_shutdown()` (no warm-up can start a camera
+while the process is leaving), `release_global_camera()` waits for the
+global lock with a 3 s timeout instead of forever (a warm-up stuck in
+`detect_cuda` can no longer be raced into native OpenCV), and
+`_release_vision_resources()` joins `jarvis-camera-warm` (bounded) before
+releasing. Live evidence after the fix: four consecutive runs exited 0
+where the same stress pattern previously produced `0xC0000005` dumps. A
+longer soak across real desktop sessions is still worthwhile.
+
+### 12.3 Suite note
+
+Latest full `tests/unit` run: **2035 passed, 5 skipped, 1 unrelated
+failure** (`test_never_asleep::test_the_mute_toggle_still_reports_a_real_state`
+asserts a literal that the concurrent `ui.py` edit replaced with
+`_idle_state()`; neither the test nor that edit is part of this audit). The
+new tests from this round: `test_camera_shutdown_guard.py` (6),
+`test_text_turn_routing.py` (5), plus the journal's
+`test_outbound_frame_journal.py` (7).
