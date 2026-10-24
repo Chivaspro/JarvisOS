@@ -2441,6 +2441,61 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
+# WebSocket close codes are transport signals, not diagnoses. 1007 means "the
+# peer rejected a frame" and 1008 means "policy violation"; the Live service
+# uses both for non-auth failures (a rejected frame, a dead session, an expired
+# resumption handle). Treating the bare numbers as authentication failures made
+# a dropped mic stream report "Gemini rejected the API key" and park the HUD in
+# NEEDS KEY while the key was perfectly valid. Auth is decided by the words in
+# the error, not by the code that carried it.
+_LIVE_AUTH_MARKERS = (
+    "api key not valid",
+    "api_key_invalid",
+    "invalid api key",
+    "api key expired",
+    "invalid authentication credentials",
+    "expected oauth",
+    "unauthenticated",
+    "permission denied",
+    "permission_denied",
+)
+
+
+def _live_error_is_auth(message: str) -> bool:
+    """True only when the error text actually describes a refused credential."""
+    low = str(message or "").lower()
+    return any(marker in low for marker in _LIVE_AUTH_MARKERS)
+
+
+def _live_error_is_stale_resume(message: str) -> bool:
+    """True when a reconnect failed because its session/resumption handle died.
+
+    A 1008 "session not found or expired" is the common shape: the previous
+    session is gone, so replaying its handle can never succeed. The handle has
+    to be dropped and the next attempt started clean.
+    """
+    low = str(message or "").lower()
+    return any(marker in low for marker in (
+        "resum", "handle", "session not found", "session expired",
+        "session has expired", "invalid_argument", "invalid argument",
+    ))
+
+
+def _live_error_is_optional_feature_rejection(message: str) -> bool:
+    """True when the server rejected an optional audio/config field.
+
+    The retry path drops enhanced audio, VAD tuning and blocking tool mode and
+    reconnects with the plain config. Matching only the uppercase
+    ``INVALID_ARGUMENT`` token missed the ordinary sentence case the Live
+    service actually sends ("Request contains an invalid argument.").
+    """
+    low = str(message or "").lower()
+    return any(marker in low for marker in (
+        "invalid_argument", "invalid argument", "affective", "proactiv",
+        "unknown name", "unexpected keyword", "behavior", "not supported for",
+    ))
+
+
 def _local_image_path(result_text) -> str:
     """The artifact path a local controller reported, when it is a real image.
 
@@ -3484,10 +3539,32 @@ class JarvisLive:
             if not laya_decision.enabled():
                 self._laya_status('NOT USED', 'disabled in Settings')
                 return
+            state = laya_decision.get_state()
+            if state == laya_decision.STATE_MISSING_DEPENDENCY:
+                self._laya_status(
+                    'NOT USED',
+                    "the 'laya' package is not installed — run setup ▸ Laya AI")
+                return
+            if state in (laya_decision.STATE_NOT_FOUND, laya_decision.STATE_ERROR):
+                detail = laya_decision.status().get('detail_line') or 'model unavailable'
+                self._laya_status('NOT USED', detail)
+                return
+            if state != laya_decision.STATE_READY:
+                # Not ready yet: this turn must not wait for a cold load, and
+                # the deferred warm-up owns starting it. Claiming ACTIVE here
+                # was the false-state bug — nothing was deciding.
+                if state == laya_decision.STATE_DISABLED:
+                    reason = 'disabled in Settings'
+                elif state == laya_decision.STATE_LOADING:
+                    reason = 'decision model loading on CPU — routing without it'
+                else:
+                    reason = 'decision model not started yet — routing without it'
+                self._laya_status('NOT USED', reason)
+                return
         except Exception:
             self._laya_status('NOT USED', 'unavailable')
             return
-        # Laya is genuinely being consulted for this turn → ACTIVE now.
+        # Laya is READY and will decide this turn → ACTIVE now.
         self._laya_status('ACTIVE', 'deciding task approach')
         # A new request supersedes the previous Laya activity row.
         prev = getattr(self, "_laya_activity_category", None)
@@ -7916,8 +7993,15 @@ class JarvisLive:
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
-                # start shutdown — resulting in "executor after shutdown" errors).
-                # Voluntary reconnect (voice change) — not an error. Rebuild the
+                # start shutdown – resulting in "executor after shutdown" errors).
+                # A quit that cancels the session must end the loop here: the
+                # recovery branches below would otherwise reconnect into a
+                # process that is already leaving and report the teardown as a
+                # real failure.
+                if _stop_all.is_set():
+                    print("[JARVIS] Shutdown requested – backend loop exiting.")
+                    break
+                # Voluntary reconnect (voice change) – not an error. Rebuild the
                 # session immediately with no backoff and no scary logs.
                 if _is_reconnect_signal(e):
                     print("[JARVIS] Voluntary reconnect requested.")
@@ -7934,12 +8018,7 @@ class JarvisLive:
                 # assistant would never come back at all: the feature meant to
                 # survive a reconnect would be the thing preventing one. Drop it
                 # once and let the next attempt start clean.
-                if _resumed_with and (
-                    "resum" in str(e).lower()
-                    or "handle" in str(e).lower()
-                    or "INVALID_ARGUMENT" in str(e)
-                    or "NOT_FOUND" in str(e)
-                ):
+                if _resumed_with and _live_error_is_stale_resume(str(e)):
                     print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
                     self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
                     self._resume_handle = None
@@ -7970,15 +8049,7 @@ class JarvisLive:
                     self._enhanced_live
                     or getattr(self, "_vad_tuning_ok", False)
                     or getattr(self, "_pin_blocking_tools", False)
-                ) and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "affective" in err_str.lower()
-                    or "proactiv" in err_str.lower()
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                    or "behavior" in err_str.lower()
-                    or "not supported for" in err_str.lower()
-                ):
+                ) and _live_error_is_optional_feature_rejection(err_str):
                     _dropped = []
                     _vad_dropped = False
                     if self._enhanced_live:
@@ -8008,23 +8079,13 @@ class JarvisLive:
                     continue
 
                 # Authentication refused by the Live service — stop hammering the
-                # API and prompt re-configuration. A 1008 "invalid authentication
-                # credentials / Expected OAuth 2 access token" is the same class
-                # of failure as a 1007 bad key: it was NOT matched here before,
-                # so a rejected Live session fell through to the generic branch
-                # and retried every 3 s forever — the endless "RECONNECTING" with
-                # the cause buried in stdout. This is the branch that ends it.
-                _auth_low = err_str.lower()
-                _auth_failed = (
-                    "api key not valid" in _auth_low
-                    or "api_key_invalid" in _auth_low
-                    or "1007" in err_str
-                    or "1008" in err_str
-                    or "invalid authentication credentials" in _auth_low
-                    or "expected oauth" in _auth_low
-                    or "unauthenticated" in _auth_low
-                    or "permission denied" in _auth_low
-                )
+                # API and prompt re-configuration. The decision is made from the
+                # error TEXT only: WebSocket close codes 1007/1008 also carry
+                # frame and session failures, and treating the bare numbers as a
+                # bad key falsely parked a healthy install in NEEDS KEY. A 1008
+                # that really is "invalid authentication credentials / Expected
+                # OAuth 2 access token" still matches below by its wording.
+                _auth_failed = _live_error_is_auth(err_str)
                 if _auth_failed:
                     # A refused key must not cost the user their session. The
                     # Initialisation overlay and Settings ▸ API both write
