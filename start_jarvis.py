@@ -707,9 +707,12 @@ def _pipeline(args, prog, ui) -> int:
     emit("launch", 0.5, "HANDING OVER TO MAIN CORE", f"Python {chosen.version}")
 
     def started() -> None:
-        emit("launch", 1.0, "J.A.R.V.I.S ONLINE", "")
+        # The core process now exists, but it is not READY yet: the HUD owns
+        # that transition (core/startup_state.py). Claiming ONLINE here was a
+        # lie on every slow or failed boot.
+        emit("launch", 1.0, "J.A.R.V.I.S STARTING", "")
         if ui is not None:
-            ui.finish()
+            ui.finish("J.A.R.V.I.S STARTING")
 
     return launch(chosen.exe, on_started=started if ui is not None else None)
 

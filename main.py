@@ -111,10 +111,22 @@ CLIENT_PRE_ROLL_MS   = 150   # onset kept ahead of the gate, shorter = snappier
 # They are print-only and never fatal, so they cannot break a release build.
 _APP_TICK = time.perf_counter()
 
+# Startup readiness has exactly one owner (core/startup_state.py). Every
+# [STARTUP] marker below is also written to data/logs/startup.log with a real
+# timestamp, because a pythonw / VBS launch has no console to read afterwards.
+from core import startup_state as _startup_state   # noqa: E402  (needs BASE_DIR)
+_startup_state.configure(BASE_DIR / "data" / "logs" / "startup.log")
+
+
 def _markup(tag: str) -> None:
     """Emit one monotonic elapsed-time marker since process start."""
+    elapsed = time.perf_counter() - _APP_TICK
     try:
-        print(f"[STARTUP] {tag}  elapsed={time.perf_counter() - _APP_TICK:.3f}s")
+        print(f"[STARTUP] {tag}  elapsed={elapsed:.3f}s")
+    except Exception:
+        pass
+    try:
+        _startup_state.event(tag, f"elapsed={elapsed:.3f}s")
     except Exception:
         pass
 
@@ -7799,6 +7811,12 @@ class JarvisLive:
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
                     self.ui.set_state("LISTENING")
+                    try:
+                        _startup_state.set_state(
+                            _startup_state.READY,
+                            "Gemini Live session established")
+                    except Exception:
+                        pass
                     self.ui.write_log("SYS: JARVIS online.")
                     _log_vision_status()
 
@@ -8027,6 +8045,13 @@ class JarvisLive:
                         # An attention state, not a sleeping one: he is awake and
                         # waiting for a key, and the HUD says exactly that.
                         self.ui.set_state("NEEDS KEY")
+                        try:
+                            _startup_state.set_state(
+                                _startup_state.ERROR,
+                                "Gemini rejected the API key - re-enter it in "
+                                "Settings > API.")
+                        except Exception:
+                            pass
                         if self._dashboard:
                             await self._dashboard.broadcast(
                                 {"type": "status", "state": "needs_key"})
@@ -8407,6 +8432,11 @@ def main():
     # JARVIS_STARTUP_OPTIMIZE=0. Fully guarded, never fatal.
     # start_jarvis.py normally does this before launching; it sets
     # JARVIS_STARTUP_OPT_DONE so a launcher start is never swept twice.
+    try:
+        _startup_state.set_state(_startup_state.CLEANUP,
+                                 "cache and temp sweep")
+    except Exception:
+        pass
     _startup_opt = None
     _opt_summary = os.environ.get("JARVIS_STARTUP_OPT_SUMMARY", "")
     if os.environ.get("JARVIS_STARTUP_OPT_DONE") != "1":
@@ -8429,6 +8459,11 @@ def main():
     if not _startup_dependency_guard():
         return
 
+    try:
+        _startup_state.set_state(_startup_state.STARTING_UI,
+                                 "building the HUD")
+    except Exception:
+        pass
     try:
         from ui import JarvisUI
         _markup("UI_IMPORT")
@@ -8523,6 +8558,16 @@ def main():
             jarvis = JarvisLive(ui)
             _deferred.set_owner(jarvis)  # phase 3 can now prewarm the client
             _markup("JCORE_CONSTRUCT_DONE")
+            try:
+                _startup_state.set_state(
+                    _startup_state.CONNECTING,
+                    "opening the Gemini Live session")
+                # A stalled connect used to retry forever with the HUD still
+                # saying INITIALISING. Promote it to a visible, actionable
+                # DEGRADED state after 30 s; the retry loop keeps running.
+                _startup_state.arm_watchdog(30.0)
+            except Exception:
+                pass
             asyncio.run(jarvis.run())
         except SystemExit:
             # A deliberate quit breaking asyncio.run — not a crash to restart.
@@ -8571,6 +8616,13 @@ def main():
             attempts += 1
             if attempts > 3:
                 _markup("BACKEND_GIVEUP")
+                try:
+                    _startup_state.set_state(
+                        _startup_state.ERROR,
+                        "The assistant backend stopped after repeated "
+                        "failures. Reopen J.A.R.V.I.S to try again.")
+                except Exception:
+                    pass
                 try:
                     ui.set_state("ERROR")
                     ui.write_log("ERR: Assistant backend stopped after repeated failures. Reopen J.A.R.V.I.S to try again.")

@@ -49,7 +49,7 @@ class Progress:
         self._weights = {k: float(v) / total for k, v in tracks.items()}
         self._frac = {k: 0.0 for k in tracks}
         self._lock = threading.Lock()
-        self._label = "INITIALISING"
+        self._label = "STARTING"
         self._detail = ""
         self._label_at = time.monotonic()
         self._shown = 0.0
@@ -200,7 +200,7 @@ class ConsoleUI:
         self._thread = threading.Thread(target=self._loop, name="launch-ui", daemon=True)
         self._thread.start()
 
-    def finish(self, message: str = "J.A.R.V.I.S ONLINE") -> None:
+    def finish(self, message: str = "J.A.R.V.I.S STARTING") -> None:
         """Final 100% frame, then release the console to the running app."""
         if self._ended:
             return
@@ -340,7 +340,7 @@ class SplashUI:
             return False
 
     # -- called from the worker thread -----------------------------------------
-    def finish(self, message: str = "J.A.R.V.I.S ONLINE") -> None:
+    def finish(self, message: str = "J.A.R.V.I.S STARTING") -> None:
         self.prog.update("launch", 1.0, message)
         self.prog.finish()
         if self._closing_at is None:
@@ -471,7 +471,7 @@ class SplashUI:
         self._text(self.w - x, int(17 * k), time.strftime("%H:%M:%S"), FAINT, 11,
                    anchor="ne", glow=False)
 
-        label = "J.A.R.V.I.S ONLINE" if done else s["label"]
+        label = "J.A.R.V.I.S STARTING" if done else s["label"]
         txt = label.upper() if done else decode(label.upper(), s["label_age"])
         cursor = "_" if (tick // 8) % 2 == 0 and not done else " "
         self._text(x, int(58 * k), "> " + txt + cursor, GREEN if not done else WHITE, 13, bold=True)

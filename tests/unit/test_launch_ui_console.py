@@ -39,7 +39,9 @@ def test_the_plain_terminal_surface_reports_real_labels_and_finishes():
 
     ui.finish()
     final = out.getvalue()
-    assert "[100%] J.A.R.V.I.S ONLINE" in final
+    # Spawning main.py is not readiness; the HUD promotes the state to READY
+    # only when the Live session connects (core/startup_state.py).
+    assert "[100%] J.A.R.V.I.S STARTING" in final
 
 
 def test_progress_is_monotonic_and_weighted():

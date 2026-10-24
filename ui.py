@@ -522,7 +522,7 @@ class HudCanvas(QWidget):
 
         self.muted    = False
         self.speaking = False
-        self.state    = "INITIALISING"
+        self.state    = "BOOTING"
         self._assistant_name = assistant_name
 
         self._tick       = 0
@@ -18827,6 +18827,9 @@ class _ImageViewPanel(QWidget):
 
 class MainWindow(QMainWindow):
     _state_sig = pyqtSignal(str)
+    # One true boot state, marshalled from the backend thread. READY is not
+    # applied here: the Live loop's LISTENING is the same event and owns it.
+    _boot_sig = pyqtSignal(str, str)
     _log_sig = pyqtSignal(str)
     _content_sig = pyqtSignal(str, str)
     _reconfig_sig = pyqtSignal()
@@ -19274,6 +19277,17 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self):
         self._state_sig.connect(self._apply_state)
+        self._boot_sig.connect(self._on_boot_state)
+        # core.startup_state is the single owner of "ready". Subscribe once;
+        # the first emit paints the state the process is already in.
+        try:
+            from core import startup_state as _boot
+            self._boot_unsubscribe = _boot.subscribe(
+                lambda state, detail: self._boot_sig.emit(state, detail))
+            _boot_state, _boot_detail = _boot.current()
+            self._boot_sig.emit(_boot_state, _boot_detail)
+        except Exception:
+            self._boot_unsubscribe = lambda: None
         self._log_sig.connect(self._log_from_backend)
         self._content_sig.connect(self.show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -22368,6 +22382,44 @@ class MainWindow(QMainWindow):
             pass
         return []
 
+    def _on_boot_state(self, state, detail=""):
+        """Render the single startup state owned by core.startup_state."""
+        try:
+            s = str(state or "").strip().upper()
+        except Exception:
+            return
+        if s == "READY":
+            # The Live loop applies LISTENING itself at the same instant.
+            return
+        label = {
+            "BOOTING": "BOOTING",
+            "CLEANUP": "CLEANING",
+            "STARTING_UI": "BOOTING",
+            "CONNECTING": "CONNECTING",
+            "DEGRADED": "CONNECTION ISSUE",
+            "ERROR": "ERROR",
+        }.get(s)
+        if label is None:
+            return
+        if s == "CONNECTING":
+            try:
+                from core import startup_state as _boot
+                if _boot.snapshot().get("ever_ready"):
+                    label = "RECONNECTING"
+            except Exception:
+                pass
+        try:
+            self._apply_state(label)
+        except Exception:
+            pass
+        if s in ("DEGRADED", "ERROR") and detail:
+            # Clear, actionable text instead of a permanent INITIALISING.
+            try:
+                self.write_log(f"SYS: {detail}")
+                self._status.setText(str(detail)[:110])
+            except Exception:
+                pass
+
     def _apply_state(self,state):
         state_u = str(state).upper()
         previous = getattr(self.hud, 'state', '')
@@ -23450,8 +23502,10 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._restore_window_position(animate=True)
-        self._apply_state('LISTENING')
-        self.write_log(f'SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.')
+        # Saving a key makes the CONFIG complete, not JARVIS ready: the backend
+        # still has to open the Live session. Only that event may say LISTENING.
+        self._apply_state('CONNECTING')
+        self.write_log(f'SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} connecting�?�')
 
     def prompt_reconfig(self): self._ready=False; self._reconfig_sig.emit()
 
@@ -23849,6 +23903,10 @@ class MainWindow(QMainWindow):
         e.acceptProposedAction()
 
     def closeEvent(self,e):
+        try:
+            getattr(self, '_boot_unsubscribe', lambda: None)()
+        except Exception:
+            pass
         self._shutdown_startup_sequence()
         self._set_taskbar_button_hidden(False)
         try:
