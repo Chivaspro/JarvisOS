@@ -6439,7 +6439,10 @@ class JarvisLive:
 
                         if sc.turn_complete:
                             try:
-                                self.ui.clear_chat_activity()
+                                # The model turn is over: this is the only
+                                # place the working indicator may end. The
+                                # per-tool clear above is per-step.
+                                self.ui.turn_finished()
                             except Exception:
                                 pass
                             if self._turn_done_event:

@@ -10988,8 +10988,13 @@ _ChatImageRow.__init__ = _ChatImageRowInit
 
 
 class _TypingIndicatorRow(QWidget):
-    """Messenger-like J.A.R.V.I.S. typing row. Only dots animate inside chat."""
-    def __init__(self, parent=None):
+    """Messenger-like J.A.R.V.I.S. working row: animated dots plus a word.
+
+    The dots alone said "something is happening" but never what, and a stalled
+    turn looked exactly like a slow one. The label is the visible promise the
+    response watchdog can then honestly withdraw.
+    """
+    def __init__(self, parent=None, label: str = 'WORKING'):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet('background:transparent;border:none;')
@@ -11002,16 +11007,23 @@ class _TypingIndicatorRow(QWidget):
         self._bubble = QFrame(self)
         self._bubble.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._bubble.setMinimumSize(0, 34)
-        self._bubble.setMaximumWidth(120)
+        self._bubble.setMaximumWidth(240)
         self._bubble.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._bubble.setFixedHeight(34)
         # Messenger-style typing bubble: the animated dots start from the
         # left instead of being centered in the capsule.
-        bl = QHBoxLayout(self._bubble); bl.setContentsMargins(11, 5, 11, 5); bl.setSpacing(0)
+        bl = QHBoxLayout(self._bubble); bl.setContentsMargins(11, 5, 11, 5); bl.setSpacing(6)
         self._dots = QLabel('·')
         self._dots.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._dots.setStyleSheet(f'color:{C.WHITE};font:800 16pt Rajdhani;background:transparent;border:none;padding:0;')
         bl.addWidget(self._dots)
+        self._label = QLabel(self)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._label.setStyleSheet(
+            f'color:{C.WHITE};font:700 7.0pt "Share Tech Mono";'
+            f'letter-spacing:0.55px;background:transparent;border:none;padding:0;')
+        self._label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        bl.addWidget(self._label, 0, Qt.AlignmentFlag.AlignVCenter)
         # Bind the painter to the BUBBLE itself. The previous form
         # (self._paint_bubble.__get__(...)) was a no-op: __get__ on an
         # already-bound method returns it unchanged, so the handler stayed
@@ -11024,10 +11036,7 @@ class _TypingIndicatorRow(QWidget):
         row.addLayout(col, 0); row.addStretch(1)
         self._frames = ('·', '··', '···', '··')
         self._i = 0
-        try:
-            self._bubble.setFixedWidth(max(32, self._dots.fontMetrics().horizontalAdvance('·') + 24))
-        except Exception:
-            pass
+        self.set_activity(label)
         self._timer = QTimer(self)
         self._timer.setInterval(260)
         self._timer.timeout.connect(self._tick)
@@ -11037,12 +11046,32 @@ class _TypingIndicatorRow(QWidget):
         self._i = (self._i + 1) % len(self._frames)
         text = self._frames[self._i]
         self._dots.setText(text)
-        # Keep the typing bubble as tight as the animated dots themselves.
+        # Keep the bubble as tight as the dots and the word together.
+        self._fit_bubble()
+
+    def _fit_bubble(self) -> None:
         try:
-            natural = max(14, self._dots.fontMetrics().horizontalAdvance(text)) + 24
-            self._bubble.setFixedWidth(min(72, natural))
+            dots = max(14, self._dots.fontMetrics().horizontalAdvance(
+                self._dots.text()))
+            word = self._label.fontMetrics().horizontalAdvance(self._label.text())
+            # 11px left + 6px gap + 11px right, matching the bubble margins.
+            self._bubble.setFixedWidth(min(240, 28 + dots + word))
         except Exception:
             pass
+
+    def set_activity(self, label: str = 'WORKING') -> None:
+        """Set the visible word beside the dots (``WORKING…``/``THINKING…``)."""
+        text = str(label or 'WORKING').strip().upper()
+        while text.endswith(('…', '.')):
+            text = text[:-1].rstrip()
+        self._label.setText((text or 'WORKING') + '…')
+        self._fit_bubble()
+
+    def activity_text(self) -> str:
+        try:
+            return str(self._label.text())
+        except Exception:
+            return ''
 
     def stop(self):
         self._timer.stop()
@@ -11065,6 +11094,50 @@ class _TypingIndicatorRow(QWidget):
             pass
         try:
             QFrame.paintEvent(self, event)
+        except Exception:
+            pass
+
+
+class _ChatNoticeRow(QWidget):
+    """A dim, UI-side line in the Chat Log: timeouts and local failures.
+
+    Deliberately NOT a ``_ChatMessageRow``. A notice is not something
+    J.A.R.V.I.S. said, so it must never be written into the conversation store
+    as an assistant turn (that would put words in the assistant's mouth and
+    survive a restart as if they were a reply).
+    """
+
+    def __init__(self, text: str, parent=None, tone: str = 'warn'):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet('background:transparent;border:none;')
+        error = str(tone or '').strip().lower() == 'error'
+        color = C.RED if error else C.ACC2
+        edge = 'rgba(255,92,110,105)' if error else 'rgba(244,178,74,105)'
+        wash = 'rgba(255,92,110,18)' if error else 'rgba(244,178,74,16)'
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 2, 6, 2)
+        row.addStretch(1)
+        self._label = QLabel(str(text or '').strip(), self)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet(
+            f'color:{color};font:600 8.4pt "Share Tech Mono";'
+            f'letter-spacing:0.4px;background:{wash};'
+            f'border:1px solid {edge};border-radius:9px;padding:5px 10px;')
+        row.addWidget(self._label, 0)
+        row.addStretch(1)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+    def text(self) -> str:
+        try:
+            return str(self._label.text())
+        except Exception:
+            return ''
+
+    def set_max_width(self, width: int) -> None:
+        try:
+            self._label.setMaximumWidth(max(220, int(width)))
         except Exception:
             pass
 
@@ -11294,6 +11367,20 @@ class _RoundedChatLog(QScrollArea):
         self._insert_before_stretch(widget)
         self._request_scroll_bottom()
 
+    def append_notice(self, text: str, tone: str = 'warn') -> None:
+        """Add a UI-side notice (timeout/failure) to the log.
+
+        It is not a conversation turn: no identity, no store record. The
+        history reload and the transcript export never see it.
+        """
+        body = str(text or '').strip()
+        if not body:
+            return
+        row = _ChatNoticeRow(body, self._page, tone=tone)
+        row.set_max_width(max(250, int(self.viewport().width() * 0.86)))
+        self._insert_before_stretch(row)
+        self._request_scroll_bottom()
+
     def append_message(self, who: str, text: str, you: bool=False, color: str|None=None, category: str='jarvis', muted: bool=False) -> None:
         raw_who = str(who or '').strip()
         compact = raw_who.lower().replace('.', '').replace(' ', '')
@@ -11388,23 +11475,29 @@ class _RoundedChatLog(QScrollArea):
                     if isinstance(r, _TypingIndicatorRow) and r is not keep]:
             self._drop_typing_row(row)
 
-    def show_typing_indicator(self) -> None:
-        """Show the dots, reusing (and un-hiding) the one existing row.
+    def show_typing_indicator(self, label: str | None = None) -> None:
+        """Show the working row, reusing (and un-hiding) the one existing row.
 
         There is exactly one typing row at any time: it is created once, put
         back into the layout if something took it out, re-shown if it was
         hidden, and any stray is purged. Nothing here consults ``isVisible()``.
+
+        ``label`` is the visible word (``WORKING``/``THINKING``); when omitted
+        an existing row keeps the word it has, and a new row starts at
+        ``WORKING``.
         """
         # A pending deferred hide (see hide_typing_indicator) must not fire
         # after we have just decided the dots are on again.
         self._cancel_typing_hide()
         row = getattr(self, '_typing_row', None)
         if row is None:
-            row = _TypingIndicatorRow(self._page)
+            row = _TypingIndicatorRow(self._page, label=label or 'WORKING')
             self._typing_row = row
             self._insert_before_stretch(row)
         else:
             try:
+                if label:
+                    row.set_activity(label)
                 if self._layout.indexOf(row) < 0:
                     self._insert_before_stretch(row)
                 row.show()
@@ -11809,6 +11902,14 @@ class _InlineVideoView(QWidget):
 class RefinedCommandWindow(_CommandWindow):
     """A calmer command deck retaining the original message and panel hooks."""
 
+    #: How long a request may be completely silent before the Chat Log stops
+    #: promising a reply and says so. Overridable for slow local models/tests;
+    #: the value is clamped so an env typo can never disable the safety net.
+    _RESPONSE_TIMEOUT_ENV = 'JARVIS_RESPONSE_TIMEOUT_SECONDS'
+    _RESPONSE_TIMEOUT_DEFAULT = 60.0
+    _RESPONSE_TIMEOUT_MIN = 0.05
+    _RESPONSE_TIMEOUT_MAX = 3600.0
+
     # ── Fading divider builder ────────────────────────────────────────────
     def _fading_rule_html(self, width_chars: int = 72) -> str:
         """A horizontal rule whose opacity fades smoothly to the right."""
@@ -11921,6 +12022,7 @@ class RefinedCommandWindow(_CommandWindow):
                 return
             self._stop_tw_timer()
             if not is_user:
+                self._cancel_response_watchdog()
                 self._cancel_indicator_settle()
                 self.chat.hide_typing_indicator()
                 # The reply text has landed, so the turn is no longer waiting
@@ -11971,6 +12073,7 @@ class RefinedCommandWindow(_CommandWindow):
 
     def finish_assistant_stream(self):
         try:
+            self._cancel_response_watchdog()
             self.chat.hide_typing_indicator()
             text = ''.join(getattr(self, '_stream_text_parts', [])).strip()
             if text:
@@ -12639,11 +12742,97 @@ class RefinedCommandWindow(_CommandWindow):
             except Exception:
                 pass
 
+    # ── Response watchdog ────────────────────────────────────────────────
+    # The indicator makes a promise ("a reply is coming"). Nothing used to
+    # withdraw that promise: a transport that died after the request was sent
+    # left the dots and the Stop glyph up forever. This single-shot timer is
+    # re-armed by every real activity signal and cancelled by the real end of
+    # the turn; when it fires it states the timeout plainly (as a UI notice,
+    # never as an assistant message).
+
+    def _response_timeout_seconds(self) -> float:
+        raw = ''
+        try:
+            raw = str(os.environ.get(self._RESPONSE_TIMEOUT_ENV, '') or '')
+        except Exception:
+            raw = ''
+        try:
+            value = float(raw) if raw.strip() else self._RESPONSE_TIMEOUT_DEFAULT
+        except Exception:
+            value = self._RESPONSE_TIMEOUT_DEFAULT
+        return max(self._RESPONSE_TIMEOUT_MIN,
+                   min(self._RESPONSE_TIMEOUT_MAX, value))
+
+    def _arm_response_watchdog(self) -> None:
+        """(Re)start the one silence timer for the current request."""
+        try:
+            timer = getattr(self, '_response_watchdog', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._on_response_timeout)
+                self._response_watchdog = timer
+            self._response_watchdog_seconds = self._response_timeout_seconds()
+            timer.start(max(50, int(self._response_watchdog_seconds * 1000)))
+        except Exception:
+            pass
+
+    def _cancel_response_watchdog(self) -> None:
+        timer = getattr(self, '_response_watchdog', None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def response_watchdog_active(self) -> bool:
+        timer = getattr(self, '_response_watchdog', None)
+        try:
+            return bool(timer is not None and timer.isActive())
+        except Exception:
+            return False
+
+    def _on_response_timeout(self) -> None:
+        """Nothing arrived for the whole window: stop promising, say why."""
+        if not self.is_busy():
+            # The turn already ended through another path; a stale timer must
+            # never add a notice to a conversation that is no longer waiting.
+            self._cancel_response_watchdog()
+            return
+        seconds = float(getattr(self, '_response_watchdog_seconds',
+                                self._RESPONSE_TIMEOUT_DEFAULT)
+                        or self._RESPONSE_TIMEOUT_DEFAULT)
+        self._cancel_response_watchdog()
+        try:
+            # Also restores the READY activity label; then settle immediately
+            # instead of waiting out the normal deferred-hide window.
+            self.clear_chat_activity()
+            self._cancel_indicator_settle()
+            self._settle_typing_indicator()
+        except Exception:
+            pass
+        shown = f'{seconds:g}'
+        notice = (f'NO RESPONSE AFTER {shown} S · The request may still be '
+                  f'running. Press STOP to interrupt, or send it again.')
+        try:
+            self.chat.append_notice(notice, tone='warn')
+        except Exception:
+            pass
+        try:
+            host = getattr(self, '_host', None)
+            write = getattr(host, 'write_log', None)
+            if callable(write):
+                write(f'WARN: chat request timed out after {shown}s '
+                      f'with no reply.')
+        except Exception:
+            pass
+
     def _settle_typing_indicator(self) -> None:
         # The request really has ended (nothing new for the settle window):
         # the dots go and the send button returns to its Send glyph. Fully
         # guarded: this fires from a QTimer, and an exception escaping a slot
         # aborts the application instead of just failing the update.
+        self._cancel_response_watchdog()
         try:
             self._set_busy(False)
         except Exception:
@@ -12652,6 +12841,22 @@ class RefinedCommandWindow(_CommandWindow):
             self.chat.hide_typing_indicator()
         except Exception:
             pass
+
+    def turn_finished(self) -> None:
+        """The model turn is genuinely over (``server_content.turn_complete``).
+
+        Distinct from ``clear_chat_activity()``, which runs after every tool
+        step while the same turn continues. Only this hook ends the visible
+        work state immediately and cancels the response watchdog.
+        """
+        self._cancel_response_watchdog()
+        try:
+            # Sets the READY label; it schedules a settle as a side effect.
+            self.clear_chat_activity()
+        except Exception:
+            pass
+        self._cancel_indicator_settle()
+        self._settle_typing_indicator()
 
     def set_chat_activity(self, activity: str) -> None:
         """Render the current J.A.R.V.I.S. action inside ReferenceDashboard."""
@@ -12662,8 +12867,13 @@ class RefinedCommandWindow(_CommandWindow):
                 self.clear_chat_activity()
                 return
             self._cancel_indicator_settle()
-            self.chat.show_typing_indicator()
+            lowered = text.lower()
+            label = 'THINKING' if (
+                'think' in lowered or 'reason' in lowered
+                or lowered in {'processing', 'working'}) else 'WORKING'
+            self.chat.show_typing_indicator(label)
             self._set_busy(True)
+            self._arm_response_watchdog()
             if now is not None:
                 display = text.upper().replace('\n', ' ')
                 if len(display) > 46:
@@ -12712,6 +12922,7 @@ class RefinedCommandWindow(_CommandWindow):
         """
         self._set_busy(False)
         try:
+            self._cancel_response_watchdog()
             self._cancel_indicator_settle()
             self.chat.hide_typing_indicator()
         except Exception:
@@ -12845,8 +13056,9 @@ class RefinedCommandWindow(_CommandWindow):
         # doing phases even if a caller only reports the activity row.
         try:
             self._cancel_indicator_settle()
-            self.chat.show_typing_indicator()
+            self.chat.show_typing_indicator('WORKING')
             self._set_busy(True)
+            self._arm_response_watchdog()
         except Exception:
             pass
         self._doing_generation[category] = self._doing_generation.get(category, 0) + 1
@@ -18873,6 +19085,8 @@ class MainWindow(QMainWindow):
     # it onto the GUI thread where the waveform painters actually live.
     _audio_level_sig = pyqtSignal(float)
     _chat_activity_sig = pyqtSignal(str)
+    #: One end-of-turn channel, distinct from the per-tool activity clear.
+    _turn_finished_sig = pyqtSignal()
     _live_transcript_sig = pyqtSignal(str, bool)
     # One authoritative chat-turn channel: a finalized user utterance (voice) or
     # a completed reply is delivered here as (role, text) so it is displayed and
@@ -19328,6 +19542,7 @@ class MainWindow(QMainWindow):
         self._gui_exec_sig.connect(self._run_gui_task)
         self._audio_level_sig.connect(self._apply_audio_level)
         self._chat_activity_sig.connect(self._apply_chat_activity)
+        self._turn_finished_sig.connect(self._apply_turn_finished)
         self._live_transcript_sig.connect(self._apply_live_transcript)
         self._chat_turn_sig.connect(self._apply_chat_turn)
         self._doing_sig.connect(self._apply_doing)
@@ -22479,6 +22694,23 @@ class MainWindow(QMainWindow):
         """Thread-safe: clear the chat activity indicator."""
         self._chat_activity_sig.emit('')
 
+    def turn_finished(self) -> None:
+        """Thread-safe: the model turn really ended (turn_complete).
+
+        Distinct from ``clear_chat_activity()``, which fires after every tool
+        step; this one ends the visible working state and the watchdog.
+        """
+        self._turn_finished_sig.emit()
+
+    def _apply_turn_finished(self) -> None:
+        """GUI-thread handler: end the turn in the open chat panel, if any."""
+        try:
+            win = getattr(self, '_command_window', None)
+            if win is not None:
+                win.turn_finished()
+        except Exception:
+            pass
+
     def set_doing(self, category: str, detail: str) -> None:
         """Thread-safe live activity update for the ReferenceDashboard.
 
@@ -24684,6 +24916,7 @@ class JarvisUI:
     def write_log(self,text): self._post(self._win._log_sig.emit, text)
     def set_chat_activity(self, activity: str): self._post(self._win._chat_activity_sig.emit, str(activity or ''))
     def clear_chat_activity(self): self._post(self._win._chat_activity_sig.emit, '')
+    def turn_finished(self): self._post(self._win.turn_finished)
     def set_live_transcript(self, text: str, final: bool = False): self._post(self._win._live_transcript_sig.emit, str(text or ''), bool(final))
     def submit_chat_turn(self, role: str, text: str): self._post(self._win.submit_chat_turn, str(role or ''), str(text or ''))
     def set_doing(self, category: str, detail: str): self._post(self._win.set_doing, category, detail)

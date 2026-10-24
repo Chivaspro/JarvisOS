@@ -42,7 +42,10 @@ _LIFECYCLE = (
     "set_chat_activity", "clear_chat_activity", "_schedule_indicator_settle",
     "_cancel_indicator_settle", "_settle_typing_indicator", "_set_busy",
     "is_busy", "_on_send_or_stop", "_request_interrupt",
-    "_clear_busy_after_interrupt",
+    "_clear_busy_after_interrupt", "turn_finished",
+    "_response_timeout_seconds", "_arm_response_watchdog",
+    "_cancel_response_watchdog", "response_watchdog_active",
+    "_on_response_timeout",
 )
 
 
@@ -50,8 +53,9 @@ class _RecChat:
     def __init__(self):
         self.shows = 0
         self.hides = 0
+        self.notices = []
 
-    def show_typing_indicator(self):
+    def show_typing_indicator(self, label=None):
         self.shows += 1
 
     def hide_typing_indicator(self):
@@ -59,6 +63,9 @@ class _RecChat:
 
     def has_typing_indicator(self):
         return self.shows > self.hides
+
+    def append_notice(self, text, tone='warn'):
+        self.notices.append(str(text))
 
 
 class _FakeSend:
