@@ -46,7 +46,7 @@ if not defined PY (
 )
 if not defined PY goto :nopython
 
-%PY% "%~dp0start_jarvis.py" --console-ui
+%PY% "%~dp0setup_jarvis.py" --launch
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :failed
 exit /b 0

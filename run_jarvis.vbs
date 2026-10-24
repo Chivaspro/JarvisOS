@@ -32,11 +32,11 @@ Dim WshShell, FSO, base, script, q, cmd, err
 Set WshShell = CreateObject("WScript.Shell")
 Set FSO = CreateObject("Scripting.FileSystemObject")
 base = FSO.GetParentFolderName(WScript.ScriptFullName)
-script = base & "\start_jarvis.py"
+script = base & "\setup_jarvis.py"
 q = Chr(34)
 
 If Not FSO.FileExists(script) Then
-    MsgBox "start_jarvis.py was not found:" & vbCrLf & script, 16, "J.A.R.V.I.S"
+    MsgBox "setup_jarvis.py was not found:" & vbCrLf & script, 16, "J.A.R.V.I.S"
     WScript.Quit 1
 End If
 
@@ -51,9 +51,9 @@ WshShell.CurrentDirectory = base
 ' WshShell.Run only errors when the executable cannot be launched at all, so a
 ' clean start exits 0 and we only move on when an interpreter is genuinely absent.
 For Each cmd In Array( _
-        "pythonw.exe " & q & script & q & " --console-ui", _
-        "pyw.exe -3 " & q & script & q & " --console-ui", _
-        "py.exe -3 -w " & q & script & q & " --console-ui")
+        "pythonw.exe " & q & script & q & " --launch", _
+        "pyw.exe -3 " & q & script & q & " --launch", _
+        "py.exe -3 -w " & q & script & q & " --launch")
     On Error Resume Next
     err = 0
     WshShell.Run cmd, 0, False          ' 0 = hidden window, False = do not wait

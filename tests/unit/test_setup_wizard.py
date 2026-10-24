@@ -26,9 +26,11 @@ import setup_jarvis  # noqa: E402
 
 WIZARD_SOURCE = ROOT / "setup_jarvis.py"
 
-# Project packages the wizard may import: both are themselves stdlib-only, so a
+# Project modules the wizard may import: all are themselves stdlib-only, so a
 # bare interpreter can import them before any pip install has happened.
-PROJECT_PACKAGES = {"core", "app"}
+# start_jarvis is the authority for HARD_IMPORTS (its own test enforces that it
+# imports nothing but the standard library), so the launch gate reuses it.
+PROJECT_PACKAGES = {"core", "app", "start_jarvis"}
 
 
 def _imported_top_level_modules(path: Path) -> set[str]:

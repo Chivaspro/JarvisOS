@@ -138,7 +138,7 @@ NODE_MIN_TEXT = "22.15.0"
 # repulsor-gold signature accent, and the same three status colours. 24-bit
 # codes render on a real terminal and degrade to plain text when NO_COLOR is
 # set or output is piped, so a logged run stays clean.
-_COLOR = sys.stdout.isatty()
+_COLOR = bool(sys.stdout and sys.stdout.isatty())
 if os.environ.get("NO_COLOR"):
     _COLOR = False
 
@@ -570,6 +570,77 @@ def _confirm(prompt: str, default: bool = False) -> bool:
     hint = " [Y/n] " if default else " [y/N] "
     answer = ask("  " + prompt + hint, "y" if default else "n").strip().lower()
     return answer in ("y", "yes")
+
+
+def _no_console() -> bool:
+    """True when there is no usable interactive console (pythonw / VBS)."""
+    return not (sys.stdin and sys.stdin.isatty()
+                and sys.stdout and sys.stdout.isatty())
+
+
+def _gui_message(message: str, title: str = "J.A.R.V.I.S") -> None:
+    """Native information box for a windowless launch; no-op in a terminal."""
+    if not _IS_WIN or not _no_console():
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x40)
+    except Exception:
+        pass
+
+
+def _launch_confirm(prompt: str, default: bool = True) -> bool:
+    """Yes/no that works with OR without a console.
+
+    ``_confirm`` deliberately answers its default when stdin is not a tty,
+    which is right for scripted maintenance and wrong for a launch: a
+    double-click would silently decline every repair. The VBS path gets a real
+    message box instead.
+    """
+    if not _no_console():
+        hint = " [Y/n] " if default else " [y/N] "
+        answer = ask("  " + prompt + hint, "y" if default else "n").strip().lower()
+        return answer in ("y", "yes")
+    if not _IS_WIN:
+        return default
+    try:
+        import ctypes
+        flags = 0x04 | 0x20           # MB_YESNO | MB_ICONQUESTION
+        if not default:
+            flags |= 0x100            # MB_DEFBUTTON2
+        return ctypes.windll.user32.MessageBoxW(
+            None, str(prompt), "J.A.R.V.I.S", flags) == 6   # IDYES
+    except Exception:
+        return default
+
+
+def _console_python() -> str:
+    """A python.exe (never pythonw.exe) for the interactive key wizard."""
+    exe = str(sys.executable or "")
+    low = exe.lower()
+    if low.endswith("pythonw.exe"):
+        sibling = exe[:-len("pythonw.exe")] + "python.exe"
+        if Path(sibling).is_file():
+            return sibling
+    if low.endswith("python.exe") and Path(exe).is_file():
+        return exe
+    return shutil.which("python") or shutil.which("py") or ""
+
+
+def _open_key_setup() -> bool:
+    """Run the interactive key wizard in its own console (pythonw has none)."""
+    exe = _console_python()
+    script = ROOT / "setup_jarvis.py"
+    if not exe or not script.is_file():
+        return False
+    try:
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if _IS_WIN else 0
+        proc = subprocess.Popen([exe, str(script), "--keys"],
+                                cwd=str(ROOT), creationflags=flags)
+        proc.wait()
+        return True
+    except Exception:
+        return False
 
 
 # ── 1. environment check ─────────────────────────────────────────────────────
@@ -2087,16 +2158,84 @@ def optimize() -> dict:
 
 # ── L. Launch ────────────────────────────────────────────────────────────────
 
+_LAUNCH_RUNTIME_CACHE: bool | None = None
+
+
+def _launch_runtime_complete() -> bool | None:
+    """Can the venv JARVIS will use import every hard requirement?
+
+    Returns ``None`` when the probe itself failed, so the caller stays silent
+    rather than claiming dependencies are missing. The import list and probe
+    come from start_jarvis.py - the same authority the launcher uses - so this
+    check can never drift from what the launch actually requires.
+    """
+    global _LAUNCH_RUNTIME_CACHE
+    if _LAUNCH_RUNTIME_CACHE is not None:
+        return _LAUNCH_RUNTIME_CACHE
+    try:
+        sys.path.insert(0, str(ROOT))
+        import start_jarvis as _sj
+        vpy = _venv_python()
+        if not Path(vpy).is_file():
+            _LAUNCH_RUNTIME_CACHE = False
+        else:
+            probe = _sj.probe_interpreter(vpy, _sj.HARD_IMPORTS, timeout=25.0)
+            _LAUNCH_RUNTIME_CACHE = bool(probe.complete)
+    except Exception:
+        _LAUNCH_RUNTIME_CACHE = None
+    return _LAUNCH_RUNTIME_CACHE
+
+
+def _ensure_launch_ready() -> None:
+    """Offer to repair what would make this launch fail, before it starts.
+
+    Two things are worth a prompt: the Python packages the app cannot import,
+    and the Gemini key that voice and chat require. Everything else degrades.
+    Declining is allowed - the launch continues and the in-app setup screen can
+    still fix it. Never raises: a pre-check must not be able to block a launch.
+    """
+    try:
+        if _launch_runtime_complete() is False:
+            warn("The Python packages J.A.R.V.I.S needs are not installed.")
+            if _launch_confirm(
+                    "Install all missing Python dependencies now?\n\n"
+                    "This happens once and can take a few minutes.", True):
+                _gui_message("J.A.R.V.I.S will install its Python packages now. "
+                             "This can take a few minutes.")
+                install_python_deps()
+
+        if not _gemini_key():
+            warn("No Gemini API key is configured (.env / config/api_keys.json).")
+            if _launch_confirm(
+                    "The Gemini API key is required for voice and chat.\n\n"
+                    "Configure it now?", True):
+                if _no_console():
+                    if not _open_key_setup():
+                        _gui_message(
+                            "Could not open the key setup window.\n\n"
+                            "Run:  python setup_jarvis.py --keys")
+                else:
+                    configure_keys("core")
+                    _ensure_env()
+    except Exception as exc:
+        warn(f"Launch pre-check skipped: {exc}")
+
+
 def launch() -> int:
     section("Launch")
     if not START.is_file():
         bad("start_jarvis.py is missing — cannot launch")
         return 1
+    # Detect missing packages/keys and offer to fix them BEFORE the core starts.
+    _ensure_launch_ready()
     auto_fix_gemini_before_launch()
     info("Starting J.A.R.V.I.S…")
     try:
         if _IS_WIN:
-            subprocess.Popen([sys.executable, str(START)], cwd=str(ROOT))
+            cmd = [sys.executable, str(START)]
+            if _no_console():
+                cmd.append("--console-ui")   # preserve the VBS splash path
+            subprocess.Popen(cmd, cwd=str(ROOT))
             ok("J.A.R.V.I.S. is starting in a separate process")
             return 0
         return subprocess.call([sys.executable, str(START)], cwd=str(ROOT))
