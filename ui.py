@@ -12154,10 +12154,14 @@ class RefinedCommandWindow(_CommandWindow):
         except Exception: pass
 
     def _position_history_stage(self) -> None:
-        """Size and place the standalone Chat History window at 4:5."""
+        """Fit the history surface to the Chat Log it belongs to."""
         try:
             stage = getattr(self, '_history_stage', None)
             if stage is None:
+                return
+            if bool(getattr(stage, '_embedded', False)):
+                stage.setGeometry(self.chat.geometry())
+                stage.raise_()
                 return
 
             screen = QApplication.screenAt(self.frameGeometry().center())
@@ -12245,20 +12249,26 @@ class RefinedCommandWindow(_CommandWindow):
             except Exception:
                 pass
 
-    def show_history(self) -> bool:
-        """Open Chat History as an independent 4:5 desktop window."""
-        try:
-            stage = getattr(self, '_history_stage', None)
-            if stage is None:
-                stage = HistoryStage(host=self)
-                self._history_stage = stage
+    def _ensure_history_stage(self):
+        """The one embedded history surface, created on first use."""
+        stage = getattr(self, '_history_stage', None)
+        if stage is not None:
+            return stage
+        stage = HistoryStage(host=self, parent=self, embedded=True)
+        stage.hide()
+        self._history_stage = stage
+        return stage
 
-            # The live Chat Log stays visible and interactive. Do not run the
-            # old overlay/backdrop/freeze path here.
+    def show_history(self) -> bool:
+        """Show Chat History inside the Chat Log area."""
+        try:
+            stage = self._ensure_history_stage()
+
+            # It covers the live log while it is open, but it is a child of
+            # this panel and never a separate desktop window.
             self._position_history_stage()
             stage.show()
             stage.raise_()
-            stage.activateWindow()
             try:
                 stage.show_chats()
             except Exception:
@@ -12279,7 +12289,7 @@ class RefinedCommandWindow(_CommandWindow):
             return False
 
     def clear_history_view(self) -> None:
-        """Hide the standalone Chat History window and return focus to chat."""
+        """Hide the Chat History surface and return focus to chat."""
         try:
             stage = getattr(self, '_history_stage', None)
             if stage is not None:
@@ -13404,11 +13414,8 @@ class RefinedCommandWindow(_CommandWindow):
         self._video_view_open=False; self._video_view_source=''; self._video_view_caption=''
         visual.addWidget(self._video_view_stage)
 
-        # -- History / Tasks: standalone desktop window --------------------
-        # Chat History is deliberately independent from the Vision/Reference
-        # Dashboard and from the live Chat Log. It opens as its own 4:5 window.
-        self._history_stage = HistoryStage(host=self)
-        self._history_stage.hide()
+        # Chat History is created with the Chat Log itself (below), so it can be
+        # an embedded surface of that log instead of a second desktop window.
 
         visual.setCurrentWidget(self._logo_page)
         cc.addWidget(visual, 1)
@@ -13602,6 +13609,13 @@ class RefinedCommandWindow(_CommandWindow):
         layout.insertLayout(layout.indexOf(self.chat), chat_hdr)
 
         layout.addWidget(self.chat, 1)
+
+        # -- Chat History: a surface of the Chat Log, not a separate window --
+        # It is a child of this panel and is positioned over `self.chat` when
+        # opened, so it can never float away from the conversation it belongs
+        # to. It is created hidden and costs nothing until the user asks.
+        self._history_stage = HistoryStage(host=self, parent=self, embedded=True)
+        self._history_stage.hide()
 
         # The realtime microphone transcript is rendered directly into the one
         # existing command textbox (`self.input`) — no separate preview widget.
@@ -17803,11 +17817,12 @@ class ConversationHistoryPage(QWidget):
 
 
 class HistoryStage(QWidget):
-    """Standalone 4:5 Chat History window.
+    """The Chat History surface.
 
-    The history UI used to be an overlay inside the main Chat Log. It is now a
-    real top-level Qt window so Chat History can stay open independently while
-    the main J.A.R.V.I.S. HUD remains usable.
+    ``embedded=True`` is how the Chat Panel builds it: a child of the panel that
+    occupies the live Chat Log, so history never floats away in a second
+    desktop window. The standalone mode remains for callers that build the
+    stage on its own.
 
     The archive is the project's own brain database (`memory/database.py`),
     reached the way the rest of the HUD reaches it (`memory.service`), so this
@@ -17820,24 +17835,32 @@ class HistoryStage(QWidget):
     is not something to run between two frames.
     """
 
-    def __init__(self, host=None, parent=None):
+    def __init__(self, host=None, parent=None, embedded: bool = False):
         super().__init__(parent)
         self._host = host
+        #: Embedded history lives inside the Chat Log, never in its own window.
+        self._embedded = bool(embedded)
 
-        # Chat History is intentionally a separate desktop window. Keep its
-        # proportions at an exact 4:5 portrait ratio instead of inheriting the
-        # main HUD's wide layout. The actual size is fitted to the available
-        # screen in the host's positioning helper.
-        self.setWindowFlags(
-            Qt.WindowType.Window
-            | Qt.WindowType.WindowTitleHint
-            | Qt.WindowType.WindowCloseButtonHint
-            | Qt.WindowType.WindowMinimizeButtonHint
-        )
-        self.setWindowTitle('J.A.R.V.I.S. · CHAT HISTORY')
+        if self._embedded:
+            # A child widget (Qt.Widget), not a desktop window: it occupies the
+            # Chat Log area and disappears with the panel.
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setMinimumSize(0, 0)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Expanding)
+        else:
+            # Standalone fallback for callers that build the stage on its own
+            # (the legacy archive view). The Chat Panel never uses this path.
+            self.setWindowFlags(
+                Qt.WindowType.Window
+                | Qt.WindowType.WindowTitleHint
+                | Qt.WindowType.WindowCloseButtonHint
+                | Qt.WindowType.WindowMinimizeButtonHint
+            )
+            self.setWindowTitle('J.A.R.V.I.S. · CHAT HISTORY')
+            self.setMinimumSize(400, 500)
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setObjectName('ChatHistoryWindow')
-        self.setMinimumSize(400, 500)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         self._loaded = False
         self._rows: list[dict] = []
@@ -18154,10 +18177,13 @@ class HistoryStage(QWidget):
             self._tasks.setPlainText(str(item.toolTip() or ''))
 
     def _close(self) -> None:
-        # Closing the standalone window only hides it. The live Chat Log remains
-        # visible because it is no longer covered by an overlay.
+        # Closing hides the surface and uncovers the live Chat Log underneath.
         try:
             self.hide()
+        except Exception:
+            pass
+        try:
+            self._host.input.setFocus()
         except Exception:
             pass
 

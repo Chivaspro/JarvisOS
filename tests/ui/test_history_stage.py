@@ -193,25 +193,42 @@ def panel(qapp):
     qapp.processEvents()
 
 
-def test_history_is_a_standalone_stage_not_a_vision_page(panel):
-    """Chat History is its own top-level window, not a reactor page.
+def test_history_is_embedded_in_the_chat_log(panel):
+    """Chat History is a surface of the Chat Log, not another desktop window.
 
-    It used to be an overlay/page of the ``_vision_visual`` stack; it is now a
-    real 4:5 desktop window (``HistoryStage``) so history can stay open while
-    the HUD remains usable. These assertions pin the new contract.
+    It briefly opened as a standalone 4:5 window, which detached it from the
+    conversation it belongs to (and could be left floating anywhere on screen).
+    These assertions pin it back inside the Chat Log area.
     """
     stage = panel._history_stage
     assert stage is not None
+    assert stage.parentWidget() is panel
+    assert stage.isWindow() is False, "Chat History must not be a top-level window"
     assert panel._vision_visual.indexOf(stage) == -1
     assert callable(panel.show_history)
     assert callable(panel.clear_history_view)
 
 
-def test_show_history_opens_the_stage_and_clear_hides_it(panel, archive, qapp):
+def test_show_history_opens_inside_the_chat_log_area(panel, archive, qapp):
     assert panel.show_history() is True
     _pump(qapp, 0.4)
-    assert not panel._history_stage.isHidden()
+    stage = panel._history_stage
+    assert not stage.isHidden()
+    assert stage.isWindow() is False
+    assert stage.geometry() == panel.chat.geometry(), (
+        "the history surface must occupy the live Chat Log, not a floating window")
 
     panel.clear_history_view()
     _pump(qapp, 0.4)
-    assert panel._history_stage.isHidden()
+    assert stage.isHidden()
+
+
+def test_the_history_surface_follows_the_chat_log_when_the_panel_resizes(
+        panel, archive, qapp):
+    assert panel.show_history() is True
+    _pump(qapp, 0.2)
+
+    panel.resize(660, 800)
+    _pump(qapp, 0.2)
+
+    assert panel._history_stage.geometry() == panel.chat.geometry()

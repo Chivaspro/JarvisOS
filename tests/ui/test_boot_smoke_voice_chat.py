@@ -82,6 +82,33 @@ def test_a_voice_turn_becomes_a_recorded_chat_turn(qapp, win, store):
     assert 'Jarvis, open YouTube' in [r._bubble._raw_text for r in _rows(panel)]
 
 
+def test_the_chat_panel_is_not_opened_by_launching(qapp, win):
+    """The HUD starts compact; only a user action brings the Chat Panel in."""
+    assert win._command_window is None
+
+
+def test_previous_chat_is_queued_faded_until_the_panel_is_opened(qapp, win, store):
+    conv = store.new_conversation()['id']
+    store.add_message(conv, 'user', 'before the restart')
+    store.add_message(conv, 'assistant', 'and the reply that followed')
+    store.set_last_active(conv)
+
+    assert win.restore_chat_history() is True
+    # Restoring must never open the panel as a launch side effect.
+    assert win._command_window is None
+    assert win._pending_restore_conv == conv
+
+    win._toggle_command_window()
+    qapp.processEvents()
+    panel = win._command_window
+    rows = _rows(panel)
+    assert [r._bubble._raw_text for r in rows] == [
+        'before the restart', 'and the reply that followed']
+    assert all(r._muted for r in rows), (
+        "a previous conversation must be shown faded, so it cannot be mistaken "
+        "for the live turn")
+
+
 def test_a_voice_turn_is_recorded_even_with_the_panel_hidden(qapp, win, store):
     win._toggle_command_window()
     qapp.processEvents()
