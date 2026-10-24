@@ -119,3 +119,21 @@ def test_mic_watchdog_replacement_actually_starts():
     assert "stale.stop()" in block and "stale.close()" in block
     assert "_failed_reopens >= 3" in block, "a failing reopen must back off, not storm"
 
+
+def test_a_failed_reopen_candidate_is_closed_not_leaked():
+    """The InputStream CONSTRUCTOR opens the PortAudio stream; if start() then
+    raises, the candidate must be closed in the handler. Leaking it left an
+    open stream behind while the fallback opened the SAME physical device —
+    two live streams on one device, the native access-violation window this
+    watchdog exists to avoid."""
+    start = MAIN.index("async def _listen_audio")
+    end = MAIN.index("async def _receive_audio", start)
+    block = MAIN[start:end]
+    assert "candidate = None" in block, (
+        "the candidate must be reset per attempt so a constructor failure "
+        "does not close an older stream")
+    reopen = block.index("_mic_stream = candidate")
+    handler = block[reopen:reopen + 900]
+    assert "candidate.close()" in handler, (
+        "a candidate whose start() failed must be closed, not leaked")
+

@@ -128,9 +128,9 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     # vision/ and every protected file. propose = never write without approval.
     "auto_heal_mode": "auto_low_risk",
     # ── Service links (Phase 3): one switch per external service ────────────
-    # Each one gates exactly one relationship, so revoking Spotify cannot leave
-    # Instagram automation quietly enabled.
-    "spotify": True,                # playback control through the Spotify MCP host
+    # Each one gates exactly one relationship, so revoking Instagram cannot
+    # leave smart-home control quietly enabled.
+    # (The "spotify" switch was removed with the Spotify MCP server.)
     "instagram": True,              # the user's own Instagram account (instagrapi)
     "smart_home": True,             # local Kasa/Tapo devices on this network
     "connect": True,                # the JarvisOS Connect gateway + paired clients

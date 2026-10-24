@@ -109,6 +109,27 @@ def _write(text: str) -> None:
         pass
 
 
+#: Marker written by BOTH controlled-exit paths. The boot sentry compares it
+#: against the crash log's mtime: the crash log is appended to on every exit
+#: (including clean ones), so its mtime alone said "crash" for a perfectly
+#: normal quit — and a good auto-heal patch was rolled back on the next
+#: launch whenever the user quit within the sentry's 15-minute window.
+_CLEAN_EXIT_MARKER = "jarvis_clean_exit.marker"
+
+
+def _mark_clean_exit() -> None:
+    """Record that THIS run is ending through a controlled exit."""
+    try:
+        base = _LOG_DIR if _LOG_DIR is not None else (
+            Path(__file__).resolve().parent.parent / "data" / "logs")
+        path = Path(base) / _CLEAN_EXIT_MARKER
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(datetime.now().isoformat(timespec="seconds") + "\n",
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Exception hooks — log, keep the process alive
 # ---------------------------------------------------------------------------
@@ -499,6 +520,9 @@ def force_exit(code: int = 0, timeout: float = 1.5) -> None:
             _CRASH_LOG.close()
     except Exception:
         pass
+    # Written AFTER the log's final line: the marker must carry a timestamp at
+    # least as new as the crash log's last write for a clean exit to register.
+    _mark_clean_exit()
     # Brief yield so lingering thread writes complete before process teardown
     time.sleep(0.05)
     # Hard exit. A daemon Timer is armed purely as a backstop in case some
@@ -528,3 +552,4 @@ def _shutdown() -> None:
             _CRASH_LOG.close()
     except Exception:
         pass
+    _mark_clean_exit()

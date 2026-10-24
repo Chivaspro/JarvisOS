@@ -274,3 +274,19 @@ def test_ui_close_paths_funnel_into_the_coordinator():
     assert "request_process_exit('main-window-close')" in src
     # the old quit-on-exec-only behaviour is now the fallback, not the path
     assert src.count("QApplication.quit()") >= 1
+
+
+def test_the_spoken_shutdown_uses_the_full_cleanup_chain():
+    """The shutdown_jarvis tool hard-exited with os._exit(0), skipping the
+    sounddevice shutdown, the hybrid-voice reset, the automation-worker
+    termination, MCP stdio teardown and the conversation-store close — MCP
+    servers and browser workers stayed orphaned after every spoken shutdown.
+    Every quit route must converge on the coordinator."""
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = src.index('elif name == "shutdown_jarvis":')
+    end = src.index("asyncio.create_task(_do_shutdown())", start)
+    block = src[start:end]
+    assert "_begin_shutdown_sequence(" in block, (
+        "the spoken shutdown must run the full cleanup chain")
+    assert "import os as _os" not in block and "_os._exit" not in block, (
+        "no direct hard exit may remain in the shutdown tool")

@@ -16,8 +16,9 @@ from services import hub, tool as hub_tool
 KNOWN_FIELDS = (
     "gemini_api_key", "openrouter_api_key", "anthropic_api_key", "openai_api_key",
     "groq_api_key", "custom_ai_api_key", "fish_audio_api_key", "elevenlabs_api_key",
-    "mem0_api_key", "qdrant_url", "qdrant_api_key", "spotify_client_id",
-    "spotify_client_secret", "weather_api_key", "radar_api_key",
+    "mem0_api_key", "qdrant_url", "qdrant_api_key",
+    # (spotify_client_id/secret were removed with the Spotify MCP server.)
+    "weather_api_key", "radar_api_key",
     "instagram_username", "instagram_password", "smart_home_hosts",
     "smart_home_username", "smart_home_password", "connect_pairing_secret",
     # The connector's project key. Listed here so the invariant holds: a
@@ -146,11 +147,11 @@ def test_status_targets_covers_every_row(monkeypatch):
 
 
 def test_a_switched_off_service_reports_its_credentials_as_disabled(monkeypatch):
-    monkeypatch.setattr(hub, "_feature_on", lambda name: name != "spotify")
+    monkeypatch.setattr(hub, "_feature_on", lambda name: name != "instagram")
     rows = {row["field"]: row for row in hub.status_targets(
-        {"spotify_client_id": "id", "spotify_client_secret": "secret"})}
-    assert rows["spotify_client_id"]["state"] == "disabled"
-    assert "switched off" in rows["spotify_client_id"]["detail"]
+        {"instagram_username": "u", "instagram_password": "p"})}
+    assert rows["instagram_username"]["state"] == "disabled"
+    assert "switched off" in rows["instagram_username"]["detail"]
 
 
 def test_provider_summary_names_every_provider():
@@ -180,7 +181,8 @@ def test_the_tool_can_name_a_key_by_its_config_field(monkeypatch):
 def test_the_tool_lists_keys_when_asked_to_test_without_a_name():
     out = hub_tool.handler({"action": "test"})
     assert "Links:" in out and "Keys:" in out
-    assert "openai" in out and "spotify" in out
+    assert "openai" in out and "instagram" in out
+    assert "spotify" not in out.lower()
 
 
 def test_the_tool_still_refuses_an_unknown_action():

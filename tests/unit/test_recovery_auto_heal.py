@@ -337,8 +337,82 @@ def test_boot_sentry_does_nothing_without_a_crash(scratch, monkeypatch):
     assert outcome["recovered"] is False
 
 
+def test_boot_sentry_ignores_a_crash_log_touched_by_a_clean_quit(broken_file, monkeypatch):
+    """The crash log is appended to on EVERY exit — clean ones included — so
+    its mtime alone looked like a crash and a working patch was rolled back
+    whenever the user quit within the sentry's 15-minute window. The clean-exit
+    marker (written after the log's last line) settles the question."""
+    import os
+    from recovery import boot_sentry
+    data_dir = broken_file.parent / "recovery"
+    monkeypatch.setattr(patcher, "_data_dir", lambda: data_dir)
+    patcher.apply_patch(_proposal_for(broken_file, "\n# good patch\n", monkeypatch))
+    patched_contents = broken_file.read_text(encoding="utf-8")
+
+    crash = broken_file.parent / "jarvis_crash.log"
+    crash.write_text("Process exiting cleanly (force_exit).", encoding="utf-8")
+    later = time.time() + 5
+    os.utime(crash, (later, later))
+    marker = broken_file.parent / "jarvis_clean_exit.marker"
+    marker.write_text("clean", encoding="utf-8")
+    os.utime(marker, (later + 1, later + 1))   # marker newer than the log
+    monkeypatch.setattr(boot_sentry, "crash_log_path", lambda: crash)
+
+    outcome = boot_sentry.check_and_recover()
+    assert outcome["recovered"] is False
+    assert "clean" in outcome["reason"]
+    assert broken_file.read_text(encoding="utf-8") == patched_contents, (
+        "a good patch must survive a clean quit")
+
+
+def test_boot_sentry_still_rolls_back_when_the_marker_is_older(broken_file, monkeypatch):
+    """A real crash writes the log WITHOUT a later marker — that must still
+    roll the patch back."""
+    import os
+    from recovery import boot_sentry
+    data_dir = broken_file.parent / "recovery"
+    monkeypatch.setattr(patcher, "_data_dir", lambda: data_dir)
+    original = broken_file.read_text(encoding="utf-8")
+    patcher.apply_patch(_proposal_for(broken_file, "\n# crashy patch\n", monkeypatch))
+
+    marker = broken_file.parent / "jarvis_clean_exit.marker"
+    marker.write_text("clean", encoding="utf-8")
+    crash = broken_file.parent / "jarvis_crash.log"
+    crash.write_text("THREAD ERROR: boom", encoding="utf-8")
+    later = time.time() + 5
+    os.utime(marker, (later, later))
+    os.utime(crash, (later + 1, later + 1))    # crash AFTER the last clean exit
+    monkeypatch.setattr(boot_sentry, "crash_log_path", lambda: crash)
+
+    outcome = boot_sentry.check_and_recover()
+    assert outcome["recovered"] is True
+    assert broken_file.read_text(encoding="utf-8") == original
+
+
 def test_history_file_is_valid_json(broken_file, monkeypatch):
     monkeypatch.setattr(patcher, "_data_dir", lambda: broken_file.parent / "recovery")
     patcher.apply_patch(_proposal_for(broken_file, "", monkeypatch))
     raw = json.loads((broken_file.parent / "recovery" / "patch_history.json").read_text(encoding="utf-8"))
     assert isinstance(raw, list) and raw
+
+
+def test_auto_heal_off_only_detects_and_reports(broken_file, monkeypatch):
+    """The documented contract for mode 'off' is detect-and-report only. The
+    old flow still called patcher.propose() — a full model round trip; this
+    file's autouse fixture fails the test if _ask is ever reached — and
+    offered a repair prompt for a feature the user had switched off."""
+    monkeypatch.setattr(service, "_mode", lambda: "off")
+    kinds = []
+    monkeypatch.setattr(service, "_event_handler",
+                        lambda kind, payload: kinds.append(kind))
+    monkeypatch.setattr(service, "_say", lambda text: None)
+
+    outcome = service.handle_now(_tb_for(broken_file), force=True)
+
+    assert outcome["stage"] == "detected"
+    assert outcome["auto"] is False
+    assert "switched off" in outcome["message"]
+    assert "repair_proposed" not in kinds, (
+        "off mode must not prepare or offer a patch")
+    assert kinds == ["repair_detected"], (
+        "off mode detects (for the log) and nothing else")

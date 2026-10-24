@@ -136,6 +136,16 @@ def test_the_connect_loop_resolves_the_live_key_and_heals_before_prompting():
         "the heal must run before the refusal count that triggers the prompt")
 
 
+def test_network_backoff_climbs_from_a_nonzero_floor():
+    """A successful connect resets _conn_backoff to 0, and the old doubling
+    multiplied from that 0 — so after any clean session a dead network meant a
+    connect attempt every half-second, with the HUD printing "retrying in 0s".
+    The doubling now has a floor of 3 s."""
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert 'max(3, getattr(self, "_conn_backoff", 3) * 2)' in source, (
+        "the network backoff must not be able to stay at 0")
+
+
 def test_the_locked_client_reuse_branch_rechecks_key_and_version():
     """A prewarm-era client may be reused ONLY when it matches the requested key
     and API version. The old code reused any non-None client, so a key change

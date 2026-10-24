@@ -64,6 +64,11 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          # pytest is a dev tool and deliberately not in requirements.txt —
+          # without this line the suite step dies with "No module named pytest"
+          # on a clean runner (the Linux job already installs it).
+          python -m pip install --disable-pip-version-check pytest
       - name: Unit + hybrid-voice suites
         run: python -m pytest tests/unit tests/hybrid_voice -q -p no:cacheprovider

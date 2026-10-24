@@ -264,6 +264,23 @@ def handle_now(traceback_text: str, *, source: str = "manual", request: str = ""
         "traceback": parsed.get("traceback", ""),
     })
 
+    if mode == "off":
+        # Documented contract (module docstring): off / self_heal false means
+        # "detect and report only". The old flow still called
+        # patcher.propose() — a full model round trip — and offered a repair
+        # prompt for a feature the user had switched off. The dedup stamp is
+        # still recorded so a repeating fault does not re-report every cycle.
+        _recent[key] = now
+        outcome = {
+            "ok": True, "stage": "detected", "auto": False, "mode": mode,
+            "parsed": parsed,
+            "message": (f"Auto-repair is switched off, so I have only logged "
+                        f"the fault in {Path(parsed['file']).name} line "
+                        f"{parsed['line']}, sir."),
+        }
+        _last_outcome = outcome
+        return outcome
+
     proposal = patcher.propose(traceback_text, parsed=parsed, context_notes=request)
     if not proposal.get("ok"):
         outcome = {"ok": False, "stage": "propose", "parsed": parsed,

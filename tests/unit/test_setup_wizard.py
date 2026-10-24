@@ -93,7 +93,9 @@ def test_check_flag_exits_zero(capsys):
 
 def test_probe_key_reports_optional_and_skipped():
     assert setup_jarvis.probe_key("gemini_api_key", "") == ("optional", "no value stored")
-    state, _detail = setup_jarvis.probe_key("spotify_client_id", "abc")
+    # A stored credential with no cheap read-only endpoint is reported honestly
+    # as "skipped" rather than guessed at.
+    state, _detail = setup_jarvis.probe_key("instagram_password", "abc")
     assert state == "skipped"
 
 

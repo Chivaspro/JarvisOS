@@ -1046,8 +1046,7 @@ EXTRA_KEYS: list[tuple[str, str, bool, str]] = [
      "https://cloud.qdrant.io/"),
     ("qdrant_url",          "Qdrant URL      (default http://localhost:6333)", False, ""),
     ("weather_api_key",     "Weather key     (optional)", True, ""),
-    ("spotify_client_id",   "Spotify client id     (optional, for MCP host)", False, ""),
-    ("spotify_client_secret", "Spotify client secret (optional)", True, ""),
+    # (The Spotify MCP client-id/secret fields were removed with the server.)
     ("instagram_username",  "Instagram username    (optional, your account)", False, ""),
     ("instagram_password",  "Instagram password    (optional)", True, ""),
     ("smart_home_username", "Kasa/Tapo username    (optional, local network)", False, ""),

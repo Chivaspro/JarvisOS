@@ -107,14 +107,45 @@ def redact_for_log(value: Any) -> Any:
 
 # Values that look like credentials even without a secret-named key around
 # them (API-key prefixes seen in the wild). Never logged verbatim.
+#
+# The shapes in live use were NOT covered by the original set: Google's current
+# "AQ." Gemini keys, OpenRouter's sk-or-v1-…, Anthropic's sk-ant-…, Fish
+# Audio's sk-fish-… (the hyphen after "or"/"ant"/"fish" broke the old
+# sk-[A-Za-z0-9]{20,}), and Groq's gsk_… . An exception string quoting any of
+# them reached the JSONL log verbatim.
 _SECRET_PATTERN = re.compile(
-    r"\b(AIzaSy[A-Za-z0-9_-]{30,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}"
-    r"|ghp_[A-Za-z0-9]{30,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,})\b"
+    r"(?<![A-Za-z0-9_-])("
+    r"AIzaSy[A-Za-z0-9_-]{30,}"
+    r"|AQ\.[A-Za-z0-9_-]{20,}"
+    r"|sk-(?:or-v1|proj|ant|fish)-[A-Za-z0-9_-]{16,}"
+    r"|sk-[A-Za-z0-9]{20,}"
+    r"|gsk_[A-Za-z0-9]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|ghp_[A-Za-z0-9]{30,}"
+    r"|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"
+    r")(?![A-Za-z0-9_-])"
 )
 
 
 def _scrub_text(text: str) -> str:
     return _SECRET_PATTERN.sub("[REDACTED]", text)
+
+
+def _scrub_value(value: Any) -> Any:
+    """Scrub secret-SHAPED strings anywhere inside a structure.
+
+    ``redact_for_log`` redacts by dict KEY NAME only, so a key pasted into chat
+    and echoed into a tool argument — main.py logs full tool arguments — was
+    persisted verbatim. Every string leaf now also passes through the
+    value-pattern scrubber.
+    """
+    if isinstance(value, str):
+        return _scrub_text(value)
+    if isinstance(value, dict):
+        return {k: _scrub_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return type(value)(_scrub_value(v) for v in value)
+    return value
 
 
 def log_event(
@@ -147,11 +178,11 @@ def log_event(
             "tool": str(tool or ""),
             "state": str(state or ""),
             "duration_ms": round(float(duration_ms), 2) if duration_ms is not None else None,
-            "result": redact_for_log(result) if result is not None else None,
+            "result": _scrub_value(redact_for_log(result)) if result is not None else None,
             "error": _scrub_text(str(error or "")),
         }
         for k, v in extra.items():
-            record[k] = redact_for_log(v)
+            record[k] = _scrub_value(redact_for_log(v))
         line = json.dumps(record, ensure_ascii=True, default=str)
         with _lock:
             fh = _get_fh()

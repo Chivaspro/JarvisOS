@@ -43,6 +43,15 @@ def _last_crash_time() -> float:
         return 0.0
 
 
+def _clean_exit_time() -> float:
+    """mtime of the clean-exit marker written by core.stability on ANY
+    controlled exit (force_exit / atexit shutdown)."""
+    try:
+        return float((crash_log_path().parent / "jarvis_clean_exit.marker").stat().st_mtime)
+    except Exception:
+        return 0.0
+
+
 def check_and_recover() -> dict[str, Any]:
     """Restore the previous source if the last patch is implicated in a crash."""
     row = patcher.last_applied_with_backup()
@@ -51,6 +60,17 @@ def check_and_recover() -> dict[str, Any]:
 
     patched_at = float(row.get("timestamp") or 0.0)
     crashed_at = _last_crash_time()
+
+    # The crash log is appended to on EVERY exit — including clean ones — so
+    # its mtime alone reported "crash" for a perfectly normal quit, and a
+    # working patch was rolled back whenever the user quit within the window.
+    # The marker is written AFTER the log's final line on any controlled
+    # exit, so a marker at least as new as the log means the last word in the
+    # log came from a clean shutdown.
+    clean_at = _clean_exit_time()
+    if clean_at > 0.0 and clean_at >= crashed_at:
+        return {"recovered": False, "reason": "the last exit was a clean shutdown"}
+
     if crashed_at < patched_at or (crashed_at - patched_at) > _CRASH_WINDOW_S:
         return {"recovered": False, "reason": "no crash after the last patch"}
 

@@ -12,10 +12,12 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-pytest.importorskip("numpy")
+# The guard must run BEFORE the import it guards: `import numpy as np` on the
+# line above it made the skip dead code, so a numpy-less interpreter (the
+# Linux CI "must COLLECT" job) raised ModuleNotFoundError during collection.
+np = pytest.importorskip("numpy")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:

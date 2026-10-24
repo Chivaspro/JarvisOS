@@ -17,7 +17,7 @@ Two rules hold everywhere in here:
 
 Nothing here holds a conversation, plans work or touches a tool: the callers are
 the Settings window (status pill) and the ``service_hub`` tool (the assistant
-answering "is my Spotify link working?").
+answering "is my weather link working?").
 """
 
 from __future__ import annotations
@@ -143,25 +143,10 @@ SERVICES: tuple[Service, ...] = (
         key_help="Anthropic Console ▸ Settings ▸ API keys ▸ Create key.",
         group="AI",
     ),
-    Service(
-        id="spotify",
-        label="Spotify",
-        summary="Playback control through the official Spotify MCP server, hosted "
-                "locally over stdio.",
-        switch="spotify",
-        # Both are required: without an app's client ID and secret there is
-        # nothing to authorise against, so a blank field is a missing key and
-        # not an optional one.
-        fields=(("spotify_client_id", "Spotify client ID", False, False),
-                ("spotify_client_secret", "Spotify client secret", True, False)),
-        note="Needs Node 18+ and a Spotify Premium account. The first run opens a "
-             "browser once to authorise the app.",
-        probe_name="_probe_spotify",
-        key_url="https://developer.spotify.com/dashboard",
-        help_url="https://developer.spotify.com/documentation/web-api/concepts/apps",
-        key_help="Spotify for Developers ▸ Dashboard ▸ Create app. Copy the Client "
-                 "ID from the app, then 'View client secret'.",
-    ),
+    # The Spotify MCP server row was removed with the server itself: a
+    # credential form for an integration that can never work is worse than no
+    # form. (Playing music through the INSTALLED Spotify app is a different,
+    # supported feature — capabilities/media.py.)
     Service(
         id="weather",
         label="Weather",
@@ -640,27 +625,14 @@ def _probe_anthropic(config: dict, timeout: float) -> dict:
         return _result("unavailable", f"Anthropic could not be reached: {exc}")
 
 
-def _probe_spotify(config: dict, timeout: float) -> dict:
-    """The Spotify MCP integration was removed from this build.
-
-    It used to probe ``mcp_host.servers.spotify`` (server + credentials +
-    token); that component is gone by request, so the link reports that
-    plainly instead of surfacing a module-load error.
-    """
-    return _result("unavailable",
-                   "The Spotify MCP integration has been removed from this "
-                   "build, so this link is not available.")
-
-
 def _probe_composio(config: dict, timeout: float) -> dict:
     """The connector is two questions before it is one: the package, then the key.
 
     The round trip is delegated to the connector's own health check rather than
     reimplemented here, so the Settings window and the assistant can never
     disagree about whether Composio answers. The first two branches touch no
-    network at all, which is what keeps a TEST button cheap: an absent package or
-    an absent key is settled locally, exactly as ``_probe_spotify`` settles its
-    credentials locally before it asks anything.
+    network at all, which is what keeps a TEST button cheap: an absent package
+    or an absent key is settled locally before anything is asked.
     """
     from connectors import composio_client, manager
 

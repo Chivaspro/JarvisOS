@@ -187,7 +187,7 @@ def test_search_finds_a_key_by_its_field(settings):
 
 
 def test_an_empty_search_hides_the_list(settings):
-    settings._search.setText("spotify")
+    settings._search.setText("instagram")
     assert settings._search_results.isVisible() or settings._search_results.count() > 0
     settings._search.setText("")
     assert settings._search_results.isHidden()

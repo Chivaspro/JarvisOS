@@ -38,23 +38,30 @@ def test_every_service_has_a_label_a_summary_and_a_probe():
 
 
 def test_describe_returns_ui_metadata_and_none_for_an_unknown_service():
-    meta = hub.describe("spotify")
-    assert meta["label"] == "Spotify"
-    assert meta["switch"] == "spotify"
+    meta = hub.describe("instagram")
+    assert meta["label"] == "Instagram"
+    assert meta["switch"] == "instagram"
     assert {field["name"] for field in meta["fields"]} == {
-        "spotify_client_id", "spotify_client_secret"}
+        "instagram_username", "instagram_password"}
     assert hub.describe("nope") is None
+
+
+def test_the_removed_spotify_mcp_has_no_row_left():
+    """The Spotify MCP server was deleted by request; a credential form for an
+    integration that can never work must not remain in Settings."""
+    assert hub.describe("spotify") is None
+    assert "spotify" not in {service.id for service in hub.SERVICES}
 
 
 # ── cheap status (never touches a socket) ─────────────────────────────────────
 
 def test_a_switch_that_is_off_is_reported_as_disabled(monkeypatch):
-    monkeypatch.setattr(hub, "_feature_on", lambda name: name != "spotify")
+    monkeypatch.setattr(hub, "_feature_on", lambda name: name != "instagram")
     rows = {row["id"]: row for row in hub.status_all({})}
-    assert rows["spotify"]["state"] == "disabled"
-    assert "switched off" in rows["spotify"]["detail"]
+    assert rows["instagram"]["state"] == "disabled"
+    assert "switched off" in rows["instagram"]["detail"]
     # The disabled service is not described as ready by accident.
-    assert rows["spotify"]["ok"] is False
+    assert rows["instagram"]["ok"] is False
 
 
 def test_a_missing_mandatory_credential_is_reported_by_name(monkeypatch):
@@ -73,29 +80,42 @@ def test_optional_credentials_do_not_block_a_service(monkeypatch):
     assert rows["weather"]["state"] != "missing_key"
 
 
-def test_spotify_needs_both_its_credentials(monkeypatch):
+def test_instagram_fields_are_optional_because_a_session_can_substitute(monkeypatch):
+    """Instagram needs a username+password OR a saved session, so the hub does
+    not brand it missing_key on empty fields — the real login state is what
+    TEST reports. (This is why it is not the service used to pin the
+    mandatory-credential message; the Gemini row above pins that.)"""
     monkeypatch.setattr(hub, "_feature_on", lambda name: True)
-    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
-    monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
-    rows = {row["id"]: row for row in hub.status_all({"spotify_client_id": "",
-                                                      "spotify_client_secret": ""})}
-    assert rows["spotify"]["state"] == "missing_key"
-    assert "Spotify client ID" in rows["spotify"]["detail"]
+    monkeypatch.delenv("INSTAGRAM_USERNAME", raising=False)
+    monkeypatch.delenv("INSTAGRAM_PASSWORD", raising=False)
+    rows = {row["id"]: row for row in hub.status_all({"instagram_username": "",
+                                                      "instagram_password": ""})}
+    assert rows["instagram"]["state"] == "configured"
+
+
+def test_the_hub_still_needs_a_real_credential_name_for_mandatory_fields(monkeypatch):
+    """A mandatory field that is empty IS named — the Gemini row proves the
+    mechanism the removed Spotify credential form used to exercise."""
+    monkeypatch.setattr(hub, "_feature_on", lambda name: True)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    rows = {row["id"]: row for row in hub.status_all({"gemini_api_key": ""})}
+    assert rows["gemini"]["state"] == "missing_key"
+    assert "Gemini API key" in rows["gemini"]["detail"]
 
 
 def test_probing_an_unknown_service_names_the_real_ones():
     result = hub.probe("telegraph", {})
     assert result["state"] == "unknown"
-    assert "spotify" in result["detail"]
+    assert "instagram" in result["detail"]
 
 
 def test_probing_a_switched_off_service_is_refused_before_any_request(monkeypatch):
     monkeypatch.setattr(hub, "_feature_on", lambda name: False)
     monkeypatch.setattr(hub, "_get", lambda *_a, **_k: pytest.fail("no request may run"))
-    result = hub.probe("spotify", {"spotify_client_id": "k",
-                                   "spotify_client_secret": "s"})
+    result = hub.probe("instagram", {"instagram_username": "u",
+                                     "instagram_password": "p"})
     assert result["state"] == "disabled"
-    assert result["switch"] == "spotify"
+    assert result["switch"] == "instagram"
 
 
 # ── real probes (transport stubbed) ───────────────────────────────────────────
@@ -395,7 +415,13 @@ def test_the_summary_lists_every_service():
 def test_the_tool_lists_every_link_for_the_assistant():
     out = hub_tool.handler({"action": "status"})
     assert "SERVICE LINKS" in out
-    assert "Spotify" in out
+    assert "Instagram" in out
+
+
+def test_the_tool_never_names_the_removed_spotify_link():
+    out = hub_tool.handler({"action": "status"})
+    assert "spotify" not in out.lower(), (
+        "the removed Spotify MCP must not be offered as a testable link")
 
 
 def test_the_tool_tests_one_service_and_names_it():
@@ -406,7 +432,7 @@ def test_the_tool_tests_one_service_and_names_it():
 
 def test_the_tool_asks_which_link_to_test():
     out = hub_tool.handler({"action": "test"})
-    assert "spotify" in out
+    assert "instagram" in out
 
 
 def test_the_tool_refuses_an_unknown_action():

@@ -85,14 +85,13 @@ _FEATURE_EXTRAS: list[tuple[str, str, str, str]] = [
     # silently not install composio and the hint would be a promise the codebase
     # does not keep.
     ("external_apps", "composio", "composio",
-     "the connector: Spotify, Gmail, GitHub and every other external app"),
+     "the connector: Gmail, GitHub and every other external app"),
 ]
 
-#: MCP servers run as child processes over stdio. The vendored Spotify server and
-#: any server the user adds need a Node runtime — a real requirement, so it is
-#: probed for real rather than assumed. The floor matches package.json's
-#: "engines" field exactly (>=22.15.0), so the probe cannot certify a runtime
-#: npm itself would refuse.
+#: MCP servers run as child processes over stdio, so every server the user adds
+#: needs a Node runtime — a real requirement, probed for real rather than
+#: assumed. The floor matches package.json's "engines" field exactly
+#: (>=22.15.0), so the probe cannot certify a runtime npm itself would refuse.
 NODE_MIN = (22, 15, 0)
 NODE_MIN_TEXT = "22.15.0"
 
@@ -143,7 +142,7 @@ def feature_status() -> list[dict]:
     node_ready, node_detail = node_status()
     rows.append({"feature": "mcp_host", "module": "node",
                  "package": f"Node.js >= {NODE_MIN_TEXT}",
-                 "purpose": "MCP servers over stdio (Spotify, and any you add)",
+                 "purpose": "MCP servers over stdio (any server you add)",
                  "ready": node_ready, "detail": node_detail,
                  "fix": "" if node_ready else
                         f"Install Node.js {NODE_MIN_TEXT}+ (nodejs.org) and reopen J.A.R.V.I.S."})

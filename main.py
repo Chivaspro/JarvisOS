@@ -2296,13 +2296,13 @@ TOOL_DECLARATIONS += [
 
 # ── Service hub (the external links and their real state) ────────────────────
 # One place that knows what each service needs and how to test it, so "is my
-# Spotify link working?" is answered from a real request rather than a guess.
+# weather link working?" is answered from a real request rather than a guess.
 TOOL_DECLARATIONS += [
     {
         "name": "service_hub",
         "description": (
             "Report the state of every external service link (Gemini, OpenRouter, "
-            "Anthropic, Spotify, weather, rain radar, Instagram, smart home, "
+            "Anthropic, weather, rain radar, Instagram, smart home, "
             "JarvisOS Connect and the document engines) plus every provider key "
             "(OpenAI, Groq, Fish Audio, ElevenLabs, Mem0, Qdrant, the custom "
             "provider) and test one for real. "
@@ -2327,7 +2327,7 @@ TOOL_DECLARATIONS += [
                 "service": {
                     "type": "STRING",
                     "description": ("Which link or key to test: gemini | openrouter | "
-                                    "anthropic | spotify | weather | radar | "
+                                    "anthropic | weather | radar | "
                                     "instagram | smart_home | connect | documents "
                                     "| openai | groq | fish_audio | elevenlabs | "
                                     "mem0 | qdrant_api_key."),
@@ -2336,7 +2336,7 @@ TOOL_DECLARATIONS += [
                     "type": "STRING",
                     "description": ("Alternatively the config field holding the "
                                     "credential, e.g. gemini_api_key | "
-                                    "openai_api_key | spotify_client_secret."),
+                                    "openai_api_key | groq_api_key."),
                 },
             },
             "required": ["action"],
@@ -2872,7 +2872,7 @@ class JarvisLive:
         except Exception as _pl_exc:
             print(f"[JARVIS] ⚠ Runtime plugin registration unavailable: {_pl_exc}")
 
-        # ── MCP servers (Spotify and anything else configured) ──────────────
+        # ── MCP servers (whatever the user has configured) ──────────────────
         # Each enabled server is a real child process speaking MCP over stdio;
         # its tools are published as `<prefix>__<tool>` through the registry
         # above, so they are offered to the model exactly like a plugin and
@@ -3073,7 +3073,13 @@ class JarvisLive:
             line = parsed.get("line")
             exc_name = str(parsed.get("exception_type") or "Error")
             if kind == "repair_detected":
-                line_text = f"Runtime fault: {exc_name} in {name} line {line} — analysing."
+                # Mode "off" only detects and reports — the same sentence must
+                # not promise analysis the policy has switched off.
+                if str((payload or {}).get("mode") or "") == "off":
+                    line_text = (f"Runtime fault: {exc_name} in {name} line {line} "
+                                 f"— auto-repair is off; logging only.")
+                else:
+                    line_text = f"Runtime fault: {exc_name} in {name} line {line} — analysing."
                 ui.run_on_ui(lambda t=line_text: ui.write_log(f"SYS: {t}"))
             message = str((payload or {}).get("message") or "").strip()
             if message:
@@ -4811,7 +4817,7 @@ class JarvisLive:
             except Exception:
                 pass
 
-    async    def _execute_tool(self, fc) -> types.FunctionResponse:
+    async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
         # NOTE: a model-authored `confirmed` flag is never treated as
@@ -4842,21 +4848,6 @@ class JarvisLive:
         except Exception:
             pass
 
-        try:
-            from observability.logger import log_event
-            log_event(
-                "INFO",
-                "agent",
-                "tool_started",
-                task_id=(_task_id or _corr),
-                tool=name,
-                state="RUNNING",
-                result={"activity": _doing_category, "detail": _doing_detail,
-                        "arguments": args},
-            )
-        except Exception:
-            pass
-
         _activity_args = args
         if name == 'file_processor' and not args.get('file_path'):
             _current_file = getattr(self.ui, 'current_file', None)
@@ -4879,6 +4870,25 @@ class JarvisLive:
                         _doing_detail = _doing_detail or str(_lc.get("request") or name)[:60]
             except Exception:
                 pass
+        # Logged AFTER the activity is resolved: the old placement read
+        # _doing_category/_doing_detail before _activity_for_tool() assigned
+        # them, so every call raised UnboundLocalError into the except — and
+        # every agent/tool_started record was silently missing from the log.
+        try:
+            from observability.logger import log_event
+            log_event(
+                "INFO",
+                "agent",
+                "tool_started",
+                task_id=(_task_id or _corr),
+                tool=name,
+                state="RUNNING",
+                result={"activity": _doing_category or "",
+                        "detail": _doing_detail or "",
+                        "arguments": args},
+            )
+        except Exception:
+            pass
         try:
             if _doing_category and _doing_detail:
                 self.ui.set_doing(_doing_category, _doing_detail)
@@ -5761,8 +5771,13 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
+                    # The full cleanup chain, not os._exit(0): the hard exit
+                    # skipped sounddevice shutdown, the hybrid-voice reset, the
+                    # automation-worker termination, MCP stdio teardown and the
+                    # conversation-store close — so MCP servers and browser
+                    # workers were orphaned on every spoken shutdown. The
+                    # sequence is idempotent and guarantees the process exit.
+                    _begin_shutdown_sequence("shutdown-tool")
                 asyncio.create_task(_do_shutdown())
 
             elif name in ("vision_look", "recognize_faces", "what_am_i_holding",
@@ -6225,6 +6240,7 @@ class JarvisLive:
                     except Exception:
                         pass
                     for _dev in (_mic_dev, None):
+                        candidate = None
                         try:
                             candidate = _open_mic(_dev)
                             candidate.start()
@@ -6232,6 +6248,18 @@ class JarvisLive:
                             break
                         except Exception as _re:
                             print(f"[JARVIS] ⚠️ Mic reopen failed ({_dev}): {_re}")
+                            # The InputStream CONSTRUCTOR opens the PortAudio
+                            # stream; start() merely starts it. If start() fails
+                            # the candidate holds an open stream that would leak
+                            # for the process lifetime — and the fallback open
+                            # on a single-mic machine targets the SAME device,
+                            # giving two live streams on one device: the exact
+                            # native-crash window the watchdog exists to avoid.
+                            if candidate is not None:
+                                try:
+                                    candidate.close()
+                                except Exception:
+                                    pass
                     if _mic_stream is None:
                         _failed_reopens += 1
                         if _failed_reopens >= 3:
@@ -8029,7 +8057,12 @@ class JarvisLive:
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
                 if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
+                    # Doubling climbs from a NON-ZERO floor: a successful
+                    # connect resets _conn_backoff to 0, so plain `0 * 2`
+                    # stayed 0 forever — a dead network meant a connect
+                    # attempt every half-second, with the HUD even printing
+                    # "retrying in 0s".
+                    _conn_backoff = min(60, max(3, getattr(self, "_conn_backoff", 3) * 2))
                     self._conn_backoff = _conn_backoff
                     self.ui.set_state("RECONNECTING")
                     self.ui.write_log(

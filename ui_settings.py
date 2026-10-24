@@ -2359,12 +2359,7 @@ class SettingsWindow(QDialog):
             bool(feats.get("instagram", True)),
             "Off = JARVIS will not read or act on any Instagram account. "
             "Publishing and messaging always need a confirmation on the HUD."))
-        linksv.addWidget(self._flag_checkbox(
-            self._perm_checks, "spotify",
-            "Allow Spotify (playback control through the local MCP server)",
-            bool(feats.get("spotify", True)),
-            "Off = the Spotify MCP server is not started at all, so its tools "
-            "never appear to the model."))
+        # (The Spotify MCP server switch was removed with the server itself.)
         linksv.addWidget(self._flag_checkbox(
             self._perm_checks, "connect",
             "Allow JarvisOS Connect (a paired phone or browser reaching this PC)",
@@ -3280,16 +3275,8 @@ class SettingsWindow(QDialog):
             _test_all.setToolTip("Run every service test in the background, one at a time.")
             _test_all.clicked.connect(self._test_all_services)
             _actions_row.addWidget(_test_all)
-            # Spotify needs one interactive step that no probe can replace:
-            # the user approving access on spotify.com. The browser opens from
-            # here and the callback lands on 127.0.0.1, so the token never
-            # leaves this machine.
-            _authorise = QPushButton("AUTHORISE SPOTIFY")
-            _authorise.setToolTip(
-                "Open Spotify's consent page in the browser and store the "
-                "resulting token locally. Required once per machine.")
-            _authorise.clicked.connect(self._authorise_spotify)
-            _actions_row.addWidget(_authorise)
+            # (The AUTHORISE SPOTIFY button lived here; both the button and the
+            # Spotify MCP server were removed from this build.)
             _actions_row.addStretch(1)
             hubv.addLayout(_actions_row)
             lay.addWidget(hub_box)
@@ -3387,37 +3374,6 @@ class SettingsWindow(QDialog):
         for service_id in list(getattr(self, "_hub_rows", {})):
             self._test_service(service_id)
 
-    def _authorise_spotify(self) -> None:
-        """Run the PKCE flow on a worker thread (it waits for the browser)."""
-        self._set_hub_state("spotify", "testing",
-                            "Waiting for you to approve access in the browser…")
-        try:
-            import threading as _threading
-            _threading.Thread(target=self._authorise_spotify_async,
-                              name="spotify-authorise", daemon=True).start()
-        except Exception as exc:
-            self._set_hub_state("spotify", "unavailable", str(exc))
-
-    def _authorise_spotify_async(self) -> None:
-        try:
-            from mcp_host.servers.spotify import auth
-        except Exception:
-            self._hub_pending["spotify"] = {
-                "state": "unavailable", "ok": False, "label": "Spotify",
-                "detail": "The Spotify MCP integration has been removed from "
-                          "this build; authorisation is not available."}
-            return
-        try:
-            result = auth.authorize()
-            detail = str(result.get("detail") or "Spotify is authorised.")
-            self._hub_pending["spotify"] = {"state": "ready", "ok": True,
-                                             "label": "Spotify",
-                                             "detail": detail}
-        except Exception as exc:
-            self._hub_pending["spotify"] = {
-                "state": "unavailable", "ok": False, "label": "Spotify",
-                "detail": f"Spotify authorisation failed: {exc}"}
-
     def _refresh_mcp_servers(self) -> None:
         """The configured MCP servers and what the host actually published."""
         label = getattr(self, "_mcp_label", None)
@@ -3481,9 +3437,9 @@ class SettingsWindow(QDialog):
             "qdrant_api_key": self.qdrant_key_edit.text().strip(),
             "qdrant_url": self.qdrant_url_edit.text().strip() or DEFAULTS["qdrant_url"],
         }
-        # Service hub credentials (OpenRouter, Spotify, weather, radar,
-        # Instagram, smart home, Connect) — one generic pass, so adding a
-        # service to services/hub.py needs no change here.
+        # Service hub credentials (OpenRouter, weather, radar, Instagram,
+        # smart home, Connect) — one generic pass, so adding a service to
+        # services/hub.py needs no change here.
         for name, edit in (getattr(self, "_hub_fields", {}) or {}).items():
             data[name] = edit.text().strip()
         feats = dict((self._data or {}).get("features") or {})

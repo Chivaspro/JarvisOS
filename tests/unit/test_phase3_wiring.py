@@ -126,15 +126,21 @@ def test_the_settings_window_offers_every_new_switch():
     source = (PROJECT / "ui_settings.py").read_text(encoding="utf-8")
     for switch in ("process_control", "system_settings", "window_control",
                    "clipboard_sentry", "document_architect", "live_vision",
-                   "smart_home", "instagram", "spotify", "connect"):
+                   "smart_home", "instagram", "connect"):
         assert f'"{switch}"' in source, f"{switch} is missing from Settings"
+    # The Spotify MCP switch was removed with the server itself, and the dead
+    # AUTHORISE button with it — neither may creep back in.
+    assert '"spotify"' not in source
+    assert "_authorise_spotify" not in source
 
 
 def test_the_api_tab_has_the_service_hub_and_the_mcp_list():
     source = (PROJECT / "ui_settings.py").read_text(encoding="utf-8")
     assert "SERVICE HUB" in source
-    assert "_test_service" in source and "_authorise_spotify" in source
+    assert "_test_service" in source and "_test_all_services" in source
     assert "MCP SERVERS" in source
+    # The Spotify-specific AUTHORISE button is gone with its server.
+    assert "_authorise_spotify" not in source
 
 
 def test_the_repair_and_vision_paths_still_import():

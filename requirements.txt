@@ -16,6 +16,12 @@ PyQt6-WebEngine
 sounddevice
 miniaudio
 pyttsx3
+# edge-tts is the DEFAULT TTS engine (config default "edgetts"); without it a
+# venv built exactly from this file has no working default voice, and the
+# startup dependency sync can never repair it (it reconciles this file only).
+edge-tts
+# soundfile is treated as installer-core (audio I/O for the kokoro/piper path).
+soundfile
 fish-audio-sdk
 piper-tts
 openwakeword
