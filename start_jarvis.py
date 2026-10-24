@@ -549,18 +549,36 @@ def _start_optimizer(progress=None):
 
 
 def _finish_optimizer(handle, log) -> None:
-    """Give the sweep a few seconds, then hand its result to main.py via env."""
+    """Wait briefly for the fast sweep, then make main.py skip a second one.
+
+    The OS-temp walk is the only stage that can take longer than a few seconds;
+    it continues on this process's daemon thread, and this process stays alive
+    as the supervisor of main.py (``proc.wait()``), so the sweep is never cut
+    short. Waiting 25 s for it was pure launch latency.
+    """
     if handle is None:
         return
+    finished = False
     try:
-        handle.wait(25.0)   # its own time budget is 15s; never cut a sweep short
-        os.environ[ENV_OPT_DONE] = "1"   # main.py will not sweep a second time
-        line = handle.summary()
-        if line:
-            os.environ[ENV_OPT_SUMMARY] = line
-            log(line)
+        finished = handle.wait(3.5)
     except Exception:
         pass
+    # Set BEFORE Popen: the child inherits this environment, and it is what
+    # stops main.py from running the whole sweep a second time.
+    os.environ[ENV_OPT_DONE] = "1"
+    if finished:
+        try:
+            line = handle.summary()
+            if line:
+                os.environ[ENV_OPT_SUMMARY] = line
+                log(line)
+        except Exception:
+            pass
+    else:
+        try:
+            log("Cache sweep continuing in the background while JARVIS starts.")
+        except Exception:
+            pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────

@@ -37,7 +37,8 @@ import threading
 import time
 from pathlib import Path
 
-__all__ = ["start", "run_startup_optimization", "StartupOptimizer"]
+__all__ = ["start", "run_startup_optimization", "run_temp_sweep",
+           "StartupOptimizer"]
 
 _REPARSE = 0x400  # Windows FILE_ATTRIBUTE_REPARSE_POINT (symlink / junction)
 
@@ -244,11 +245,40 @@ def _emit(progress, fraction: float, label: str, detail: str = "") -> None:
         pass
 
 
+def _sweep_system_temp(base: Path, started: float, deadline: float,
+                       stats: dict, progress=None) -> None:
+    """Stage 2: the user's OS temp folder, files idle for a day or more.
+
+    This is the only unbounded stage - a cold machine can hold hundreds of
+    thousands of temp files. It is therefore the one stage allowed to continue
+    after JARVIS has started (the launcher process stays alive as supervisor).
+    The 24 h age floor is what makes that safe: nothing the new session writes
+    can be old enough to match.
+    """
+    _emit(progress, 0.30, "SWEEPING SYSTEM TEMP", "files idle for 24h+")
+    try:
+        hours = float(os.environ.get("JARVIS_STARTUP_TEMP_AGE_HOURS", "24") or 24)
+        tmp = Path(tempfile.gettempdir()).resolve()
+        if (tmp.name.lower() in ("temp", "tmp")
+                and tmp != Path(tmp.anchor) and tmp != Path.home()):
+            _purge(tmp, time.time() - max(1.0, hours) * 3600.0, deadline, stats,
+                   tick=lambda s: _emit(progress, 0.45, "SWEEPING SYSTEM TEMP",
+                                        f"{s['files']} files / "
+                                        f"{s['bytes'] / (1024 * 1024):.1f} MB"))
+    except Exception:
+        pass
+
+
 def run_startup_optimization(base_dir, started_at: float | None = None,
-                             time_budget: float = 15.0, progress=None) -> dict:
+                             time_budget: float = 15.0, progress=None,
+                             include_temp: bool = True) -> dict:
     """Do the sweep now. Never raises; returns a summary dict.
 
     ``progress(fraction, label, detail)`` (all optional) reports real progress.
+
+    ``include_temp=False`` runs only the bounded, app-owned stages. That is the
+    "fast" half used before boot; the OS-temp walk is then deferred to
+    :func:`run_temp_sweep`, which cannot delay the window.
     """
     stats = {"files": 0, "dirs": 0, "bytes": 0, "skipped": 0,
              "timed_out": False, "db": False, "seconds": 0.0, "ran": False}
@@ -264,7 +294,7 @@ def run_startup_optimization(base_dir, started_at: float | None = None,
     def freed() -> str:
         return f"{stats['files']} files / {stats['bytes'] / (1024 * 1024):.1f} MB"
 
-    # 1. JARVIS's own regenerable cache/temp — leftovers from earlier sessions.
+    # 1. JARVIS's own regenerable cache/temp - leftovers from earlier sessions.
     _emit(progress, 0.00, "PURGING JARVIS CACHE", "data/cache  data/tmp  data/temp")
     try:
         data = base / "data"
@@ -277,32 +307,27 @@ def run_startup_optimization(base_dir, started_at: float | None = None,
     except Exception:
         pass
 
-    # 2. The user's OS temp folder — only files untouched for a day or more.
-    _emit(progress, 0.30, "SWEEPING SYSTEM TEMP", "files idle for 24h+")
-    try:
-        hours = float(os.environ.get("JARVIS_STARTUP_TEMP_AGE_HOURS", "24") or 24)
-        tmp = Path(tempfile.gettempdir()).resolve()
-        if (tmp.name.lower() in ("temp", "tmp")
-                and tmp != Path(tmp.anchor) and tmp != Path.home()):
-            _purge(tmp, time.time() - max(1.0, hours) * 3600.0, deadline, stats,
-                   tick=lambda s: _emit(progress, 0.45, "SWEEPING SYSTEM TEMP", freed()))
-    except Exception:
-        pass
+    # 2. The user's OS temp folder - deferred when include_temp is False.
+    if include_temp:
+        _sweep_system_temp(base, started, deadline, stats, progress)
 
     # 3. Bytecode that outlived its source file.
-    _emit(progress, 0.60, "PRUNING ORPHANED BYTECODE", freed())
+    _emit(progress, 0.60 if include_temp else 0.35,
+          "PRUNING ORPHANED BYTECODE", freed())
     _prune_orphan_bytecode(base, deadline, stats)
 
     # 4. Runaway log files.
-    _emit(progress, 0.72, "TRIMMING OVERSIZED LOGS", "keeping newest 1 MB")
+    _emit(progress, 0.72 if include_temp else 0.55,
+          "TRIMMING OVERSIZED LOGS", "keeping newest 1 MB")
     _trim_logs(base, deadline, stats)
 
     # 5. Compact the chat-history database.
-    _emit(progress, 0.82, "COMPACTING CHAT DATABASE", "WAL checkpoint / analyze")
+    _emit(progress, 0.82 if include_temp else 0.75,
+          "COMPACTING CHAT DATABASE", "WAL checkpoint / analyze")
     stats["db"] = _checkpoint_conversations(base)
 
     # 6. Release freed memory.
-    _emit(progress, 0.95, "RELEASING MEMORY", freed())
+    _emit(progress, 0.95 if include_temp else 0.90, "RELEASING MEMORY", freed())
     try:
         gc.collect()
     except Exception:
@@ -312,16 +337,56 @@ def run_startup_optimization(base_dir, started_at: float | None = None,
     return stats
 
 
+def run_temp_sweep(base_dir, started_at: float | None = None,
+                   time_budget: float = 12.0, progress=None,
+                   stats: dict | None = None) -> dict:
+    """The deferred half: only the OS temp folder. Never raises.
+
+    Safe to run while JARVIS is starting: it deletes nothing newer than the
+    cutoff computed from ``started_at``.
+    """
+    if stats is None:
+        stats = {"files": 0, "dirs": 0, "bytes": 0, "skipped": 0,
+                 "timed_out": False, "db": False, "seconds": 0.0, "ran": True}
+    if not _enabled():
+        return stats
+    try:
+        t0 = time.monotonic()
+        _sweep_system_temp(
+            Path(base_dir).resolve(),
+            float(started_at or time.time()),
+            t0 + max(1.0, float(time_budget)),
+            stats,
+            progress,
+        )
+    except Exception:
+        pass
+    return stats
+
+
 class StartupOptimizer:
-    """Handle for the background sweep so boot can wait on it briefly."""
+    """Handle for the background sweep so boot can wait on it briefly.
+
+    ``wait()`` releases as soon as the fast, app-owned stages are done. The
+    OS-temp walk keeps running on the same daemon thread; the launcher process
+    stays alive as its supervisor (``proc.wait()``), so it cannot be killed
+    mid-sweep. ``wait_all()`` is for tests and shutdown.
+    """
 
     def __init__(self) -> None:
         self.result: dict = {}
         self._done = threading.Event()
+        self._all_done = threading.Event()
         self._thread: threading.Thread | None = None
+        self._slow_running = False
 
     def wait(self, timeout: float = 4.0) -> bool:
+        """Wait for the fast pass only."""
         return self._done.wait(max(0.0, float(timeout)))
+
+    def wait_all(self, timeout: float = 4.0) -> bool:
+        """Wait for the deferred OS-temp walk too."""
+        return self._all_done.wait(max(0.0, float(timeout)))
 
     def summary(self) -> str:
         r = self.result
@@ -329,14 +394,19 @@ class StartupOptimizer:
             return ""
         mb = r.get("bytes", 0) / (1024 * 1024)
         tail = " (stopped at time budget)" if r.get("timed_out") else ""
-        return (f"SYS: Startup optimize — cleared {r.get('files', 0)} cache/temp file(s), "
+        pending = (" (OS temp sweep continuing in the background)"
+                   if self._slow_running else "")
+        return (f"SYS: Startup optimize - cleared {r.get('files', 0)} cache/temp file(s), "
                 f"{mb:.1f} MB freed in {r.get('seconds', 0)}s; "
-                f"chat DB {'compacted' if r.get('db') else 'unchanged'}{tail}.")
+                f"chat DB {'compacted' if r.get('db') else 'unchanged'}"
+                f"{tail}{pending}.")
 
 
 def start(base_dir, progress=None) -> StartupOptimizer:
     """Start the sweep on a daemon thread and return its handle.
 
+    The bounded stages run first; ``wait()`` is satisfied as soon as they
+    finish, and the unbounded OS-temp walk then continues in the background.
     ``progress(fraction, label, detail)`` is called from that thread.
     """
     handle = StartupOptimizer()
@@ -344,13 +414,25 @@ def start(base_dir, progress=None) -> StartupOptimizer:
 
     def _work() -> None:
         try:
-            handle.result = run_startup_optimization(base_dir, started_at=started,
-                                                     progress=progress)
+            handle.result = run_startup_optimization(
+                base_dir, started_at=started, time_budget=3.0,
+                progress=progress, include_temp=False)
         except Exception:
-            handle.result = {}
+            handle.result = {"files": 0, "dirs": 0, "bytes": 0, "skipped": 0,
+                             "timed_out": False, "db": False, "seconds": 0.0,
+                             "ran": True}
         finally:
             _emit(progress, 1.0, "OPTIMIZATION COMPLETE", "")
             handle._done.set()
+        try:
+            handle._slow_running = True
+            run_temp_sweep(base_dir, started_at=started, time_budget=12.0,
+                           progress=None, stats=handle.result)
+        except Exception:
+            pass
+        finally:
+            handle._slow_running = False
+            handle._all_done.set()
 
     handle._thread = threading.Thread(target=_work, name="startup-optimizer", daemon=True)
     handle._thread.start()
