@@ -707,6 +707,25 @@ def _release_vision_resources():
         release_coordinator()
     except Exception:
         pass
+    # Close the camera LAST, and tell the camera module the process is
+    # leaving first: the UI warm-up thread can still be inside CameraManager
+    # construction (detect_cuda imports torch; tens of seconds on a cold
+    # machine), and releasing the device from under it is what produced the
+    # intermittent 0xC0000005 at exit (AUDIT_REPORT.md section 8.1). The flag
+    # turns new warm-ups into no-ops, the bounded join gives an in-flight one
+    # a chance to finish, and the release itself never blocks for long.
+    try:
+        from vision import camera as _camera_mod
+        _camera_mod.begin_shutdown()
+    except Exception:
+        pass
+    try:
+        _me = threading.current_thread()
+        for _thread in threading.enumerate():
+            if _thread is not _me and _thread.name == "jarvis-camera-warm":
+                _thread.join(timeout=2.0)
+    except Exception:
+        pass
     try:
         from vision.camera import release_global_camera
         release_global_camera()

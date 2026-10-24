@@ -827,10 +827,40 @@ class CameraManager:
 _GLOBAL: Optional[CameraManager] = None
 _GLOBAL_LOCK = threading.Lock()
 
+#: True from the moment the process starts leaving. Set by begin_shutdown()
+#: from main.py's shutdown sequence; never cleared - the process is ending.
+_SHUTTING_DOWN = False
+
+#: release_global_camera() waits at most this long for a warm-up that is
+#: still inside CameraManager construction. See the note in that function.
+_RELEASE_LOCK_TIMEOUT = 3.0
+
+
+def begin_shutdown() -> None:
+    """Mark the camera subsystem as leaving, so no warm-up starts a camera.
+
+    Idempotent and non-blocking. The UI warm-up thread can spend tens of
+    seconds inside ``detect_cuda`` (it imports torch); releasing the device
+    from under it is what produced the intermittent 0xC0000005 at exit
+    (measured 2026-10-24, AUDIT_REPORT.md section 8.1).
+    """
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+
 
 def get_camera_manager(config: Optional[VisionConfig] = None) -> CameraManager:
-    """Return the process-wide single camera manager."""
+    """Return the process-wide single camera manager.
+
+    Raises during shutdown when no manager exists yet: constructing a new one
+    (load_vision_config -> detect_cuda) while the process is leaving is the
+    other half of the exit race. Callers that run at shutdown already treat a
+    failure here as "camera unavailable".
+    """
     global _GLOBAL
+    if _SHUTTING_DOWN:
+        if _GLOBAL is not None:
+            return _GLOBAL
+        raise RuntimeError("camera subsystem is shutting down")
     if config is not None:
         with _GLOBAL_LOCK:
             if _GLOBAL is None:
@@ -852,15 +882,28 @@ def get_camera_manager(config: Optional[VisionConfig] = None) -> CameraManager:
 
 
 def release_global_camera() -> None:
-    """Stop + release the process-wide camera (used at shutdown)."""
+    """Stop + release the process-wide camera (used at shutdown).
+
+    The global lock is taken with a timeout ON PURPOSE. A warm-up thread can
+    still be inside CameraManager construction (``detect_cuda`` can take tens
+    of seconds), and calling ``stop(force=True)`` concurrently with that
+    native init is what produced the intermittent 0xC0000005 at exit. If the
+    process is leaving and the lock never frees, leaving the device to the OS
+    is strictly better than crashing in OpenCV; the handle dies with us.
+    """
     global _GLOBAL
-    with _GLOBAL_LOCK:
+    if not _GLOBAL_LOCK.acquire(timeout=_RELEASE_LOCK_TIMEOUT):
+        logger.warn("camera release skipped - warm-up still initialising")
+        return
+    try:
         if _GLOBAL is not None:
             try:
                 _GLOBAL.stop(force=True)
             except Exception:
                 pass
             _GLOBAL = None
+    finally:
+        _GLOBAL_LOCK.release()
 
 
 # ── tiny local helpers ─────────────────────────────────────────────────────
