@@ -65,7 +65,7 @@ environment one (install the MSVC/MFC runtime), not a code change.
   first open; `core/maintenance.run_maintenance()` also rotates (14-day + size
   cap).
 * Verified limitation: **none** — rotation exists. `docs/cleanup_report.md` §7
-  ("log rotation is not implemented") and `JARVIS_ARCHITECTURE.md` §14/§18
+  ("log rotation is not implemented") and `ARCHITECTURE.md` §14/§18
   disagree; the architecture doc matches the code.
 * Decision: **KEEP**; the stale note in `cleanup_report.md` is superseded by
   this audit (not edited, to avoid rewriting an historical report).

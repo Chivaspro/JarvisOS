@@ -37,7 +37,7 @@ jobs:
         run: |
           python - <<'PY'
           import compileall, re, sys
-          rx = re.compile(r"(node_modules|UI-TARS|\.venv|build|dist|\.git|\.pytest_tmp)")
+          rx = re.compile(r"(node_modules|UI-TARS|\.venv|build|dist|\.git|\.pytest_tmp|\.cache)")
           ok = compileall.compile_dir(".", quiet=1, rx=rx)
           print("compileall:", "ok" if ok else "FAILED")
           sys.exit(0 if ok else 1)

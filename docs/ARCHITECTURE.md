@@ -731,6 +731,7 @@ setup_jarvis.bat / python setup_jarvis.py     # interactive Setup & Control Cent
     [l] launch J.A.R.V.I.S. — hand over to start_jarvis.py
 
 setup_jarvis.py --all --yes                    # scripted, non-interactive
+setup_jarvis.py --auto-heal                    # one pass: repair every known failure
 setup_jarvis.py --install-missing              # add every dependency still absent
 install_dependencies.bat                       # create .venv + install py deps
 run_jarvis.bat                                 # just launch

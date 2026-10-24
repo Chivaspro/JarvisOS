@@ -9,6 +9,7 @@ content keeps working.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -73,7 +74,9 @@ def test_guard_never_raises():
 # ── wiring: the dispatcher consults the guard ─────────────────────────────────
 
 def test_execute_tool_runs_the_guard_before_acting():
-    start = MAIN_SRC.index("async    def _execute_tool")
+    match = re.search(r"async\s+def _execute_tool", MAIN_SRC)
+    assert match, "main.py must define async def _execute_tool"
+    start = match.start()
     end = MAIN_SRC.index("async def _brain_tool", start)
     body = MAIN_SRC[start:end]
     assert "_greeting_tool_refusal(name, _utterance)" in body

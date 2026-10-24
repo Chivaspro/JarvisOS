@@ -114,6 +114,7 @@ python setup_jarvis.py --browser          # Playwright chromium
 python setup_jarvis.py --keys --yes       # write keys from .env, no prompts
 python setup_jarvis.py --test             # test stored keys live
 python setup_jarvis.py --diagnose         # report providers and engines
+python setup_jarvis.py --auto-heal        # diagnose & repair every known failure
 python setup_jarvis.py --install-missing  # install everything still absent
 python setup_jarvis.py --all --yes        # everything, no prompts
 python setup_jarvis.py --launch           # start J.A.R.V.I.S.
@@ -232,6 +233,7 @@ needs no credentials and carries **no badge until it has actually run green**.
 | Voice silent / Gemini error | Check the key in **Settings ▸ AI** and run `python setup_jarvis.py --test`. The voice model is `gemini-3.8-live`; a retired model in your config is migrated automatically and reported. |
 | Microphone/speaker issues | Pick devices in **Settings ▸ Audio**; the app probes devices at startup. |
 | App won't start after a crash | `python setup_jarvis.py --inspect-crash`, or `python Closed_Jarvis.py`. |
+| Several things look broken at once | `python setup_jarvis.py --auto-heal` — repairs the runtime, packages, config/keys, Gemini, SQLite stores, stale locks and caches in one pass, then lists anything it could not fix. |
 
 **Where the logs are:** `data/logs/` (rotated structured JSONL) and the startup
 error file `jarvis_startup_error.log`. Diagnostics never include secret values.
@@ -240,9 +242,9 @@ error file `jarvis_startup_error.log`. Diagnostics never include secret values.
 
 ## Documentation
 
-* `docs/CODEBASE_AUDIT.md` *(repository root: `CODEBASE_AUDIT.md`)* — the audit
-  ledger: every finding with severity, evidence, fix status and test name.
-* `JARVIS_ARCHITECTURE.md` — startup flow, module boundaries, model routing,
+* `docs/CODEBASE_AUDIT.md` — the audit ledger: every finding with severity,
+  evidence, fix status and test name.
+* `docs/ARCHITECTURE.md` — startup flow, module boundaries, model routing,
   voice lifecycle, tool execution, permissions and integration boundaries.
 * `docs/FEATURE_AUDIT.md`, `docs/REPAIR_REPORT.md`, `docs/TEST_RESULTS.md`,
   `docs/coding_agent_hardening.md` — per-pass ledgers.

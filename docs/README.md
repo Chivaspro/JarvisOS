@@ -4,6 +4,8 @@ Project documentation that is not part of the main README.
 
 | Document | What it covers |
 | --- | --- |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Startup flow, module boundaries, model routing, voice lifecycle, tool execution, permissions and integration boundaries. |
+| [`CODEBASE_AUDIT.md`](CODEBASE_AUDIT.md) | The audit ledger: every finding with severity, evidence, fix status and test name. |
 | [`FEATURE_AUDIT.md`](FEATURE_AUDIT.md) | Master audit (2026-10-16): subsystem-by-subsystem status (A–K), source references, evidence, and BLOCKED/UNVERIFIED labels. |
 | [`REPAIR_REPORT.md`](REPAIR_REPORT.md) | Master audit (2026-10-16): each confirmed defect, root cause, fix, files changed, tests run and unresolved limitations. |
 | [`REPLACEMENT_DECISIONS.md`](REPLACEMENT_DECISIONS.md) | Master audit (2026-10-16): KEEP/IMPROVE/CONSOLIDATE/REPLACE/OPTIONAL/DEFER decisions with evidence. |
@@ -13,7 +15,7 @@ Project documentation that is not part of the main README.
 | [`pc_web_control.md`](pc_web_control.md) | PC and web control: the four local controllers (Playwright · pywinauto · UI-TARS-on-Gemini · PyAutoGUI), the action registry, routing, settings, activity rows and how each layer was verified. |
 | [`coding_agent_hardening.md`](coding_agent_hardening.md) | Coding agent (`dev_agent` / `code_helper`), 2026-10-17: exit-status run reporting, timeout honesty, project-venv isolation, alias-safe auto-install, file-path validation, credential pre-flight — and the 35 offline tests that pin them. |
 
-Everything else lives in the root [`readme.md`](../readme.md): capabilities,
+Everything else lives in the root [`README.md`](../README.md): capabilities,
 install, AI provider setup, voice/TTS compatibility, vision setup, optional
 packages, configuration and feature flags.
 

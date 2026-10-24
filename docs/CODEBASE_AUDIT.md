@@ -35,7 +35,7 @@ Excluded on purpose (vendored/generated, per project rules): `.venv/`,
   `_full_settings_window` (`ui.py:19764`).
 - **State writers:** one guarded writer per store (`app/config_guard.py`,
   `config/settings.py`).
-- **Degrade-never-crash conventions** documented in `JARVIS_ARCHITECTURE.md`
+- **Degrade-never-crash conventions** documented in `ARCHITECTURE.md`
   and honored in the code paths inspected.
 
 ## 3. Discovered problems, root causes, evidence
@@ -265,7 +265,7 @@ Baseline before this pass: `tests/unit` **1366 passed, 5 skipped, 0 failed**
 * **Fix:** one floor `(22, 15, 0)` in both modules; robust
   `_parse_node_version` (junk → `(0,0,0)`, minor/patch aware — the old check
   passed v22.14.9); every message aligned, including `setup_jarvis.py:921` and
-  `JARVIS_ARCHITECTURE.md`.
+  `ARCHITECTURE.md`.
 * **Tests:** `tests/unit/test_node_version_gate.py`; `test_feature_probes.py`
   updated for the new floor.
 
@@ -390,7 +390,7 @@ No git history rewrite was performed.
 
 * `readme.md` (2-line stub) → canonical **`README.md`** (case rename; a single
   root README, no duplicate).
-* `JARVIS_ARCHITECTURE.md` updated: Node floor, Live model source + retired-id
+* `ARCHITECTURE.md` updated: Node floor, Live model source + retired-id
   migration + BLOCKING pin, fail-closed permissions, `core/process_launch`.
 * **`.github/workflows/ci.yml` added** — Linux: byte-compile + full-suite
   collect + Node-gate test; Windows: `tests/unit` + `tests/hybrid_voice`. No

@@ -19,9 +19,8 @@ __pycache__/
 .venv/
 venv/
 env/
-.pytest_cache/
-.pytest_tmp/
-.pytest_tmp_hv/
+# One dedicated home for every cache / temp / test-scratch artifact.
+/.cache/
 # Local model weights (the ~600 MB laya-multilingual tree). Downloaded, not
 # source; pytest.ini and CI both exclude it from collection/compileall.
 # Root-anchored so data/models/ (the bundled vision model) stays committed.

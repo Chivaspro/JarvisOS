@@ -10,6 +10,10 @@ Enter runs, and every letter/number shortcut still works.
 
     [1] Quick setup          keys → packages → Gemini → Node → browser → test,
                              end to end in one press
+    [H] Auto heal            NEW one pass over every known failure: runtime,
+                             packages, config/keys, Gemini, databases, locks,
+                             caches — and a plain report of anything it could
+                             not repair
     [2] Install & update     ▸ Python 3.13 · packages · update · wipe .venv ·
                                Node runtime · Playwright · FFmpeg · Git ·
                                install ALL missing
@@ -508,6 +512,9 @@ def ok(msg: str) -> None:   print("  " + green("[ ok ] ") + msg)
 def warn(msg: str) -> None: print("  " + yellow("[warn] ") + msg)
 def bad(msg: str) -> None:  print("  " + red("[ X  ] ") + msg)
 def info(msg: str) -> None: print("  " + accent("[ .. ] ") + msg)
+# ``good`` is the historical name used by the maintenance paths; keep it as an
+# alias so a successful repair never ends in a NameError.
+def good(msg: str) -> None: ok(msg)
 
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: float | None = None,
@@ -2137,6 +2144,395 @@ def diagnose(auto_fix: bool = False) -> dict:
     return {"ready": ready, "missing": len(missing)}
 
 
+# ── 10. Auto heal ──────────────────────────────────────────────────────────
+#
+# "It fixes all bugs or errors" is a promise no installer can honestly make, so
+# Auto Heal covers every failure this project can actually detect and repair on
+# its own: the interpreter and pip, the .venv and its packages, the optional
+# feature packages, a damaged api_keys.json, Gemini, SQLite health, stale locks
+# and crash markers, the Node/browser runtime, and cache/bytecode bloat.
+# Anything it cannot fix is reported with the exact manual step instead of
+# being hidden — a heal pass never lies about what is still broken.
+
+#: The single dedicated cache/temp home (see .cache/README.md).
+CACHE_DIR = ROOT / ".cache"
+CACHE_SUBDIRS = ("pytest-tmp", "temp", "models", "quarantine")
+
+#: Directories the cache purge must never walk: installed runtimes, vendored
+#: tools, user data and the cache home itself.
+_CACHE_SKIP_DIRS = {".venv", "venv", "env", "node_modules", ".git",
+                    "UI-TARS", "models", "data", ".cache"}
+
+
+def _cache_dir(*parts: str) -> Path:
+    """Return (and create) a path inside the one dedicated cache home."""
+    path = CACHE_DIR.joinpath(*parts)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _tree_size(path: Path) -> int:
+    """Bytes held by a file or directory tree (never raises)."""
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except Exception:
+        return 0
+
+
+def _latest_config_backup() -> Path | None:
+    """The newest api_keys/settings backup, or None when there is none."""
+    try:
+        backups = [p for p in SETTINGS_BACKUP_DIR.glob("*.json") if p.is_file()]
+        backups.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return None
+    return backups[0] if backups else None
+
+
+def _seed_config_from_env() -> dict:
+    """API-key fields present in .env, shaped like api_keys.json."""
+    env = _read_env()
+    data: dict = {}
+    for field, _label, _secret, _url in CORE_KEYS + VOICE_KEYS + EXTRA_KEYS:
+        value = env.get(field.upper())
+        if value:
+            data[field] = value
+    return data
+
+
+def _heal_python_runtime() -> tuple[bool, str]:
+    """Check the interpreter, then bootstrap pip when it is missing."""
+    if not check_python():
+        return False, f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required"
+    if check_pip():
+        return True, "Python and pip are ready"
+    info("pip is missing — bootstrapping it with ensurepip…")
+    _run([sys.executable, "-m", "ensurepip", "--upgrade"], timeout=300)
+    if check_pip():
+        return True, "pip reinstalled with ensurepip"
+    return False, "pip could not be bootstrapped (repair Python manually)"
+
+
+def _heal_python_packages() -> tuple[bool, str]:
+    """Create .venv when absent, then reinstall requirements if PyQt6 is missing."""
+    if not ensure_venv():
+        return False, "the .venv could not be created"
+    vpy = _venv_python()
+    probe = _run([vpy, "-c", "import PyQt6"], timeout=30)
+    if probe and probe.returncode == 0:
+        return True, "core packages are present in .venv"
+    info("Core packages are incomplete — reinstalling requirements.txt…")
+    if install_python_deps():
+        return True, "requirements.txt reinstalled"
+    return False, "requirements.txt could not be installed"
+
+
+def _heal_optional_features() -> tuple[bool | None, str]:
+    """Install every optional feature package the project probes for."""
+    rows = _feature_rows()
+    if not rows:
+        return None, "feature probe unavailable (fix the core packages first)"
+    missing = [r for r in rows
+               if not r.get("ready") and r.get("module") != "node"]
+    if not missing:
+        return True, "every optional feature package is present"
+    info(f"{len(missing)} optional package(s) missing — installing…")
+    failed: list[str] = []
+    for row in missing:
+        installed, sentence = _install_feature(row["feature"])
+        (ok if installed else warn)(sentence)
+        if not installed:
+            failed.append(str(row["feature"]))
+    if failed:
+        return False, "still missing: " + ", ".join(failed)
+    return True, f"{len(missing)} optional package(s) installed"
+
+
+def _heal_config() -> tuple[bool, str]:
+    """Make api_keys.json readable with the right shapes, and mirror .env."""
+    _ensure_env()
+    original = CONFIG_FILE.is_file()
+    raw = ""
+    if original:
+        try:
+            raw = CONFIG_FILE.read_text(encoding="utf-8")
+        except Exception:
+            raw = ""
+
+    data: dict = {}
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+            data = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            data = {}
+
+    source = ""
+    if not data:
+        backup = _latest_config_backup()
+        if backup is not None:
+            try:
+                restored = json.loads(backup.read_text(encoding="utf-8"))
+                if isinstance(restored, dict) and restored:
+                    data, source = restored, f"backup {backup.name}"
+            except Exception:
+                pass
+    if not data:
+        seeded = _seed_config_from_env()
+        if seeded:
+            data, source = seeded, ".env"
+    if not data:
+        data, source = {}, "defaults"
+
+    changed = not original or bool(source)
+    if not isinstance(data.get("features"), dict):
+        data["features"] = {}
+        changed = True
+    if not str(data.get("assistant_name", "") or "").strip():
+        data["assistant_name"] = "JARVIS"
+        changed = True
+
+    # Fill blanks from .env (the shell launches read both, so drift is a real
+    # source of "the key is set but JARVIS says it is missing").
+    env = _read_env()
+    for field, _label, _secret, _url in CORE_KEYS + VOICE_KEYS + EXTRA_KEYS:
+        if str(data.get(field, "") or "").strip():
+            continue
+        value = env.get(field.upper(), "")
+        if value:
+            data[field] = value
+            changed = True
+
+    if changed and not _write_config(data):
+        return False, f"could not write {CONFIG_FILE.name}"
+
+    gemini = str(data.get("gemini_api_key", "") or "").strip()
+    _sync_gemini_env(gemini, _read_env())
+
+    if changed:
+        detail = "api_keys.json recreated"
+        if source:
+            detail += f" from {source}"
+        return True, detail
+    return True, "api_keys.json is valid and .env is in sync"
+
+
+def _heal_gemini() -> tuple[bool, str]:
+    """Repair google-genai, the stored key, and verify it live."""
+    return fix_gemini(verify=True, announce=False)
+
+
+def _heal_databases() -> tuple[bool, str]:
+    """quick_check every SQLite store; compact healthy ones, quarantine damage."""
+    dbs = sorted((ROOT / "data").glob("*.db"))
+    if not dbs:
+        return True, "no SQLite databases to verify"
+    damaged: list[str] = []
+    compacted = 0
+    for db in dbs:
+        try:
+            conn = sqlite3.connect(str(db), timeout=5.0)
+            try:
+                verdict = conn.execute("PRAGMA quick_check;").fetchone()
+            finally:
+                conn.close()
+            problem = str(verdict[0]) if verdict else "unknown"
+        except Exception as exc:
+            damaged.append(f"{db.name} ({type(exc).__name__})")
+            continue
+        if problem.strip().lower() != "ok":
+            copy = _cache_dir("quarantine") / f"{db.name}.{int(time.time())}"
+            try:
+                shutil.copy2(db, copy)
+                damaged.append(f"{db.name} damaged (copy in .cache/quarantine)")
+            except Exception:
+                damaged.append(f"{db.name} damaged")
+            continue
+        if _compact_sqlite_db(db) > 0:
+            compacted += 1
+    if damaged:
+        return False, "needs attention: " + "; ".join(damaged)
+    detail = f"{len(dbs)} database(s) healthy"
+    if compacted:
+        detail += f", {compacted} compacted"
+    return True, detail
+
+
+def _heal_crashes() -> tuple[bool, str]:
+    """Clear stale locks and archive crash markers (inspect_crashes, no prompts)."""
+    report = inspect_crashes(auto_fix=True)
+    fixes = report.get("fixes_applied") or []
+    if report.get("healthy"):
+        return True, (f"{len(fixes)} repair(s) applied" if fixes
+                      else "no locks or crash markers to clear")
+    return False, f"{len(report.get('issues') or [])} issue(s) still open"
+
+
+def _heal_node_runtime() -> tuple[bool | None, str]:
+    """Repair the Agent TARS Node runtime when Node itself is present."""
+    if not shutil.which("node") or not shutil.which("npm"):
+        return None, (f"Node.js {NODE_MIN_TEXT}+ not installed "
+                      f"(optional: Agent TARS automation)")
+    version = _version_of("node", "--version")
+    if _parse_node_version(version) < NODE_MIN:
+        return None, (f"Node.js {version or '?'} is older than {NODE_MIN_TEXT} "
+                      f"(optional: Agent TARS automation)")
+    if _node_modules_ready():
+        return True, f"Node runtime ready ({version or 'node'})"
+    info("node_modules is incomplete — walking the npm repair ladder…")
+    if install_node_deps():
+        return True, "Node runtime reinstalled"
+    return False, "npm could not repair node_modules"
+
+
+def _heal_playwright() -> tuple[bool | None, str]:
+    """Install the Playwright Chromium binary when the package is present."""
+    vpy = _venv_python()
+    py = vpy if Path(vpy).is_file() else sys.executable
+    probe = _run([py, "-m", "playwright", "--version"], timeout=20)
+    if not probe or probe.returncode != 0:
+        return None, "playwright package not installed (optional: browser automation)"
+    if _playwright_chromium_ready():
+        return True, "Chromium is already downloaded"
+    if install_playwright_browser():
+        return True, "Chromium downloaded"
+    return False, "Chromium could not be downloaded"
+
+
+def _playwright_chromium_ready() -> bool:
+    """True when a Playwright Chromium build is on disk in either cache root."""
+    roots = []
+    if _IS_WIN:
+        local = os.environ.get("LOCALAPPDATA", "")
+        if local:
+            roots.append(Path(local) / "ms-playwright")
+    roots.append(Path.home() / ".cache" / "ms-playwright")
+    for root in roots:
+        try:
+            if root.is_dir() and any(p.name.startswith("chromium")
+                                     for p in root.iterdir()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _heal_caches() -> tuple[bool, str]:
+    """Purge regenerable bytecode/temp output and keep the single .cache home."""
+    for sub in CACHE_SUBDIRS:
+        _cache_dir(sub)
+
+    freed = 0
+    removed = 0
+
+    # 1. Stale test/scratch dirs at the project root belong in .cache/.
+    for name in (".pytest_cache", ".pytest_tmp", ".pytest_tmp_hv",
+                 ".pytest_tmp_voice"):
+        path = ROOT / name
+        if path.exists():
+            freed += _tree_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+
+    # 2. In-tree __pycache__ and loose .pyc/.pyo (Python recreates them).
+    for root_dir, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in _CACHE_SKIP_DIRS]
+        if os.path.basename(root_dir) == "__pycache__":
+            for name in files:
+                try:
+                    freed += (Path(root_dir) / name).stat().st_size
+                except Exception:
+                    pass
+            removed += 1
+            dirs[:] = []
+            shutil.rmtree(root_dir, ignore_errors=True)
+            continue
+        for name in files:
+            if name.endswith((".pyc", ".pyo")):
+                target = Path(root_dir) / name
+                try:
+                    freed += target.stat().st_size
+                    target.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+
+    if removed:
+        return True, (f"{removed} cache item(s) removed "
+                      f"({round(freed / (1024 * 1024), 2)} MB)")
+    return True, "no stale cache or bytecode to remove"
+
+
+#: (key, label, repair) for one Auto Heal pass. ``None`` from a repair means the
+#: step was skipped because its optional component is not installed.
+AUTO_HEAL_STEPS: tuple[tuple[str, str, object], ...] = (
+    ("runtime",   "Python runtime & pip",         _heal_python_runtime),
+    ("packages",  "Virtualenv & Python packages", _heal_python_packages),
+    ("features",  "Optional feature packages",    _heal_optional_features),
+    ("config",    "Config & API key file",        _heal_config),
+    ("gemini",    "Gemini engine",                _heal_gemini),
+    ("databases", "SQLite databases",             _heal_databases),
+    ("crashes",   "Stale locks & crash markers",  _heal_crashes),
+    ("node",      "Node runtime (Agent TARS)",    _heal_node_runtime),
+    ("browser",   "Playwright Chromium",          _heal_playwright),
+    ("cache",     "Cache & bytecode",             _heal_caches),
+)
+
+
+def auto_heal(*, steps=None) -> dict:
+    """One key: diagnose every known failure and repair what can be repaired.
+
+    Each step returns ``(fixed, detail)`` where ``fixed`` is True (healed),
+    False (still broken — the detail names the manual fix) or None (skipped
+    because an optional component is not installed). The summary separates
+    those three outcomes so "Node isn't installed" never reads as a failure.
+    """
+    section("Auto heal  — one pass over every known failure")
+    chosen = list(AUTO_HEAL_STEPS if steps is None else steps)
+    healed: list[str] = []
+    skipped: list[str] = []
+    unresolved: list[str] = []
+    for index, (key, label, repair) in enumerate(chosen, start=1):
+        info(f"[{index}/{len(chosen)}] {label}")
+        try:
+            fixed, detail = repair()
+        except Exception as exc:
+            fixed, detail = False, f"{type(exc).__name__}: {exc}"
+        entry = f"{label}: {detail}"
+        if fixed is True:
+            ok(entry)
+            healed.append(entry)
+        elif fixed is None:
+            info(entry)
+            skipped.append(entry)
+        else:
+            warn(entry)
+            unresolved.append(entry)
+
+    print()
+    rule()
+    if unresolved:
+        warn(f"Auto heal finished — {len(unresolved)} item(s) still need attention.")
+    else:
+        ok("Auto heal finished — everything it can check is healthy.")
+    if skipped:
+        info(f"{len(skipped)} optional item(s) skipped (not installed).")
+    print("  " + faint(f"healed {len(healed)}  ·  skipped {len(skipped)}  ·  "
+                       f"open {len(unresolved)}"))
+
+    return {
+        "healthy": not unresolved,
+        "healed": healed,
+        "skipped": skipped,
+        "unresolved": unresolved,
+    }
+
+
 # ── packaging: a .exe that carries its saved data ────────────────────────────
 
 #: Folders that hold J.A.R.V.I.S.'s own saved state. They are bundled into the
@@ -2971,6 +3367,7 @@ def view_logs() -> None:
 #: Main menu rows: (key, title, description, submenu-id | callable | None=exit).
 MAIN_MENU: list[tuple[str, str, str, object]] = [
     ("1", "Quick setup",        "keys → packages → Gemini → Node → browser → test", _quick_setup),
+    ("h", "Auto heal",          "one pass: every known failure diagnosed & fixed", auto_heal),
     ("2", "Install & update",   "Python · Node · Playwright · FFmpeg · Git", "install-menu"),
     ("3", "Keys & providers",   "configure · test · fix Gemini · authorize", "keys-menu"),
     ("4", "Diagnose & fix",     "environment · crashes · logs · project folder", "diag-menu"),
@@ -3003,6 +3400,7 @@ SUBMENUS: dict[str, list[tuple[str, str, str, object]]] = {
         ("o", "Authorize providers", "open sign-up / key pages in browser", authorize_keys),
     ],
     "diag-menu": [
+        ("h", "Auto heal (fix everything)", "one pass over every known failure", auto_heal),
         ("1", "Environment check",   "Python · pip · Node · git · FFmpeg · .venv", report_env),
         ("i", "Inspect & fix crash", "debug run_jarvis crashes & fix", inspect_crashes),
         ("9", "Diagnose & repair",   "report, then fix what is missing", diagnose),
@@ -3177,6 +3575,7 @@ python setup_jarvis.py --fix-gemini    repair Gemini: install google-genai into 
 python setup_jarvis.py --fix-gemini --launch
                                        repair Gemini, then start J.A.R.V.I.S.
 python setup_jarvis.py --install-missing  install every dependency still absent
+python setup_jarvis.py --auto-heal     one pass: diagnose & repair every known failure
 python setup_jarvis.py --optimize      housekeeping (logs, cache, bytecode)
 python setup_jarvis.py --shrink        remove build dirs, clean caches, vacuum DBs
 python setup_jarvis.py --inspect-crash inspect & auto-fix run_jarvis crash causes
@@ -3227,6 +3626,10 @@ def build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         help="install every dependency still absent "
                              "(requirements + optional features + node)")
+    parser.add_argument("--auto-heal", dest="auto_heal", action="store_true",
+                        help="one pass: diagnose and repair every known "
+                             "failure (runtime, packages, config, Gemini, "
+                             "databases, locks, caches)")
     parser.add_argument("--optimize", action="store_true",
                         help="run housekeeping (logs, cache, bytecode)")
     parser.add_argument("--diagnose", action="store_true",
@@ -3321,6 +3724,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.install_missing:
         install_all_missing()
+        did_something = True
+
+    if args.auto_heal:
+        auto_heal()
         did_something = True
 
     if args.optimize:

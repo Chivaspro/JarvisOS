@@ -2,7 +2,7 @@
 
 Business date: 2026-10-16. Repository: `JarvisOS Main/` (branch `main`, one commit).
 Environment: `.venv` Python 3.14.8, `requirements.txt` fully installed + `pytest 9.1.1`.
-Method: code inspection against `JARVIS_ARCHITECTURE.md` + the suites in
+Method: code inspection against `ARCHITECTURE.md` + the suites in
 `tests/` + targeted live/repro checks. Report date and evidence are recorded for
 each row. **A feature is only marked working when a named command/test passed.**
 

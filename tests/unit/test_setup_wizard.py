@@ -606,3 +606,129 @@ def test_latency_report_says_so_when_the_log_is_missing(tmp_path, monkeypatch,
     monkeypatch.setattr(setup_jarvis, "ROOT", tmp_path)
     assert setup_jarvis.latency_report() == {}
     assert "No log yet" in capsys.readouterr().out
+
+# -- Auto heal --------------------------------------------------------------
+
+def test_auto_heal_separates_healed_skipped_and_open(capsys):
+    steps = [
+        ("a", "working step", lambda: (True, "repaired")),
+        ("b", "optional step", lambda: (None, "not installed")),
+        ("c", "broken step", lambda: (False, "manual fix needed")),
+    ]
+    summary = setup_jarvis.auto_heal(steps=steps)
+
+    assert summary["healthy"] is False
+    assert summary["healed"] == ["working step: repaired"]
+    assert summary["skipped"] == ["optional step: not installed"]
+    assert summary["unresolved"] == ["broken step: manual fix needed"]
+    out = capsys.readouterr().out
+    assert "Auto heal" in out and "still need attention" in out
+
+
+def test_auto_heal_turns_a_crashing_step_into_a_reported_failure(capsys):
+    def explode():
+        raise RuntimeError("boom")
+
+    summary = setup_jarvis.auto_heal(steps=[("x", "exploding step", explode)])
+
+    assert summary["healthy"] is False
+    assert "RuntimeError: boom" in summary["unresolved"][0]
+
+
+def test_auto_heal_reports_a_clean_pass_as_healthy(capsys):
+    summary = setup_jarvis.auto_heal(
+        steps=[("a", "one", lambda: (True, "ok")),
+               ("b", "two", lambda: (None, "optional")),
+               ("c", "three", lambda: (True, "ok"))])
+    assert summary["healthy"] is True
+    assert len(summary["healed"]) == 2 and len(summary["skipped"]) == 1
+
+
+def test_every_default_heal_step_returns_the_contract():
+    for key, label, repair in setup_jarvis.AUTO_HEAL_STEPS:
+        assert key and label and callable(repair)
+
+
+def test_auto_heal_is_on_the_main_menu_and_in_diagnose():
+    assert setup_jarvis._lookup_choice("h", "")[1] is setup_jarvis.auto_heal
+    assert setup_jarvis._lookup_choice("h", "diag-menu")[1] is setup_jarvis.auto_heal
+
+
+def test_parser_accepts_auto_heal():
+    assert setup_jarvis.build_parser().parse_args(["--auto-heal"]).auto_heal is True
+
+
+def test_heal_config_rebuilds_damaged_json_from_the_newest_backup(
+        tmp_path, monkeypatch):
+    cfg = tmp_path / "api_keys.json"
+    cfg.write_text("{not json", encoding="utf-8")
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    older = backups / "api_keys_old_settings.json"
+    older.write_text(json.dumps({"gemini_api_key": "old"}), encoding="utf-8")
+    newer = backups / "settings_new.json"
+    newer.write_text(json.dumps({"gemini_api_key": "new-key"}), encoding="utf-8")
+    os.utime(older, (1_600_000_000, 1_600_000_000))
+    os.utime(newer, (1_700_000_000, 1_700_000_000))
+
+    monkeypatch.setattr(setup_jarvis, "CONFIG_FILE", cfg)
+    monkeypatch.setattr(setup_jarvis, "ENV_FILE", env)
+    monkeypatch.setattr(setup_jarvis, "ENV_EXAMPLE", tmp_path / ".env.example")
+    monkeypatch.setattr(setup_jarvis, "SETTINGS_BACKUP_DIR", backups)
+
+    fixed, detail = setup_jarvis._heal_config()
+
+    assert fixed is True and "backup" in detail
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["gemini_api_key"] == "new-key"
+    assert isinstance(data["features"], dict)
+    # The restored key is mirrored into .env for shell launches.
+    assert "GEMINI_API_KEY=new-key" in env.read_text(encoding="utf-8")
+
+
+def test_heal_config_creates_a_valid_file_when_none_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_jarvis, "CONFIG_FILE", tmp_path / "api_keys.json")
+    monkeypatch.setattr(setup_jarvis, "ENV_FILE", tmp_path / ".env")
+    monkeypatch.setattr(setup_jarvis, "ENV_EXAMPLE", tmp_path / ".env.example")
+    monkeypatch.setattr(setup_jarvis, "SETTINGS_BACKUP_DIR", tmp_path / "backups")
+
+    fixed, _detail = setup_jarvis._heal_config()
+
+    assert fixed is True
+    data = json.loads((tmp_path / "api_keys.json").read_text(encoding="utf-8"))
+    assert data["assistant_name"] == "JARVIS"
+    assert data["features"] == {}
+
+
+def test_heal_caches_purges_bytecode_but_never_touches_runtimes_or_user_data(
+        tmp_path, monkeypatch):
+    (tmp_path / "pkg" / "__pycache__").mkdir(parents=True)
+    (tmp_path / "pkg" / "__pycache__" / "a.cpython-313.pyc").write_bytes(b"x" * 10)
+    (tmp_path / "loose.pyc").write_bytes(b"x" * 5)
+    (tmp_path / ".venv" / "Lib" / "__pycache__").mkdir(parents=True)
+    keep = tmp_path / ".venv" / "Lib" / "__pycache__" / "keep.pyc"
+    keep.write_bytes(b"x")
+    (tmp_path / "data" / "__pycache__").mkdir(parents=True)
+    keep_data = tmp_path / "data" / "__pycache__" / "keep.pyc"
+    keep_data.write_bytes(b"x")
+
+    monkeypatch.setattr(setup_jarvis, "ROOT", tmp_path)
+    monkeypatch.setattr(setup_jarvis, "CACHE_DIR", tmp_path / ".cache")
+
+    fixed, detail = setup_jarvis._heal_caches()
+
+    assert fixed is True and "removed" in detail
+    assert not (tmp_path / "pkg" / "__pycache__").exists()
+    assert not (tmp_path / "loose.pyc").exists()
+    assert keep.is_file(), "installed runtimes are protected"
+    assert keep_data.is_file(), "user data is protected"
+    for sub in setup_jarvis.CACHE_SUBDIRS:
+        assert (tmp_path / ".cache" / sub).is_dir()
+
+
+def test_heal_node_runtime_skips_instead_of_failing_when_node_is_absent(monkeypatch):
+    monkeypatch.setattr(setup_jarvis.shutil, "which", lambda name: None)
+    fixed, detail = setup_jarvis._heal_node_runtime()
+    assert fixed is None and "not installed" in detail
