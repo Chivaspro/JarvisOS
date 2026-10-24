@@ -75,7 +75,9 @@ def _get(server, path: str, token: str = ""):
 
 def test_the_pairing_code_is_derived_and_rotates(monkeypatch):
     monkeypatch.setattr(devices, "pairing_secret", lambda: "s3cret")
-    now = time.time()
+    # Anchor inside one code window. A bare time.time() + 10 crosses the
+    # boundary for ~3% of runs, which made this deterministic test flaky.
+    now = (time.time() // devices.CODE_WINDOW_S) * devices.CODE_WINDOW_S + 1.0
     first = devices.pairing_code(window=now)
     again = devices.pairing_code(window=now + 10)
     later = devices.pairing_code(window=now + devices.CODE_WINDOW_S + 5)
