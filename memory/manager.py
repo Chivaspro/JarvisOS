@@ -475,8 +475,14 @@ class BrainMemory:
                 s += 3.0
             if w in m.get("category", "").lower():
                 s += 1.0
-        recency = _sigmoid((now - float(m.get("updated_at", now))) / 86400.0, k=-0.25)
-        access = _sigmoid(float(m.get("access_count", 0)) / 20.0, k=1.0)
+        # Direction matters: _sigmoid(x, k) = 1/(1+e^(k·x)). With k = -0.25 the
+        # term grew with the memory's AGE and ranked the oldest rows highest;
+        # with k = +1.0 the access term FELL as a memory was recalled more.
+        # Both contradicted this module's own rule that "memories the user
+        # keeps querying outrank one-off context". Fresh and frequently-used
+        # memories must score higher.
+        recency = _sigmoid((now - float(m.get("updated_at", now))) / 86400.0, k=0.25)
+        access = _sigmoid(float(m.get("access_count", 0)) / 20.0, k=-1.0)
         s *= (0.5 + 0.5 * float(m.get("importance", 0.5)))
         s *= (0.4 + 0.6 * float(m.get("confidence", 0.6)))
         s += recency * 2.0 + access * 0.5
@@ -549,7 +555,11 @@ class BrainMemory:
                         "importance": max(float(keeper["importance"]), float(dropper["importance"])),
                     })
                     stats["merged"] += 1
-                elif norm in on or on in norm and len(on) > 18 and len(norm) > 18:
+                # Parenthesised on purpose: `and` binds tighter than `or`, so
+                # the unparenthesised form was `(norm in on) or (on in norm and
+                # guards)` — any containment at all superseded one memory with
+                # the other, and the length guards applied to one side only.
+                elif (norm in on or on in norm) and len(on) > 18 and len(norm) > 18:
                     if on in norm:
                         self._db.mark_superseded(other["id"], m["id"])
                     else:

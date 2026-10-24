@@ -9,6 +9,7 @@ retriever, which falls back to local search and logs one notice.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 _COLLECTION = os.environ.get("QDRANT_COLLECTION", "jarvis_knowledge")
@@ -36,10 +37,7 @@ def _client():
 def search(query: str, limit: int = 8) -> list[dict[str, Any]]:
     """Semantic search; raises on unavailability (retriever falls back)."""
     client = _client()
-    try:
-        from qdrant_client.models import Filter
-    except Exception:
-        Filter = None  # older clients
+    # (An unused qdrant Filter import lived here — no filter is applied.)
     # Embedding provider: reuse the memory layer's local embeddings when
     # present (no extra network dependency), else dense-vector is unavailable
     # and the caller falls back to local search.

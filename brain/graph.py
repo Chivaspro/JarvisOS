@@ -478,17 +478,20 @@ class Orchestrator:
             "cursor": 0, "results": [], "errors": [], "replans": 0,
             "observation": {}, "verified": False, "terminal_error": "",
         }, config={"configurable": {"thread_id": tid}})
-        exhausted = (
-            int(final.get("replans", 0)) > MAX_REPLANS
-            or (final.get("cursor", 0) >= len(final.get("plan") or [])
-                and bool(final.get("errors")))
-        )
-        if exhausted and final.get("errors"):
-            emit_state(tid, TaskState.FAILED, final["errors"][-1])
+        # A run is FAILED only when it genuinely failed: an unrecoverable step
+        # recorded a terminal error, or the replan budget was spent. `errors`
+        # accumulates for the whole run and is never cleared after a successful
+        # replan, so the old `cursor >= len(plan) and bool(errors)` test
+        # reported an honest, fully-recovered completion as a failure — the
+        # inverse of the honesty rule this module enforces elsewhere.
+        terminal = str(final.get("terminal_error") or "").strip()
+        exhausted = int(final.get("replans", 0)) > MAX_REPLANS or bool(terminal)
+        if exhausted:
+            detail = terminal or (list(final.get("errors") or ["failed"]))[-1]
+            emit_state(tid, TaskState.FAILED, detail)
             return OrchestratorResult(
                 ok=False,
-                summary=(f"failed after {final.get('replans', 0)} replans: "
-                         f"{final['errors'][-1]}"),
+                summary=(f"failed after {final.get('replans', 0)} replans: {detail}"),
                 steps_done=list(final.get("results") or []),
                 errors=list(final.get("errors") or []),
                 replans=int(final.get("replans", 0)), state="Failed",
