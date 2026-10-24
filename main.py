@@ -805,7 +805,8 @@ _GREETING_GUARDED_TOOLS = frozenset({
     "jarvis_window", "self_repair", "brain_mode", "shutdown_jarvis",
     "identity_profile", "voice_settings", "save_memory", "mcp",
     "pc_control", "computer_control", "visual_control",
-    "browser_action", "web_task",
+    "browser_action", "web_task", "file_control",
+    "control_plan", "smart_decide",
 })
 
 
@@ -1893,6 +1894,26 @@ TOOL_DECLARATIONS += [
         "parameters": _cap_actions.parameters("documents"),
     },
     {
+        "name": "file_control",
+        "description": (
+            "Work with real files and folders on this PC. Actions: list (folder "
+            "contents), find (search by name under a folder), info (size, type, "
+            "dates), open (open a document or folder with its default app), "
+            "mkdir, copy, move, rename, delete (always asks for the on-screen "
+            "confirmation and moves to the Recycle Bin), zip and unzip. Use it "
+            "for 'what is in my Downloads folder', 'find the invoice from March', "
+            "'copy this folder to my desktop', 'zip these files', 'delete that "
+            "old draft'. Paths may use ~ and environment variables. It never "
+            "overwrites silently: pass overwrite=true only when the user "
+            "explicitly asked to replace the destination. It never opens "
+            "executables — use pc_control open_application to launch a program. "
+            "Report the exact path the result names; if the result says a step "
+            "was refused or a file was not found, say that instead of claiming "
+            "it worked."
+        ),
+        "parameters": _cap_actions.parameters("file_control"),
+    },
+    {
         "name": "smart_home",
         "description": (
             "Control the smart plugs and bulbs on this network (Kasa/Tapo): "
@@ -1939,6 +1960,81 @@ TOOL_DECLARATIONS += [
         "parameters": _cap_actions.parameters("globe"),
     },
     {
+        "name": "library",
+        "description": (
+            "The user's local document library: status, ingest, search, read, "
+            "list and remove. Use it for 'add this folder to my library', "
+            "'what do my documents say about X', 'find the passage about the "
+            "vendor contract', 'what have I indexed'. ingest accepts one file "
+            "or a folder and indexes PDF, Word, Excel, PowerPoint, HTML, CSV, "
+            "JSON, XML, Markdown and plain text locally; the source file is "
+            "never modified or deleted. search returns ranked snippets with a "
+            "document title and heading, and read returns more of one document. "
+            "When you answer from the library, cite the exact title and heading "
+            "the result returned. If the result does not contain the answer, say "
+            "so instead of guessing. Extraction and the index stay on this "
+            "machine; only the passages you retrieve enter the conversation. If "
+            "MarkItDown is missing for a PDF or Office file, name the package and "
+            "pip command from the result rather than claiming it was indexed."
+        ),
+        "parameters": _cap_actions.parameters("library"),
+    },
+    {
+        "name": "meeting_notes",
+        "description": (
+            "Record a meeting locally and turn it into Markdown notes: start, "
+            "stop, status, list, transcript, save_summary, transcribe and delete. "
+            "start always shows an on-screen confirmation first because it "
+            "records system audio and the microphone; never claim recording began "
+            "before the result says it did. Audio stays on this machine. stop "
+            "finalises the WAV files and begins local transcription in the "
+            "background, so call status or transcript afterwards rather than "
+            "inventing a transcript. The system-audio track is labelled 'Them' "
+            "and the microphone 'You'; this is track separation, not voice "
+            "fingerprinting. Read the real transcript, then call save_summary "
+            "with a concise summary and the action items the transcript actually "
+            "supports. If faster-whisper is missing, the audio is kept and the "
+            "result names the install command. delete needs the meeting id and "
+            "always confirms on the HUD. If the user asks for a summary, say that "
+            "the transcript text is being sent to the active AI model; the audio "
+            "itself never leaves the machine."
+        ),
+        "parameters": _cap_actions.parameters("meeting_notes"),
+    },
+    {
+        "name": "home_assistant",
+        "description": (
+            "Control the user's own Home Assistant instance over its REST API: "
+            "status, entities, state, turn_on, turn_off, toggle, set_brightness, "
+            "activate_scene and run_script. Use it for 'is the office lamp on', "
+            "'turn off the desk fan', 'dim the lounge light to 30 percent', 'run "
+            "the movie scene', 'start the goodnight script'. Every control answer "
+            "is read back from Home Assistant, so never say a device is on unless "
+            "the result says it is. Entity names are resolved exactly; if a name "
+            "is ambiguous the result lists candidates and you must ask which one. "
+            "Locks, alarms, cameras, covers and arbitrary service calls are "
+            "deliberately not controllable: say that plainly instead of trying "
+            "another path. This is separate from the local Kasa/Tapo smart_home "
+            "tool; use smart_home only for devices it discovers on this network."
+        ),
+        "parameters": _cap_actions.parameters("home_assistant"),
+    },
+    {
+        "name": "github",
+        "description": (
+            "Read-only GitHub intelligence: status, repos, notifications, issues, "
+            "issue, pulls, pull, checks, workflow_runs and search. Use it for "
+            "'what GitHub notifications are waiting', 'show open PRs that need "
+            "review', 'what is the CI status on main', 'find issues mentioning the "
+            "login bug', 'summarize this pull request'. This tool can only issue "
+            "GET requests: it cannot create, comment, merge, close, label or push. "
+            "For any GitHub write, use the Composio connector instead and say so. "
+            "Never claim an issue or PR was changed. Report rate-limit resets as "
+            "the result gives them, and cite repository and number exactly."
+        ),
+        "parameters": _cap_actions.parameters("github"),
+    },
+    {
         "name": "connect_devices",
         "description": (
             "JarvisOS Connect: a paired phone or browser reaching this desktop. "
@@ -1983,19 +2079,23 @@ TOOL_DECLARATIONS += [
     {
         "name": "pc_control",
         "description": (
-            "Act on this Windows PC directly, one action at a time: open, close or "
-            "focus an application, move or click the mouse, drag, scroll, type "
-            "text, press a key or a hotkey, or capture the screen. Use it for "
-            "direct, precise control — 'open Notepad', 'press ctrl s', 'screenshot "
-            "my screen', 'click at the point I'm pointing at'. Applications and "
-            "windows go through native Windows automation; mouse and keyboard go "
-            "through the physical input layer, and the result always states which "
-            "one ran. For a multi-step desktop job where you do not need to "
-            "choose the individual steps, use computer_control instead. If the "
-            "target can only be identified visually, name it with visual_control "
-            "rather than guessing coordinates. Never invent coordinates: only pass "
-            "x/y that come from the user, from a screenshot you understood, or "
-            "from visual_find. Report exactly what this tool confirms."
+            "Act on this Windows PC directly, one action at a time. Applications "
+            "and windows: open, close or focus. Pointer and keyboard: move, "
+            "click, double-click, right-click, drag, scroll, type, press a key or "
+            "a hotkey. Screen text: read_screen (real OCR of everything visible, "
+            "with line positions), find_text (locate a word and return the exact "
+            "point), click_text (find it and click it), wait_for_text. Native "
+            "controls: ui_tree (list a window's real controls with automation "
+            "ids), ui_read, ui_click and ui_set_text — these are deterministic "
+            "and always preferable to a guessed coordinate when the control has "
+            "a name or automation id. run_sequence runs a short JSON array of "
+            "safe steps in order (pc/window/system/clipboard/file actions only; "
+            "no confirm-gated action, no nesting). Prefer a named control or real "
+            "recognised text over coordinates; use visual_control only when "
+            "neither the control tree nor OCR can identify the target. Never "
+            "invent coordinates: only pass x/y that come from the user, from a "
+            "screenshot you understood, from visual_find or from find_text. "
+            "Report exactly what this tool confirms."
         ),
         "parameters": _cap_actions.parameters("pc_control"),
     },
@@ -2105,7 +2205,44 @@ TOOL_DECLARATIONS += [
                 "intent": {
                     "type": "STRING",
                     "description": ("Optional intent when you already know it: "
-                                    "media | app | web | screen | research | chat"),
+                                    "media | app | web | screen | research | "
+                                    "window | system | file | clipboard | "
+                                    "document | chat"),
+                },
+                "mode": {
+                    "type": "STRING",
+                    "description": ("How to decide: plan (deterministic rules and "
+                                    "the built-in vocabulary), quick (rules "
+                                    "only) or smart (rules first, then the local "
+                                    "Laya classifier). Default: plan."),
+                },
+            },
+            "required": ["request"],
+        },
+    },
+    {
+        "name": "smart_decide",
+        "description": (
+            "Smart Decision — ask J.A.R.V.I.S.'s own routing layer what to do "
+            "with a request, BEFORE choosing a tool. Three layers decide in "
+            "order and the answer always names which one did: (1) a "
+            "deterministic rule, for commands with exactly one mechanical "
+            "meaning ('minimize all windows', 'set chrome priority high', "
+            "'take a screenshot', 'find the invoice from March' — these are "
+            "never guessed); (2) the local Laya decision model, for everything "
+            "else; (3) the built-in vocabulary. The reply names the exact "
+            "controller, tool, action and arguments, plus the honest fallbacks. "
+            "It executes NOTHING — call the named tool with the arguments "
+            "shown and report only what that tool confirms. Use it whenever a "
+            "request could be served by more than one tool or when a previous "
+            "attempt went to the wrong one."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "request": {
+                    "type": "STRING",
+                    "description": "The user's request, in their own words.",
                 },
             },
             "required": ["request"],
@@ -2587,6 +2724,18 @@ def _activity_for_tool(tool_name: str, tool_args: dict):
                                       or action or 'control task')[:70]
     if tool_name == 'web_research':
         return 'FIND', (clean(a.get('query')) or clean(a.get('url')))[:70]
+    if tool_name == 'library':
+        return 'ANALYZE', (clean(a.get('query')) or clean(a.get('path'))
+                           or clean(a.get('doc_id')) or action)
+    if tool_name == 'meeting_notes':
+        return 'AUTOMATE', (clean(a.get('meeting_title'))
+                            or clean(a.get('meeting_id')) or action)
+    if tool_name == 'home_assistant':
+        return 'AUTOMATE', (clean(a.get('entity')) or clean(a.get('search'))
+                            or action)
+    if tool_name == 'github':
+        return 'FIND', (clean(a.get('repo')) or clean(a.get('query'))
+                        or action)
     if tool_name.startswith('rea__'):
         # A reverse-engineering call from the REA MCP server. The dashboard has
         # a fixed row set (ANALYZE is the honest one), and the detail names what
@@ -4733,6 +4882,11 @@ class JarvisLive:
                 "* control_plan — ask which controller should serve a request "
                 "before choosing one; it probes what is installed and ready and "
                 "executes nothing.\n"
+                "* smart_decide — the fused decision (deterministic rules → "
+                "local Laya classifier → built vocabulary). Use it when a "
+                "request could be served by several tools or a previous attempt "
+                "went to the wrong one; it names the exact tool and arguments "
+                "and executes nothing.\n"
                 "* play_music for music (the installed player first) and "
                 "brain_mode to change the mode itself.\n"
                 "Report only what the tool results confirmed. If a request is "
@@ -5667,12 +5821,34 @@ class JarvisLive:
                 from capabilities import decide as _decide
                 result = _decide.report(
                     str(args.get("request", "") or ""),
-                    intent=str(args.get("intent", "") or ""))
+                    intent=str(args.get("intent", "") or ""),
+                    mode=str(args.get("mode", "") or "plan"))
+
+            elif name == "smart_decide":
+                # Smart Decision: rules first, then the local Laya classifier,
+                # then the vocabulary — decided ONCE and rendered from that one
+                # decision (never re-decided for the display).
+                from capabilities import decide as _decide
+                decision = _decide.smart(str(args.get("request", "") or ""))
+                result = _decide.render(decision)
+                try:
+                    chosen = (f"{decision.get('tool') or 'chat'}"
+                              + (f".{decision['args'].get('action')}"
+                                 if (decision.get("args") or {}).get("action")
+                                 else ""))
+                    self.ui.set_doing(
+                        "SMART",
+                        f"{decision.get('source') or 'classifier'} → {chosen}"
+                        + (f" · {decision.get('rule')}"
+                           if decision.get("rule") else ""))
+                except Exception:
+                    pass
 
             elif name in ("pc_control", "visual_control", "browser_action",
                           "power_control", "system_control", "window_control",
-                          "clipboard_sentry", "documents", "smart_home",
-                          "instagram", "globe"):
+                          "clipboard_sentry", "file_control", "documents",
+                          "smart_home", "instagram", "globe", "library",
+                          "meeting_notes", "home_assistant", "github"):
                 from capabilities import actions as _local_actions
                 self._narrate_task(name, args)
                 _local_progress = (lambda detail: self._narrate_progress(name, detail))
@@ -5684,10 +5860,15 @@ class JarvisLive:
                     "system_control": _local_actions.handle_system_control,
                     "window_control": _local_actions.handle_window_control,
                     "clipboard_sentry": _local_actions.handle_clipboard_sentry,
+                    "file_control": _local_actions.handle_file_control,
                     "documents": _local_actions.handle_documents,
                     "smart_home": _local_actions.handle_smart_home,
                     "instagram": _local_actions.handle_instagram,
                     "globe": _local_actions.handle_globe,
+                    "library": _local_actions.handle_library,
+                    "meeting_notes": _local_actions.handle_meeting_notes,
+                    "home_assistant": _local_actions.handle_home_assistant,
+                    "github": _local_actions.handle_github,
                 }[name]
                 # The globe is the one local control whose *evidence* is also a
                 # picture: its handler reports the raw result back, so the card
@@ -6092,6 +6273,103 @@ class JarvisLive:
             id=fc.id, name=name,
             response={"result": result}
         )
+
+    # -- outbound frame journal ------------------------------------------
+    # The Live service refuses a malformed client message by closing with
+    # 1007 "Request contains an invalid argument" and never names the message.
+    # Two drops on 2026-10-24 could not be diagnosed for exactly that reason.
+    # Keeping the last few outbound frames (kind, size, age) costs two list
+    # appends per frame and makes the next drop self-explanatory.
+
+    _OUT_JOURNAL_SIZE = 5
+
+    @staticmethod
+    def _describe_outbound(args, kwargs) -> str:
+        """Compact "what was sent": field names plus byte/char/entry counts."""
+        parts = []
+        try:
+            for name, value in dict(kwargs).items():
+                if isinstance(value, (bytes, bytearray, memoryview)):
+                    parts.append(f"{name}={len(value)}B")
+                elif isinstance(value, dict):
+                    data = value.get("data")
+                    if isinstance(data, (bytes, bytearray, memoryview)):
+                        mime = value.get("mime_type") or value.get("mimeType") or ""
+                        parts.append(
+                            f"{name}={len(data)}B" + (f" {mime}" if mime else ""))
+                    else:
+                        parts.append(f"{name}=dict[{len(value)}]")
+                elif isinstance(value, str):
+                    parts.append(f"{name}=str[{len(value)}]")
+                elif isinstance(value, (list, tuple)):
+                    parts.append(f"{name}={type(value).__name__}[{len(value)}]")
+                elif value is None or isinstance(value, bool):
+                    parts.append(f"{name}={value}")
+                else:
+                    parts.append(f"{name}={type(value).__name__}")
+        except Exception:
+            return "unavailable"
+        return " ".join(parts) or ("positional" if args else "empty")
+
+    def _outbound_journal_text(self) -> str:
+        """One line naming the last outbound frames, newest last."""
+        journal = list(getattr(self, "_out_journal", ()) or ())
+        now = time.monotonic()
+        parts = []
+        for label, caller, desc, stamp in reversed(journal):
+            age = max(0.0, now - float(stamp))
+            where = f"[{caller}]" if caller else ""
+            detail = f" {desc}" if desc and desc != "empty" else ""
+            parts.append(f"{label}{where}{detail} ({age:.2f}s ago)")
+        return ", ".join(parts)
+
+    def _track_outbound(self, session) -> None:
+        """Journal every outbound Live frame, then delegate unchanged.
+
+        Wraps the session's two send entry points once per connect, so a drop
+        can say which message preceded it. Best-effort: if the SDK object
+        refuses the assignment, sending behaves exactly as before.
+        """
+        journal = getattr(self, "_out_journal", None)
+        if journal is None:
+            journal = self._out_journal = deque(maxlen=self._OUT_JOURNAL_SIZE)
+        for name in ("send_realtime_input", "send_client_content"):
+            try:
+                original = getattr(session, name, None)
+            except Exception:
+                continue
+            if original is None or getattr(original, "_jarvis_journal", False):
+                continue
+
+            def _tracked(orig, label):
+                # A plain def runs at CALL time, so the caller name and the
+                # timestamp are exact even for run_coroutine_threadsafe(...)
+                # sends. It returns the coroutine the SDK method would have
+                # returned, so awaiting/scheduling is unchanged.
+                def send(*args, **kwargs):
+                    try:
+                        caller = sys._getframe(1).f_code.co_name
+                    except Exception:
+                        caller = ""
+                    try:
+                        journal.append(
+                            (label, caller,
+                             self._describe_outbound(args, kwargs),
+                             time.monotonic()))
+                    except Exception:
+                        pass
+
+                    async def _delegate():
+                        return await orig(*args, **kwargs)
+
+                    return _delegate()
+                send._jarvis_journal = True
+                return send
+
+            try:
+                setattr(session, name, _tracked(original, name))
+            except Exception:
+                continue
 
     async def _send_realtime(self):
         """Forward queued realtime input (PC mic PCM, phone-relay PCM) to Gemini.
@@ -7865,6 +8143,10 @@ class JarvisLive:
                     except Exception:
                         pass
                     self.session          = session
+                    # Journal outbound frames for post-drop diagnosis: the
+                    # Live service answers a malformed message with a bare
+                    # 1007 and no field details (see _track_outbound).
+                    self._track_outbound(session)
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
@@ -8026,6 +8308,12 @@ class JarvisLive:
                     continue
 
                 err_str = str(e)
+                try:
+                    _frames = self._outbound_journal_text()
+                    if _frames:
+                        print(f"[JARVIS] Outbound frames before this error: {_frames}")
+                except Exception:
+                    pass
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
