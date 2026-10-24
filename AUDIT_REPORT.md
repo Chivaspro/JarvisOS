@@ -3,7 +3,8 @@
 **Branch:** `fix/full-audit`, cut from `master` @ `5367d8a`
 **Backup:** `dddbd7c` - the workspace exactly as it was before any audit change
 **Date:** 2026-10-24
-**State:** 10 commits (1 backup + 8 fixes + this report), nothing pushed. `master` is untouched.
+**State:** 10 audit commits (1 backup + 8 fixes + this report); post-audit
+follow-ups in section 12. Nothing pushed. `master` is untouched.
 
 This report is deliberately split into **what is proven** and **what is not**.
 The short version: the boot state no longer lies, the cleanup no longer blocks
@@ -469,3 +470,57 @@ git log --oneline -10
   `data/logs/jarvis_crash.log` (native shutdown dumps).
 * Open decisions: section 8.1 (camera-release crash) and 8.2 (`1007` frame
   rejection).
+
+---
+
+## 12. Post-audit update - the `1007` frame is identified
+
+*Added after the report commit; sections 1-11 remain the audit-close
+snapshot.*
+
+Commit `8c4c06d` adds an outbound frame journal: the session's two send entry
+points are wrapped once per connect, and when a session drops the last five
+frames are printed as kind, calling function, size and age. Sends are
+delegated unchanged - diagnostic only.
+
+Two live runs on 2026-10-24 reproduced the `1007` with the journal active:
+
+```
+[JARVIS] Recv: 1007 None. Request contains an invalid argument.
+[JARVIS] Outbound frames before this error:
+  send_client_content[_send_startup_briefing] turns=dict[1] turn_complete=True (2.2s ago)
+```
+
+What it means:
+
+* The refused frame is the startup greeting: `_send_startup_briefing`'s
+  `send_client_content(turns=..., turn_complete=True)` (`main.py:7279`).
+  It was the ONLY outbound frame in the session - no mic or vision frames
+  preceded the drop (the room was silent, and the client VAD forwards
+  nothing until speech; the journal would have shown them).
+* The model had already produced its first response ~0.2 s BEFORE the
+  greeting was injected (`AI_FIRST_RESPONSE` 8.99 s, `GREETING_SENT`
+  9.16 s; the drop reported the greeting as 2.2 s old; the reconnect began
+  at 14.85 s).
+* The reconnect drops the optional audio features, reconnects, and the
+  session holds; the false "Gemini rejected the API key" reporting is gone
+  (`422ff1a`).
+
+The open question in section 8.2 is now narrow: why does the first session
+refuse the greeting turn? The candidates are all behaviour-visible, so they
+still need your decision:
+
+1. Wait for the model's first response to finish before injecting the
+   greeting, or skip the greeting when `AI_FIRST_RESPONSE` already fired.
+2. Send the greeting without `turn_complete=True`.
+3. Connect with the plain config from the start (no proactivity/enhanced
+   audio), as the reconnect path already does.
+4. Leave it: the reconnect recovers and the user sees `RECONNECTING`.
+
+Section 8.1 (shutdown camera race) is unchanged and still needs a decision.
+
+Suite note: re-running `tests/unit` after the journal change collected 1890
+tests (the concurrent work added files) with **3 unrelated failures**
+(`test_home_assistant`, `test_library`, `test_meeting_notes`); all three
+reproduce standalone and none of those files import `main`, so they are not
+from this instrumentation. 1890 passed, 5 skipped.
