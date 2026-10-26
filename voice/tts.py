@@ -846,6 +846,36 @@ def _looks_like_voice_id(value: str) -> bool:
     return len(v) >= 20 and all(ch in "0123456789abcdefABCDEF" for ch in v)
 
 
+# ── Fish Audio realtime WebSocket (incremental TEXT in, audio out) ────────────
+# The HTTP path above is per SENTENCE: every sentence pays its own request and
+# time-to-first-byte. The WebSocket session below is per TURN: the reply text is
+# pushed in as it is generated (``fishaudio`` SDK ``tts.stream_websocket`` →
+# ``/v1/tts/live``), and the first audio chunk comes back while the model is
+# still writing the rest of the answer. Raw 24 kHz PCM is requested so the bytes
+# can be written straight to the speaker - no container, no decoder.
+#
+# Guardrails: the session is only opened when the SDK is importable and the
+# endpoint has the documented shape; any failure before the first audio byte
+# raises, and the sink (voice/speech_stream.py) falls back to the engine path.
+
+#: Sample rate requested for the realtime PCM stream (matches the project's
+#: other PCM paths: sounddevice RECEIVE_SAMPLE_RATE / _play_pcm_frames).
+FISH_WS_SAMPLE_RATE = 24000
+
+
+def _ws_base_url(endpoint: str) -> str:
+    """``https://api.fish.audio`` from the configured ``.../v1/tts`` endpoint."""
+    base = (endpoint or "").strip().rstrip("/")
+    for suffix in ("/v1/tts/live", "/v1/tts", "/v1"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base.rstrip("/") or "https://api.fish.audio"
+
+
+
+
+
 class FishAudioTTSEngine:
     """Fish Audio cloud TTS via the official ``fish-audio-sdk``.
 
@@ -987,6 +1017,120 @@ class FishAudioTTSEngine:
             except Exception:
                 pass
 
+    # ── Realtime WebSocket session (incremental TEXT in, audio out) ──────────
+
+    def ws_supported(self) -> bool:
+        """Can this configuration open the realtime session at all?
+
+        Checked, not assumed: the SDK must be importable and the endpoint must
+        have the documented ``…/v1`` shape the WebSocket route lives under.
+        """
+        try:
+            import fishaudio  # noqa: F401
+            import httpx_ws    # noqa: F401
+        except Exception:
+            return False
+        base = _ws_base_url(self.endpoint)
+        return base.startswith(("http://", "https://"))
+
+    def ws_stream(self, text_iter, cancel=None, on_audio=None) -> bool:
+        """Speak ONE turn from a live text iterator over the realtime WebSocket.
+
+        ``text_iter`` yields reply text as the model produces it. Audio is
+        written to a single output stream as chunks arrive, so playback starts
+        on the first chunk instead of at the end of the turn.
+
+        Returns True when any audio was played. Raises on a failure that
+        happened BEFORE the first audio byte (the caller then renders the turn
+        the ordinary way); a failure after playback began propagates too, but
+        nothing already heard is repeated.
+        """
+        if not self.ws_supported():
+            raise RuntimeError("Fish realtime session unavailable "
+                               "(SDK or endpoint)")
+        from fishaudio import FishAudio, TTSConfig
+        try:
+            from fishaudio import WebSocketOptions
+        except Exception:                                     # older SDK
+            WebSocketOptions = None
+
+        client = FishAudio(api_key=self.api_key, base_url=_ws_base_url(self.endpoint))
+        # Tuning measured against the real account (2026-10-26, s2.1-pro-free,
+        # two sentences fed 0.8 s apart, time to the first PCM chunk):
+        #
+        #   min_chunk_length=50 (SDK default)  2602 ms
+        #   min_chunk_length=20                1849 ms
+        #   min_chunk_length=12                1063 ms   <- shipped
+        #   min_chunk_length=5                 1124 ms
+        #
+        # 12 lets the FIRST SENTENCE start generation on its own (a shorter
+        # value buys nothing and would synthesise two-word fragments); 50 held
+        # audio back until the next sentence arrived, which is most of the
+        # difference. chunk_length=100 is the fastest value the API accepts.
+        config = TTSConfig(
+            format="pcm",
+            sample_rate=FISH_WS_SAMPLE_RATE,
+            chunk_length=100,
+            min_chunk_length=12,
+            latency=self.latency,
+        )
+        ws_options = None
+        if WebSocketOptions is not None:
+            # Default ping timeout is 20 s; a long reply can idle longer than
+            # that between phrases while the model is still writing.
+            ws_options = WebSocketOptions(keepalive_ping_timeout_seconds=60.0)
+
+        stream = None
+        played = False
+        started = False
+        try:
+            audio = client.tts.stream_websocket(
+                text_iter,
+                reference_id=self.reference_id,
+                config=config,
+                model=self.model,
+                max_workers=4,
+                ws_options=ws_options,
+            )
+            for chunk in audio:
+                if cancel is not None and cancel.is_set():
+                    break
+                if not chunk:
+                    continue
+                try:
+                    if stream is None:
+                        stream = _open_pcm_stream(FISH_WS_SAMPLE_RATE)
+                    stream.write(bytes(chunk))
+                except Exception as exc:
+                    if not played:
+                        raise RuntimeError(f"speaker unavailable: {exc}") from exc
+                    print(f"[TTS] Fish realtime playback stopped: {exc}")
+                    break
+                if not started:
+                    started = True
+                    if on_audio is not None:
+                        try:
+                            on_audio()
+                        except Exception:
+                            pass
+                played = True
+                _push_reactive(bytes(chunk), FISH_WS_SAMPLE_RATE)
+            return played
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def speak(self, text: str, cancel=None, on_audio=None) -> None:
         """Speak ``text`` sentence by sentence, streaming each one.
 
@@ -1019,6 +1163,32 @@ class FishAudioTTSEngine:
             except Exception:
                 pass
         _play_audio_bytes(audio)
+
+
+def fish_stream_session(text_iter, *, cancel=None, cfg: Optional[dict] = None,
+                        player=None, on_audio=None) -> bool:
+    """Speak ONE turn from a live text iterator over the Fish realtime session.
+
+    This is the callable ``voice/speech_stream.py`` looks for. It resolves the
+    SAME cached engine the ordinary path uses (so the voice, model and API key
+    can never disagree between the two), and raises when the session cannot be
+    opened - the sink then renders the turn through the engine path instead of
+    leaving the reply silent.
+    """
+    engine = None
+    try:
+        if player is not None:
+            engine = player._ensure_engine()
+    except Exception:
+        engine = None
+    if not isinstance(engine, FishAudioTTSEngine):
+        try:
+            engine = create_tts_player(dict(cfg or {}))._ensure_engine()
+        except Exception as exc:
+            raise RuntimeError(f"Fish Audio engine unavailable: {exc}") from exc
+    if not isinstance(engine, FishAudioTTSEngine):
+        raise RuntimeError("the configured TTS engine is not Fish Audio")
+    return engine.ws_stream(text_iter, cancel=cancel, on_audio=on_audio)
 
 
 # ---------------------------------------------------------------------------
