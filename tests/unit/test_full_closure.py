@@ -269,8 +269,27 @@ def test_main_wires_the_stop_event_into_every_restart_path():
 
 
 def test_ui_close_paths_funnel_into_the_coordinator():
+    """Every close path converges on the coordinator, not on a bare quit.
+
+    NOTE: this used to assert the literal ``request_process_exit('close-all-ui')``
+    in ui.py. The HUD then grew a deliberate fade-out outro, so that literal
+    moved: ``_close_all_ui`` -> ``_ShutdownFadeOut`` -> ``_finish_close_all_ui``
+    -> ``self.close()`` -> ``closeEvent`` -> ``request_process_exit(
+    'main-window-close')``. The BEHAVIOUR is unchanged, so the guard now pins
+    the chain that carries the behaviour - and
+    ``tests/ui/test_shutdown_funnel.py`` drives the real path and records the
+    real coordinator call (a string guard cannot tell a refactor from a
+    regression; that test can).
+    """
     src = (ROOT / "ui.py").read_text(encoding="utf-8")
-    assert "request_process_exit('close-all-ui')" in src
+    assert "def _close_all_ui" in src
+    assert "def _begin_shutdown_outro" in src
+    assert "def _finish_close_all_ui" in src
+    # the outro path must END in the window close, which owns the coordinator
+    finish = src[src.index("def _finish_close_all_ui"):]
+    finish = finish[:finish.index("def _on_gui_thread")]
+    assert "self.close()" in finish, (
+        "the outro must end in the window close path, not a bare quit")
     assert "request_process_exit('main-window-close')" in src
     # the old quit-on-exec-only behaviour is now the fallback, not the path
     assert src.count("QApplication.quit()") >= 1
