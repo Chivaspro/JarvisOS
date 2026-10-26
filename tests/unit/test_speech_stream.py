@@ -67,11 +67,13 @@ class FakeFishSession:
         self.chunks: list[str] = []
         self.audio_starts = 0
         self.cancelled = False
+        self.sessions = 0
         self.started = threading.Event()
         self.finished = threading.Event()
         self._fail_after = fail_after
 
     def __call__(self, text_iter, cancel=None, cfg=None, player=None, on_audio=None):
+        self.sessions += 1
         self.started.set()
         try:
             for chunk in text_iter:
@@ -275,6 +277,101 @@ def test_fish_session_failure_reports_and_hands_the_rest_to_the_engine():
     assert _wait(lambda: player.spoken, timeout=3.0), (
         "the rest of the turn must still be spoken through the engine path")
     assert service.status()["backend"] == "engine"
+
+
+def test_prepare_opens_the_session_before_any_text_exists():
+    """The handshake (~0.6-0.9 s measured) must overlap generation, not delay
+    the first phrase: the socket is opened when the TURN starts."""
+    session = FakeFishSession()
+    service, player = _service(player=FakePlayer(name="fish_audio"),
+                               session_factory=session)
+
+    assert service.prepare() is True
+    assert session.started.wait(timeout=2.0)
+    assert session.chunks == [], "opened early: no text has been produced yet"
+
+    service.feed("Now the first sentence arrives. ")
+    assert _wait(lambda: session.chunks == ["Now the first sentence arrives."])
+    service.flush()
+    assert _wait(lambda: session.finished.is_set())
+    assert session.sessions == 1, "one session for the whole turn"
+
+
+def test_prepare_closes_an_idle_session_and_the_next_turn_opens_a_fresh_one():
+    session = FakeFishSession()
+    service, player = _service(player=FakePlayer(name="fish_audio"),
+                               session_factory=session)
+
+    assert service.prepare(timeout=1.0) is True
+    assert _wait(lambda: session.finished.is_set(), timeout=3.0), (
+        "a prepared session with no text must close itself")
+
+    service.feed("This turn does speak. ")
+    service.flush()
+
+    assert _wait(lambda: session.sessions == 2), session.sessions
+    assert session.chunks == ["This turn does speak."]
+
+
+def test_prepare_is_a_no_op_when_realtime_is_off_or_not_fish():
+    session = FakeFishSession()
+    service, player = _service(player=FakePlayer(name="fish_audio"),
+                               session_factory=session, realtime=False)
+    assert service.prepare() is False
+    assert session.sessions == 0
+
+    session2 = FakeFishSession()
+    service2, _ = _service(player=FakePlayer(name="edgetts"),
+                           session_factory=session2)
+    assert service2.prepare() is False
+    assert session2.sessions == 0
+
+
+def test_text_taken_by_a_session_that_never_spoke_is_still_spoken():
+    """A socket that dies BEFORE any audio must not swallow the reply: the text
+    it took - plus what was still queued - is re-rendered by the engine."""
+
+    class _NoAudioSession(FakeFishSession):
+        def __call__(self, text_iter, cancel=None, cfg=None, player=None,
+                     on_audio=None):
+            self.sessions += 1
+            self.started.set()
+            try:
+                for index, chunk in enumerate(text_iter):
+                    self.chunks.append(str(chunk))
+                    if index >= 1:
+                        raise RuntimeError("socket closed before any audio")
+            finally:
+                self.finished.set()
+
+    session = _NoAudioSession()
+    service, player = _service(player=FakePlayer(name="fish_audio"),
+                               session_factory=session)
+
+    service.feed("First sentence arrives. ")
+    service.feed("Second sentence arrives. ")
+    service.flush()
+
+    assert _wait(lambda: player.spoken, timeout=3.0), (
+        "nothing was heard from the socket, so the reply must still be spoken")
+    assert " ".join(player.spoken) == "First sentence arrives. Second sentence arrives."
+    assert service.status()["backend"] == "engine"
+    assert "socket closed" in service.status()["reason"]
+
+
+def test_a_session_that_spoke_is_never_replayed_on_failure():
+    """The mirror image: once audio was heard, the same words must not repeat."""
+    session = FakeFishSession(fail_after=1)          # on_audio fires, then it dies
+    service, player = _service(player=FakePlayer(name="fish_audio"),
+                               session_factory=session)
+
+    service.feed("First sentence arrives. ")
+    service.feed("Second sentence arrives. ")
+    service.flush()
+
+    assert _wait(lambda: "websocket dropped" in service.status()["reason"])
+    time.sleep(0.2)
+    assert player.spoken == [], "already-heard speech must not be re-spoken"
 
 
 def test_realtime_off_uses_the_engine_path_even_for_a_fish_voice():

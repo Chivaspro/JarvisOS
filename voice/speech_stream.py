@@ -111,6 +111,9 @@ class StreamingSpeechService:
         self._fed = ""            # reply text received this turn (all of it)
         self._pending = ""        # text with no boundary yet
         self._chars_sent = 0      # characters actually handed to a renderer
+        self._idle_deadline = None   # set by prepare(): close an unused session
+        self._session_consumed: list[str] = []   # text a live session has taken
+        self._session_audio = False              # any audio heard this session?
         self._phase = "idle"
         self._inflight = 0       # chunks accepted but not yet rendered
         self._dropped = 0
@@ -214,6 +217,35 @@ class StreamingSpeechService:
             self._last_reason = str(exc)
             return 0
 
+    def prepare(self, timeout: float = 6.0) -> bool:
+        """Open the realtime session NOW, before the first text exists.
+
+        The WebSocket handshake was measured at ~0.6-0.9 s against the real
+        account, and it sits on the critical path when the session is opened on
+        the first text chunk. Starting it at the beginning of the turn hides
+        that handshake behind the model's own first-token latency instead of
+        adding it to the first phrase.
+
+        Purely optional and bounded: with no text within ``timeout`` seconds
+        the prepared session closes itself and the next ``feed`` opens a fresh
+        one, so a tool-only turn never leaves a socket (or a charge) behind.
+        Returns True when a session was actually opened.
+        """
+        try:
+            if not self._use_fish():
+                return False
+            with self._lock:
+                alive = (self._session_thread is not None
+                         and self._session_thread.is_alive())
+                if alive:
+                    return True
+                self._idle_deadline = time.monotonic() + max(1.0, float(timeout))
+            self._ensure_session()
+            return True
+        except Exception as exc:
+            self._last_reason = str(exc)
+            return False
+
     def speak(self, text) -> int:
         """Submit a whole line (corrected replies, tests): tail included."""
         try:
@@ -297,6 +329,25 @@ class StreamingSpeechService:
                         self._backend = "engine"
                         self._last_reason = ("Fish realtime session unavailable — "
                                              "speaking through the engine path")
+                    return False
+                # Pre-flight the real factory: it needs a real Fish engine, and
+                # "the player is named fish_audio" is not the same thing as "the
+                # engine can be built". Building a FISH engine is trivial (no
+                # model to load), so this costs nothing and avoids opening a
+                # socket that can only fail.
+                try:
+                    _engine = player._ensure_engine()
+                    from voice.tts import FishAudioTTSEngine
+                    if not isinstance(_engine, FishAudioTTSEngine):
+                        with self._lock:
+                            self._backend = "engine"
+                            self._last_reason = ("the configured voice is not a "
+                                                 "Fish Audio engine")
+                        return False
+                except Exception as exc:
+                    with self._lock:
+                        self._backend = "engine"
+                        self._last_reason = f"Fish Audio engine unavailable: {exc}"
                     return False
                 with self._lock:
                     self._session_factory = session_factory
@@ -440,35 +491,79 @@ class StreamingSpeechService:
             cancel = self._cancel
             factory = self._session_factory
             player = self._player
+            self._session_consumed = []
+            self._session_audio = False
+            # The idle deadline belongs to THIS session: it is read here and
+            # cleared, so a session that timed out can never leave an expired
+            # deadline behind to kill the next one instantly.
+            idle_deadline = self._idle_deadline
+            self._idle_deadline = None
             self._session_thread = threading.Thread(
-                target=self._run_session, args=(factory, epoch, cancel, player),
+                target=self._run_session,
+                args=(factory, epoch, cancel, player, idle_deadline),
                 name="jarvis-fish-stream", daemon=True)
             self._session_thread.start()
 
-    def _run_session(self, factory, epoch, cancel, player) -> None:
+    def _session_audio_started(self) -> None:
+        """Audio really arrived on this session (so it is not a silent failure)."""
+        with self._lock:
+            self._session_audio = True
+        self._on_audio_started()
+
+    def _run_session(self, factory, epoch, cancel, player,
+                     idle_deadline=None) -> None:
         self._set_phase("synthesizing")
         failed: Exception | None = None
         try:
-            factory(self._text_source(epoch, cancel), cancel=cancel,
+            factory(self._text_source(epoch, cancel, idle_deadline), cancel=cancel,
                     cfg=dict(self._cfg), player=player,
-                    on_audio=self._on_audio_started)
+                    on_audio=self._session_audio_started)
             self._spoken += 1
         except Exception as exc:
             failed = exc
         with self._lock:
             stale = epoch != self._epoch
         if failed is not None and not stale and not cancel.is_set():
-            # The session died mid-turn. Nothing already heard is replayed (that
-            # would double-speak), and the REST of the turn - plus every later
-            # turn - goes back through the engine path instead of into a dead
-            # socket. The failure is recorded, never swallowed.
+            # The session died mid-turn. Whatever was already HEARD is never
+            # repeated (that would double-speak); text the session took but
+            # never voiced is re-rendered through the engine path, so a broken
+            # socket costs latency, not the reply. Everything after this turn
+            # goes through the engine path too - no dead socket is reused.
             self._last_reason = str(failed)
             with self._lock:
                 self._backend = "engine"
             self._note("voice_error", failed)
+            self._requeue_after_session_failure()
             self._set_phase("error")
         elif not stale:
             self._set_phase("idle")
+
+    def _requeue_after_session_failure(self) -> None:
+        """Speak what the failed session never voiced, through the engine path."""
+        try:
+            with self._lock:
+                heard = self._session_audio
+                lost = list(self._session_consumed)
+                self._session_consumed = []
+            if heard:
+                return                      # partially heard: never replay
+            rest: list[str] = []
+            while True:
+                try:
+                    item = self._text_queue.get_nowait()
+                except Exception:
+                    break
+                try:
+                    if item is _END:
+                        continue
+                    rest.append(str(item))
+                except Exception:
+                    continue
+            chunks = [c for c in (" ".join(lost + rest)).split() if c]
+            if chunks:
+                self._enqueue_chunks([" ".join(chunks)])
+        except Exception as exc:
+            self._last_reason = str(exc)
 
     @staticmethod
     def _note(key: str, value) -> None:
@@ -479,14 +574,22 @@ class StreamingSpeechService:
         except Exception:
             pass
 
-    def _text_source(self, epoch: int, cancel: threading.Event):
-        """Generator handed to the WebSocket sender: text until END or cancel."""
+    def _text_source(self, epoch: int, cancel: threading.Event,
+                     idle_deadline: float | None = None):
+        """Generator handed to the WebSocket sender: text until END or cancel.
+
+        ``idle_deadline`` (only set by ``prepare()``) closes a session that was
+        opened early for a turn which never produced text, instead of holding a
+        socket open for nothing.
+        """
         while True:
             if cancel.is_set():
                 return
             with self._lock:
                 if epoch != self._epoch:
                     return
+            if idle_deadline is not None and time.monotonic() > idle_deadline:
+                return
             try:
                 item = self._text_queue.get(timeout=0.1)
             except queue.Empty:
@@ -496,6 +599,8 @@ class StreamingSpeechService:
             try:
                 if item is _END:
                     return
+                with self._lock:
+                    self._session_consumed.append(str(item))
                 self._mark("tts_submit")
                 yield str(item)
             finally:
@@ -519,6 +624,9 @@ class StreamingSpeechService:
             self._pending = ""
             self._first_audio_marked = False
             self._inflight = 0
+            self._idle_deadline = None
+            self._session_consumed = []
+            self._session_audio = False
             old_cancel = self._cancel
             self._cancel = threading.Event()
             cleared = 0
