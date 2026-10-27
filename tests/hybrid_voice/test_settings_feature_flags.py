@@ -144,10 +144,11 @@ def test_ui_tars_mode_survives_a_settings_save(monkeypatch, tmp_path):
 
 
 def test_narration_and_latency_controls_exist_and_save(window_with_flags):
-    """The three audible behaviour switches must be reachable and persisted."""
+    """The audible behaviour switches must be reachable and persisted."""
     for key, needle in (("narrator", "Narrate"),
                         ("realtime_low_latency", "Low-latency"),
-                        ("tts_streaming", "Stream")):
+                        ("tts_streaming", "Stream"),
+                        ("tts_realtime", "as it is written")):
         cb = _flags_box(window_with_flags, key)
         assert cb is not None, f"no Settings control for {key}"
         assert needle in cb.text()

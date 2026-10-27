@@ -305,6 +305,181 @@ def _anthropic_chat(api_key: str, model: str, message: str, timeout: int = 60,
     return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
 
+def _resolve_or_raise(config: dict) -> tuple[dict, str, str]:
+    """One place that validates a provider configuration.
+
+    Returns ``(active, provider, model)``; raises ``ValueError`` with an
+    actionable message for every way a request could not be made. Shared by
+    ``chat`` and ``chat_stream`` so the two can never disagree about what a
+    valid configuration is.
+    """
+    active = active_config(config)
+    provider = active["provider"]
+    if provider == "gemini":
+        raise ValueError("Gemini uses the live voice session — no HTTP call needed.")
+    model = active.get("model", "")
+    if not model:
+        raise ValueError(f"No model selected for provider '{provider}'. "
+                         "Pick one in Control Center → AI.")
+    if provider == "anthropic":
+        if not active.get("api_key"):
+            raise ValueError("Anthropic API key is missing — add it in "
+                             "Control Center → AI.")
+        return active, provider, model
+    endpoint = active.get("endpoint", "")
+    if not endpoint.startswith(("http://", "https://")):
+        raise ValueError(
+            f"Provider '{provider}' has no valid endpoint URL — set it in "
+            "Control Center → AI.")
+    meta = PROVIDERS.get(provider, {})
+    if meta.get("needs_key") and not active.get("api_key"):
+        raise ValueError(f"API key for '{provider}' is missing — add it in "
+                         "Control Center → AI.")
+    return active, provider, model
+
+
+def _openai_chat_stream(endpoint: str, api_key: str, model: str, message: str,
+                        timeout: int = 60, system: str | None = None,
+                        temperature: float = 0.7, history=None, cancel=None):
+    """Yield text deltas from an OpenAI-compatible streaming completion.
+
+    Parses server-sent events line by line: ``data: {...}`` frames carry
+    ``choices[0].delta.content``, a bare ``[DONE]`` ends the stream, and empty
+    lines / comments (keep-alives) are ignored. Never raises for one malformed
+    frame — a garbled line must not cost the answer.
+    """
+    import json
+    import requests
+
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    messages: list[dict] = [{"role": "system", "content": system or DEFAULT_SYSTEM}]
+    messages += _bounded_history(history)
+    messages.append({"role": "user", "content": message})
+    resp = requests.post(
+        endpoint.rstrip("/") + "/chat/completions",
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        },
+        headers=headers,
+        timeout=timeout,
+        stream=True,
+    )
+    with resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines(decode_unicode=True):
+            if cancel is not None and cancel.is_set():
+                return
+            if not raw:
+                continue
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line:
+                continue
+            if line == "[DONE]":
+                return
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            try:
+                choices = data.get("choices") or []
+                choice = choices[0] if choices else {}
+                text = (choice.get("delta") or {}).get("content")
+                if not text:
+                    text = (choice.get("message") or {}).get("content")
+            except Exception:
+                text = None
+            if text:
+                yield str(text)
+
+
+def _anthropic_chat_stream(api_key: str, model: str, message: str, timeout: int = 60,
+                           system: str | None = None, temperature: float = 0.7,
+                           max_tokens: int = 1024, history=None, cancel=None):
+    """Yield text deltas from Anthropic's streaming messages endpoint."""
+    import json
+    import requests
+
+    msgs = _bounded_history(history)
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    msgs.append({"role": "user", "content": message})
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        json={
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system or DEFAULT_SYSTEM,
+            "messages": msgs,
+            "stream": True,
+        },
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout=timeout,
+        stream=True,
+    )
+    with resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines(decode_unicode=True):
+            if cancel is not None and cancel.is_set():
+                return
+            if not raw:
+                continue
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                event = json.loads(line[5:].strip())
+            except Exception:
+                continue
+            kind = str(event.get("type") or "")
+            if kind == "content_block_delta":
+                text = (event.get("delta") or {}).get("text")
+                if text:
+                    yield str(text)
+            elif kind == "message_stop":
+                return
+
+
+def chat_stream(config: dict, message: str, timeout: int = 60,
+                system: str | None = None, temperature: float = 0.7,
+                max_tokens: int = 1024, history=None, cancel=None):
+    """The streaming twin of :func:`chat`: yield the answer as it is written.
+
+    Same configuration resolution, validation and bounded history, so a caller
+    can switch between the two without any other change. ``cancel`` (a
+    ``threading.Event``) stops the stream at the next frame, which is what an
+    interruption uses.
+
+    Raises before yielding anything when the request cannot be made at all
+    (missing key, bad endpoint, HTTP error), so the caller can fall back to the
+    one-shot :func:`chat`; a failure AFTER the first delta propagates too, and
+    the caller keeps what was already spoken rather than repeating it.
+    """
+    active, provider, model = _resolve_or_raise(config)
+    if provider == "anthropic":
+        yield from _anthropic_chat_stream(
+            active["api_key"], model, message, timeout, system=system,
+            temperature=temperature, max_tokens=max_tokens, history=history,
+            cancel=cancel)
+        return
+    yield from _openai_chat_stream(
+        active.get("endpoint", ""), active.get("api_key", ""), model, message,
+        timeout, system=system, temperature=temperature, history=history,
+        cancel=cancel)
+
+
 def chat(config: dict, message: str, timeout: int = 60, system: str | None = None,
          temperature: float = 0.7, max_tokens: int = 1024, history=None) -> str:
     """One-shot text answer from the configured non-Gemini provider.
@@ -316,29 +491,16 @@ def chat(config: dict, message: str, timeout: int = 60, system: str | None = Non
     second one?") were answered from nothing, which the user experienced as
     JARVIS forgetting and being slow.
     """
-    active = active_config(config)
-    provider = active["provider"]
-    if provider == "gemini":
-        raise ValueError("Gemini uses the live voice session — no HTTP call needed.")
-    model = active.get("model", "")
-    if not model:
-        raise ValueError(f"No model selected for provider '{provider}'. Pick one in Control Center → AI.")
+    # Validation lives in ONE place (_resolve_or_raise) so the one-shot and the
+    # streaming call can never disagree about what a valid configuration is.
+    active, provider, model = _resolve_or_raise(config)
     if provider == "anthropic":
-        if not active.get("api_key"):
-            raise ValueError("Anthropic API key is missing — add it in Control Center → AI.")
         return _anthropic_chat(active["api_key"], model, message, timeout,
                                system=system, temperature=temperature,
                                max_tokens=max_tokens, history=history)
-    endpoint = active.get("endpoint", "")
-    if not endpoint.startswith(("http://", "https://")):
-        raise ValueError(
-            f"Provider '{provider}' has no valid endpoint URL — set it in Control Center → AI."
-        )
-    meta = PROVIDERS.get(provider, {})
-    if meta.get("needs_key") and not active.get("api_key"):
-        raise ValueError(f"API key for '{provider}' is missing — add it in Control Center → AI.")
-    return _openai_chat(endpoint, active.get("api_key", ""), model, message, timeout,
-                        system=system, temperature=temperature, history=history)
+    return _openai_chat(active.get("endpoint", ""), active.get("api_key", ""),
+                        model, message, timeout, system=system,
+                        temperature=temperature, history=history)
 
 
 def test_connection(config: dict, timeout: float = 20.0) -> str:
