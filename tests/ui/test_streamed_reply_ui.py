@@ -169,6 +169,65 @@ def test_a_streamed_reply_is_visible_even_with_no_chat_panel(qapp, win):
         "the activity feed must show the reply, like write_log did")
 
 
+# ── readable before audible ──────────────────────────────────────────────────
+
+def test_the_pending_text_can_be_applied_immediately(qapp, win):
+    """The backend holds the first spoken word until the reply is readable, so
+    it needs a flush that does not wait for the coalescing tick."""
+    panel = _open_panel(qapp, win)
+
+    win.stream_assistant_text("Readable at once, sir.")
+    win.flush_assistant_stream_text()
+    qapp.processEvents()
+
+    assert win.stream_shown() is True
+    assert [r._bubble._raw_text for r in _rows(panel)] == ["Readable at once, sir."]
+
+
+def test_stream_shown_resets_for_the_next_turn(qapp, win):
+    _open_panel(qapp, win)
+    win.stream_assistant_text("First.")
+    win.flush_assistant_stream_text()
+    qapp.processEvents()
+    assert win.stream_shown() is True
+
+    win.finish_assistant_stream()
+    _pump(qapp, 0.2)
+
+    assert win.stream_shown() is False, (
+        "the next turn must lead with its own text, not inherit this one")
+
+
+def test_with_no_panel_the_reply_is_readable_while_it_is_spoken(qapp, win):
+    """The reported experience: J.A.R.V.I.S. speaking while nothing at all is
+    on screen. With the panel closed the first chunk becomes an activity line."""
+    assert win._command_window is None
+    assert win.stream_available() is False
+
+    win.stream_assistant_text("A reply that must be visible while it is spoken.")
+    win.flush_assistant_stream_text()
+    qapp.processEvents()
+
+    assert win.stream_shown() is True
+    activity = win.get_activity_lines(40)
+    assert any("must be visible while it is spoken" in line for line in activity), (
+        "the reply must be readable somewhere while it is being said")
+
+
+def test_the_activity_preview_is_only_the_first_chunk(qapp, win):
+    """A preview per flush would spam the feed; one per turn is a heads-up."""
+    _pump(qapp, 0.0)
+    for chunk in ("First part. ", "Second part. ", "Third part. "):
+        win.stream_assistant_text(chunk)
+        win.flush_assistant_stream_text()
+    qapp.processEvents()
+
+    previews = [line for line in win.get_activity_lines(60)
+                if "First part." in line or "Second part." in line
+                or "Third part." in line]
+    assert len(previews) == 1, previews
+
+
 def test_an_empty_stream_leaves_no_empty_row(qapp, win, store):
     panel = _open_panel(qapp, win)
 

@@ -104,6 +104,14 @@ while credit was healthy and is the trustworthy latency figure.
 
 ## 4. What the user experiences
 
+* **readable before audible**: on the first chunk of a turn the UI is flushed
+  immediately and the voice waits (bounded, condition-based) until that text is
+  really on screen. With no chat panel there is nothing to wait for, so the
+  first chunk also becomes one preview line in the activity feed - the reply is
+  never spoken while the screen shows nothing;
+* **said exactly once**: a streamed reply is spoken by the live sink and the
+  turn-end whole-reply speech is skipped for it (`_speak_local_turn_reply`);
+  a turn that did NOT stream is still spoken the ordinary way;
 * text appears progressively (bounded to 25 updates/second),
 * speech starts on the first phrase (measured ~1.0 s from the first text with
   healthy credit, plus whatever the model takes to produce that text),

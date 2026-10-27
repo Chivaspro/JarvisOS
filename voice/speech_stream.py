@@ -217,6 +217,28 @@ class StreamingSpeechService:
             self._last_reason = str(exc)
             return 0
 
+    def warmup(self) -> bool:
+        """Build the voice ENGINE now so the first turn never pays for it.
+
+        Called once from the background prewarm at startup for local voice
+        modes. Deliberately does NOT open the realtime session: a session with
+        no turn behind it would sit idle and be closed anyway (and a socket
+        held open for nothing is a socket billed for nothing). The session is
+        opened at the start of the turn instead - see :meth:`prepare`.
+        Returns True when the engine is ready.
+        """
+        try:
+            player = self._ensure_player()
+            if player is None:
+                return False
+            hook = getattr(player, "warmup", None)
+            if callable(hook):
+                hook()
+            return True
+        except Exception as exc:
+            self._last_reason = str(exc)
+            return False
+
     def prepare(self, timeout: float = 6.0) -> bool:
         """Open the realtime session NOW, before the first text exists.
 

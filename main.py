@@ -3417,6 +3417,43 @@ class JarvisLive:
         except Exception:
             return True
 
+    def _lead_text_before_voice(self, timeout: float = 0.35) -> None:
+        """Wait (briefly, once per turn) until the first reply text is ON SCREEN.
+
+        Condition-based, never a fixed delay: the UI is asked to flush its
+        coalesced buffer immediately and the loop returns the moment the text
+        has really been applied to the chat row. If no chat panel exists there
+        is nothing to show, so it returns at once and the voice is not delayed.
+        """
+        try:
+            ui = self.ui
+            ui.flush_assistant_stream_text()
+            if not ui.stream_available():
+                return          # nothing visible to lead: speak immediately
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while time.monotonic() < deadline:
+                if ui.stream_shown():
+                    return
+                time.sleep(0.005)
+        except Exception:
+            pass
+
+    def _speak_local_turn_reply(self, full_out: str, streamed: bool) -> None:
+        """Speak the finished reply through the local engine.
+
+        ONLY when it was not already spoken. A streamed reply went out loud
+        through the live sink, phrase by phrase, as it was written; speaking
+        the whole text again here said every answer twice (the reported
+        "he repeats the voice when the message shows up").
+        """
+        if streamed or not str(full_out or "").strip():
+            return
+        try:
+            threading.Thread(target=self.speak_local, args=(full_out,),
+                             daemon=True).start()
+        except Exception as exc:
+            print(f"[SPEECH] local reply unavailable: {exc}")
+
     def _stream_provider_answer(self, aip, cfg: dict, text: str, system,
                                 history) -> str:
         """Stream one provider answer to the screen and the voice engine.
@@ -3493,9 +3530,18 @@ class JarvisLive:
                     self._stream_buffer = ""
                 else:
                     return
-            if self._stream_gate == "":
+            first_of_turn = (self._stream_gate != "open")
+            if first_of_turn:
                 self._stream_gate = "open"
             self.ui.stream_assistant_text(new)
+            if first_of_turn:
+                # The FIRST words are on screen before the first sound. The UI
+                # path is coalesced and queued to the Qt thread while the voice
+                # engine starts synthesising immediately, so without this the
+                # reply is heard before it is readable ("he starts talking and
+                # nothing is on screen yet"). Bounded and once per turn; with no
+                # chat panel there is nothing to wait for, so it does not wait.
+                self._lead_text_before_voice()
             sink.feed(new)
         except Exception as exc:
             print(f"[SPEECH] streamed reply unavailable: {exc}")
@@ -4874,6 +4920,14 @@ class JarvisLive:
                     PiperSpeechService.get(cfg).warmup_async()
                     print("[STARTUP] PIPER_PREWARM_STARTED")
                     return
+                if _mode == "local":
+                    # Local voice renders through the live speech sink: build
+                    # its engine here too, so the first reply never waits for
+                    # an engine that was still loading.
+                    from voice.speech_stream import get_speech_stream
+                    sink = get_speech_stream(cfg)
+                    print("[STARTUP] LIVE_SINK_WARMED" if sink.warmup()
+                          else "[STARTUP] LIVE_SINK_WARMUP_SKIPPED")
                 # Warm up local voice engine without prematurely speaking a truncated greeting.
                 # The actual startup greeting is coordinated and spoken by _send_startup_briefing.
                 player.warmup()
@@ -7486,9 +7540,12 @@ class JarvisLive:
                                 except Exception:
                                     pass
                                 if self.voice_mode() == "local":
-                                    threading.Thread(
-                                        target=self.speak_local, args=(full_out,), daemon=True
-                                    ).start()
+                                    # NOT unless it still has to be spoken: a
+                                    # streamed reply was already said out loud
+                                    # by the live sink, and speaking the whole
+                                    # text again made J.A.R.V.I.S. repeat every
+                                    # answer, twice, in the same voice.
+                                    self._speak_local_turn_reply(full_out, _streamed)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",

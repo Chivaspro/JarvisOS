@@ -397,6 +397,50 @@ def test_a_fish_player_without_a_session_falls_back_to_the_engine():
     assert service.status()["backend"] == "engine"
 
 
+# ── warm-up: the engine is loaded BEFORE a turn needs it ─────────────────────
+
+def test_warmup_builds_the_engine_without_opening_a_session():
+    """The first reply must never wait for an engine that is still loading -
+    and warming up must not hold a socket open for a turn that does not exist."""
+    session = FakeFishSession()
+    built: list = []
+
+    class _WarmPlayer(FakePlayer):
+        def __init__(self):
+            super().__init__(name="fish_audio")
+            self.warmed = 0
+
+        def warmup(self):
+            self.warmed += 1
+            return True
+
+    player = _WarmPlayer()
+
+    def factory(cfg):
+        built.append(1)
+        return player
+
+    service = StreamingSpeechService({}, session_factory=session,
+                                     player_factory=factory)
+
+    assert service.warmup() is True
+    assert len(built) == 1, "the engine is built exactly once"
+    assert player.warmed == 1, "the engine's own warm-up hook is used"
+    assert session.sessions == 0, "no WebSocket without a turn"
+    assert service.prepare() is True
+    assert session.started.wait(timeout=2.0), "the session is opened per turn"
+
+
+def test_warmup_reports_a_broken_engine_instead_of_raising():
+    def factory(cfg):
+        raise RuntimeError("engine unavailable")
+
+    service = StreamingSpeechService({}, player_factory=factory)
+
+    assert service.warmup() is False
+    assert "engine unavailable" in service.status()["reason"]
+
+
 # ── state + lifecycle ────────────────────────────────────────────────────────
 
 def test_state_callbacks_report_playback_and_idle():

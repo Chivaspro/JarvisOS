@@ -17,6 +17,8 @@ wait, and the properties that must survive it:
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -58,16 +60,32 @@ class FakeSink:
 
 
 class FakeUI:
-    def __init__(self):
+    def __init__(self, panel: bool = True):
         self.streamed: list[str] = []
         self.finished = 0
         self.logged: list[str] = []
+        self.flushes = 0
+        self.panel = panel
+        self._shown = False
 
     def stream_assistant_text(self, chunk):
         self.streamed.append(str(chunk))
 
+    def flush_assistant_stream_text(self):
+        self.flushes += 1
+        # A real flush applies the text on the GUI thread; pretend it already
+        # did, unless the test wants to observe the wait.
+        self._shown = True
+
+    def stream_shown(self):
+        return self._shown
+
+    def stream_available(self):
+        return self.panel
+
     def finish_assistant_stream(self):
         self.finished += 1
+        self._shown = False
 
     def write_log(self, text):
         self.logged.append(str(text))
@@ -89,11 +107,13 @@ def _timeline_never_writes_the_project_log(tmp_path):
     turn_timeline.configure(None)
 
 
-def _host(main, sink=None, mode="local"):
+def _host(main, sink=None, mode="local", panel=True):
     sink = sink if sink is not None else FakeSink()   # never a shared default
     host = main.JarvisLive.__new__(main.JarvisLive)
-    host.ui = FakeUI()
+    host.ui = FakeUI(panel=panel)
     host._speech_stream = sink
+    host._spoken = []
+    host.speak_local = lambda text, **kw: host._spoken.append(str(text))
     host._stream_gate = ""
     host._stream_buffer = ""
     host._live_out_fed = ""
@@ -210,6 +230,91 @@ def test_a_typed_turn_is_never_mistaken_for_the_greeting(main):
     assert host.ui.streamed == ["Two plus two is four."]
 
 
+# ── the reply is said ONCE (the reported repeat) ─────────────────────────────
+
+def test_a_streamed_turn_is_never_spoken_a_second_time(main):
+    """THE reported bug: J.A.R.V.I.S. said the whole reply again when it landed
+    in the chat. The turn-end local speech must be skipped for a streamed turn -
+    the live sink already spoke the same words, phrase by phrase."""
+    host, sink = _host(main)
+
+    # Exactly the turn-end sequence the receive loop runs.
+    for fragment in ("Good evening, ", "sir. All systems nominal."):
+        host._stream_reply_text(fragment)
+    _streamed = host._finish_reply_stream("Good evening, sir. All systems nominal.")
+    host._speak_local_turn_reply("Good evening, sir. All systems nominal.", _streamed)
+
+    assert _streamed is True
+    assert sink.flushes == 1, "the sink speaks the tail exactly once"
+    assert host._spoken == [], (
+        "the whole reply must NOT be spoken again after the streamed one")
+
+
+def test_a_turn_that_did_not_stream_is_still_spoken_by_the_local_engine(main):
+    """The fallback must keep working: no stream, so the engine says it."""
+    host, sink = _host(main)
+
+    _streamed = host._finish_reply_stream("A reply that never streamed.")
+    host._speak_local_turn_reply("A reply that never streamed.", _streamed)
+
+    assert _streamed is False
+    assert host._spoken == ["A reply that never streamed."]
+
+
+def test_an_empty_reply_is_never_spoken(main):
+    host, _ = _host(main)
+    host._speak_local_turn_reply("   ", False)
+    assert host._spoken == []
+
+
+# ── the first words are readable before they are audible ─────────────────────
+
+def test_the_first_chunk_waits_for_the_text_to_be_shown(main):
+    """The UI is coalesced and queued while the voice engine starts at once:
+    without the lead the reply is HEARD before it is READ."""
+    host, sink = _host(main)
+    order: list[str] = []
+    host.ui.stream_assistant_text = lambda chunk: order.append("text")
+    shown = {"value": False}
+    host.ui.stream_shown = lambda: shown["value"]
+    kept_feed = sink.feed
+    sink.feed = lambda text: (order.append("voice"), kept_feed(text))[1]
+
+    def _show_soon():
+        time.sleep(0.05)
+        shown["value"] = True
+
+    threading.Thread(target=_show_soon, daemon=True).start()
+    host._stream_reply_text("Good evening, sir. ")
+
+    assert host.ui.flushes >= 1, "the UI must be asked to flush immediately"
+    assert order and order[0] == "text" and "voice" in order, order
+
+
+def test_no_panel_means_no_wait_before_speaking(main):
+    """Nothing to show must never delay the voice."""
+    host, sink = _host(main, panel=False)
+    started = time.monotonic()
+
+    host._stream_reply_text("Good evening, sir. ")
+
+    assert time.monotonic() - started < 0.2, (
+        "with no chat panel there is nothing to wait for")
+    assert sink.fed == ["Good evening, sir. "]
+
+
+def test_the_lead_gives_up_instead_of_stalling_the_voice(main):
+    """A UI that never reports its text must not hold the reply hostage."""
+    host, sink = _host(main)
+    host.ui.stream_shown = lambda: False            # never becomes readable
+    started = time.monotonic()
+
+    host._stream_reply_text("Good evening, sir. ")
+
+    assert time.monotonic() - started < 1.0
+    assert sink.fed == ["Good evening, sir. "], "the voice still speaks"
+
+
 # ── the realtime session is opened early ─────────────────────────────────────
 
 def test_turn_start_prepares_the_realtime_session_in_local_mode(main):
@@ -241,6 +346,16 @@ def test_a_streamed_reply_is_not_logged_again():
     and store the same reply twice."""
     block = MAIN_SRC[MAIN_SRC.index("_streamed = self._finish_reply_stream(full_out)"):]
     assert "elif not _streamed:" in block[:600]
+
+
+def test_the_turn_end_never_speaks_a_streamed_reply_directly():
+    """A bare speak_local(full_out) at turn end is what caused the repeat: the
+    decision must go through the streamed-aware helper - the receive loop must
+    not be able to speak a whole reply on its own."""
+    assert "self._speak_local_turn_reply(full_out, _streamed)" in MAIN_SRC
+    assert MAIN_SRC.count("args=(full_out") == 1, (
+        "exactly one place may speak a finished reply (the streamed-aware "
+        "helper), otherwise the repeat can come back")
 
 
 def test_interrupt_stops_the_sink_too():

@@ -20749,6 +20749,10 @@ class MainWindow(QMainWindow):
         self._stream_mirror: list = []
         self._stream_buf_lock = threading.Lock()
         self._stream_flush_timer = None
+        #: True once any streamed text has been APPLIED to a visible surface,
+        #: so the backend can hold the first spoken word until the reply is
+        #: readable (and never wait when there is nothing to show).
+        self._stream_shown = False
         self._ready = self._check_config()
         self.get_plugins = None
         self.request_say = None
@@ -24487,6 +24491,30 @@ class MainWindow(QMainWindow):
             # than dropping the reply.
             self._flush_stream_text()
 
+    def flush_assistant_stream_text(self):
+        """Apply any pending streamed text NOW instead of at the next tick.
+
+        Used once per turn, before the voice starts: the first words must be
+        readable before they are audible.
+        """
+        try:
+            if self._stream_flush_timer is not None:
+                self._stream_flush_timer.stop()
+        except Exception:
+            pass
+        self._flush_stream_text()
+
+    def stream_shown(self) -> bool:
+        """Has any streamed reply text reached a visible surface yet?"""
+        return bool(getattr(self, '_stream_shown', False))
+
+    def stream_available(self) -> bool:
+        """Is there a surface a streamed reply can actually appear on?"""
+        try:
+            return self._live_command_window() is not None
+        except Exception:
+            return False
+
     def _flush_stream_text(self):
         """Apply the pending streamed text to the panel (GUI thread)."""
         try:
@@ -24496,16 +24524,28 @@ class MainWindow(QMainWindow):
         except Exception:
             pending = ""
         if pending:
+            first_of_turn = not self._stream_mirror
             self._stream_mirror.append(pending)
-            self.run_on_ui(lambda: self._stream_assistant_text_ui(pending))
+            self.run_on_ui(lambda: self._stream_assistant_text_ui(pending,
+                                                                 first_of_turn))
 
-    def _stream_assistant_text_ui(self, chunk: str):
+    def _stream_assistant_text_ui(self, chunk: str, first_of_turn: bool = False):
         win = self._live_command_window()
         if win is None:
+            # No chat panel: the reply would otherwise be invisible until the
+            # turn ends, while J.A.R.V.I.S. is already speaking it. One activity
+            # line, at the FIRST chunk only, keeps it readable as it is said.
+            if first_of_turn:
+                try:
+                    self._activity_add(f"{self._assistant_name}: {chunk[:80]}…")
+                except Exception:
+                    pass
+            self._stream_shown = True
             return
         if not getattr(win, '_stream_active', False):
             win.begin_assistant_stream()
         win.append_assistant_stream(chunk)
+        self._stream_shown = True
 
     def finish_assistant_stream(self):
         """Close the streamed reply: flush the tail, then finish exactly once."""
@@ -24531,6 +24571,7 @@ class MainWindow(QMainWindow):
         activity line and the transport buffer the first-open replay renders
         are updated here exactly as the plain ``write_log`` path would do.
         """
+        self._stream_shown = False          # next turn leads with its own text
         try:
             text = "".join(self._stream_mirror).strip()
             self._stream_mirror = []
