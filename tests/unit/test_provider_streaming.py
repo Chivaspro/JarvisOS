@@ -302,6 +302,16 @@ def _provider_host(main, sink=None, streamed_flags=True):
 
 
 @pytest.fixture(autouse=True)
+def _timeline_never_writes_the_project_log(tmp_path):
+    """A provider turn marks the latency timeline; the real log is evidence and
+    must never contain synthetic turns from a test run."""
+    from voice import turn_timeline
+    turn_timeline.configure(tmp_path / "turn_timeline.log")
+    yield
+    turn_timeline.configure(None)
+
+
+@pytest.fixture(autouse=True)
 def _no_task_registry(monkeypatch):
     """The task registry writes to a real SQLite store; a unit test must not."""
     try:

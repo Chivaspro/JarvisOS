@@ -131,6 +131,19 @@ def _scrub_text(text: str) -> str:
     return _SECRET_PATTERN.sub("[REDACTED]", text)
 
 
+def scrub_text(text: str) -> str:
+    """Public form of the value scrubber: secret-shaped substrings → [REDACTED].
+
+    Exists so any other log sink (e.g. ``voice/turn_timeline.py``) can scrub
+    free text before persisting it, instead of re-implementing the pattern set
+    and drifting from the one that is actually maintained here. Never raises.
+    """
+    try:
+        return _scrub_text(str(text))
+    except Exception:
+        return ""
+
+
 def _scrub_value(value: Any) -> Any:
     """Scrub secret-SHAPED strings anywhere inside a structure.
 

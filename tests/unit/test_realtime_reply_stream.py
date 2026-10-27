@@ -78,6 +78,17 @@ def main():
     return pytest.importorskip("main")
 
 
+@pytest.fixture(autouse=True)
+def _timeline_never_writes_the_project_log(tmp_path):
+    """These tests drive real JarvisLive methods, which MARK the latency
+    timeline. The timeline must not be polluted with synthetic turns: it is the
+    evidence a latency claim is checked against."""
+    from voice import turn_timeline
+    turn_timeline.configure(tmp_path / "turn_timeline.log")
+    yield
+    turn_timeline.configure(None)
+
+
 def _host(main, sink=None, mode="local"):
     sink = sink if sink is not None else FakeSink()   # never a shared default
     host = main.JarvisLive.__new__(main.JarvisLive)

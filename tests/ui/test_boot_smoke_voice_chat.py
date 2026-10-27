@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -64,11 +65,29 @@ def _rows(panel):
     return [r for r in panel.chat._rows if isinstance(r, ui._ChatMessageRow)]
 
 
-def test_a_voice_turn_becomes_a_recorded_chat_turn(qapp, win, store):
+def _toggle_and_wait(qapp, win, timeout: float = 15.0):
+    """Open the Chat Panel through the app's real path and return it.
+
+    The HUD now settles the startup reactor before it creates the panel: the
+    toggle is QUEUED while that settle animation runs (~4 s, and progress
+    needs pumped events, not one ``processEvents()``). Asserting the panel
+    immediately after the toggle therefore tested the animation's timing, not
+    the behaviour these tests are about (recording turns, faded history). This
+    waits for the REAL open and returns the panel.
+    """
     win._toggle_command_window()
-    qapp.processEvents()
+    deadline = time.monotonic() + timeout
+    while win._command_window is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
     panel = win._command_window
-    assert panel is not None
+    assert panel is not None, "the chat panel must open"
+    qapp.processEvents()
+    return panel
+
+
+def test_a_voice_turn_becomes_a_recorded_chat_turn(qapp, win, store):
+    panel = _toggle_and_wait(qapp, win)
 
     win.submit_chat_turn('user', 'Jarvis, open YouTube')
     win.write_log('J.A.R.V.I.S.: Opening YouTube now, sir.')
@@ -98,9 +117,7 @@ def test_previous_chat_is_queued_faded_until_the_panel_is_opened(qapp, win, stor
     assert win._command_window is None
     assert win._pending_restore_conv == conv
 
-    win._toggle_command_window()
-    qapp.processEvents()
-    panel = win._command_window
+    panel = _toggle_and_wait(qapp, win)
     rows = _rows(panel)
     assert [r._bubble._raw_text for r in rows] == [
         'before the restart', 'and the reply that followed']
@@ -110,9 +127,7 @@ def test_previous_chat_is_queued_faded_until_the_panel_is_opened(qapp, win, stor
 
 
 def test_a_voice_turn_is_recorded_even_with_the_panel_hidden(qapp, win, store):
-    win._toggle_command_window()
-    qapp.processEvents()
-    panel = win._command_window
+    panel = _toggle_and_wait(qapp, win)
     # Establish a conversation so the id is stable.
     panel.append_msg('J.A.R.V.I.S.', 'At your service.', you=False)
     conv_id = panel.active_conversation_id()
@@ -135,9 +150,7 @@ def test_opening_a_conversation_lands_at_the_newest_message(qapp, win, store):
         store.add_message(conv, 'user' if i % 2 == 0 else 'assistant',
                           f'history line {i} ' + 'x' * 60)
 
-    win._toggle_command_window()
-    qapp.processEvents()
-    panel = win._command_window
+    panel = _toggle_and_wait(qapp, win)
     assert panel.load_conversation(conv) is True
     qapp.processEvents()
     qapp.processEvents()
@@ -155,9 +168,7 @@ def test_switching_between_conversations_stays_at_the_newest(qapp, win, store):
         store.add_message(first, 'user', f'first {i} ' + 'x' * 60)
         store.add_message(second, 'user', f'second {i} ' + 'x' * 60)
 
-    win._toggle_command_window()
-    qapp.processEvents()
-    panel = win._command_window
+    panel = _toggle_and_wait(qapp, win)
 
     for conv in (first, second, first):
         assert panel.load_conversation(conv) is True

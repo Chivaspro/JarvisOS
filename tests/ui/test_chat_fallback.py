@@ -42,6 +42,22 @@ def _break_refined(monkeypatch):
     monkeypatch.setattr(ui.RefinedCommandWindow, "__init__", _boom)
 
 
+def _toggle_and_wait(window, qapp, timeout: float = 15.0):
+    """Toggle the chat panel and wait for it to REALLY open.
+
+    The HUD settles the startup reactor before creating the panel, so the
+    toggle is queued while that animation runs (~4 s of pumped events). A fixed
+    50 ms pump asserted the animation's timing rather than the fallback these
+    tests are about.
+    """
+    import time
+    window._toggle_command_window()
+    deadline = time.monotonic() + timeout
+    while getattr(window, "_command_window", None) is None and time.monotonic() < deadline:
+        _pump(qapp, 0.05)
+    return getattr(window, "_command_window", None)
+
+
 def test_a_failing_refined_build_still_produces_a_chat_panel(window, qapp, monkeypatch):
     """Break RefinedCommandWindow.__init__ and toggle the chat panel: the
     fallback must construct the BASE window (a different class) and the window
@@ -57,10 +73,7 @@ def test_a_failing_refined_build_still_produces_a_chat_panel(window, qapp, monke
     _break_refined(monkeypatch)
     monkeypatch.setattr(window, "_command_window", None)
 
-    window._toggle_command_window()
-    _pump(qapp, 0.05)
-
-    win = getattr(window, "_command_window", None)
+    win = _toggle_and_wait(window, qapp)
     assert win is not None, (
         "the fallback produced no chat panel; logs:\n" + "\n".join(logs)
         + "\nswallowed tracebacks:\n" + "\n---\n".join(captured))
@@ -73,10 +86,7 @@ def test_the_base_fallback_seeds_no_fake_conversation(window, qapp, monkeypatch)
     _break_refined(monkeypatch)
     monkeypatch.setattr(window, "_command_window", None)
 
-    window._toggle_command_window()
-    _pump(qapp, 0.05)
-
-    win = getattr(window, "_command_window", None)
+    win = _toggle_and_wait(window, qapp)
     assert win is not None
     text = win.chat.toPlainText()
     assert "What's the status of my system?" not in text
