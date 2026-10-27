@@ -169,6 +169,57 @@ def test_a_streamed_reply_is_visible_even_with_no_chat_panel(qapp, win):
         "the activity feed must show the reply, like write_log did")
 
 
+# ── word boundaries survive the whole display path ───────────────────────────
+
+def _rendered_text(row) -> str:
+    """What the bubble actually shows, as plain text (Markdown applied)."""
+    body = getattr(row._bubble, '_body', None)
+    if body is None:
+        return ""
+    for attr in ("toPlainText", "text"):
+        fn = getattr(body, attr, None)
+        if callable(fn):
+            try:
+                return str(fn())
+            except Exception:
+                pass
+    return ""
+
+
+def test_reported_welded_words_render_with_their_spaces(qapp, win, store):
+    """The exact reported message, streamed the way the Live session sends it:
+    'I have displayeda comprehensiveF2L algorithmcheat sheet for you, sir.'"""
+    panel = _open_panel(qapp, win)
+    fragments = ["I have displayed", " a comprehensive", " F2L", " algorithm",
+                 " cheat sheet for you, sir."]
+
+    for fragment in fragments:
+        win.stream_assistant_text(fragment)
+    win.finish_assistant_stream()
+    _pump(qapp, 0.3)
+
+    expected = "I have displayed a comprehensive F2L algorithm cheat sheet for you, sir."
+    rows = _rows(panel)
+    assert [r._bubble._raw_text for r in rows] == [expected]
+    assert expected in _rendered_text(rows[0]), _rendered_text(rows[0])
+    assert [r['text'] for r in store.messages(panel.active_conversation_id())] == \
+        [expected], "the stored reply must keep the spaces too"
+
+
+def test_a_normal_streamed_reply_is_untouched_by_the_fix(qapp, win, store):
+    """No invented spaces: a reply streamed with its own spacing renders as-is."""
+    panel = _open_panel(qapp, win)
+    sentence = "Sir, the layout is fixed, and the F2L sheet is open."
+
+    win.stream_assistant_text(sentence)
+    win.finish_assistant_stream()
+    _pump(qapp, 0.3)
+
+    assert [r._bubble._raw_text for r in _rows(panel)] == [sentence]
+    assert [r['text'] for r in store.messages(panel.active_conversation_id())] == \
+        [sentence]
+
+
 # ── readable before audible ──────────────────────────────────────────────────
 
 def test_the_pending_text_can_be_applied_immediately(qapp, win):

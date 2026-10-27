@@ -337,7 +337,11 @@ def test_native_gemini_audio_never_prepares_the_local_sink(main):
 # ── main.py wiring (source-level guards) ─────────────────────────────────────
 
 def test_the_receive_loop_streams_the_reply_in_local_mode():
-    assert "self._stream_reply_text(txt)" in MAIN_SRC
+    # The EDGE-PRESERVING fragment, never the trimmed form: the transcription
+    # carries its word boundary as a leading space, and streaming the trimmed
+    # text welded the words together ("displayed" + " a" -> "displayeda").
+    assert "self._stream_reply_text(fragment)" in MAIN_SRC
+    assert "self._stream_reply_text(txt)" not in MAIN_SRC
     assert "self._finish_reply_stream(full_out)" in MAIN_SRC
 
 

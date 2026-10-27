@@ -799,10 +799,20 @@ def _load_system_prompt() -> str:
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
-def _clean_transcript(text: str) -> str:    
-    text = _CTRL_RE.sub("", text)
+def _clean_transcript(text: str, preserve_edges: bool = False) -> str:
+    """Remove control markers from one transcription event.
+
+    ``preserve_edges`` keeps the fragment's OWN leading/trailing whitespace,
+    and that whitespace is load-bearing. The transcription arrives in events
+    whose text starts with the word boundary, e.g. ``"I have displayed"`` then
+    ``" a comprehensive"``; stripping each event welds the words together
+    ("displayeda comprehensive"). The accumulated whole-reply text joins the
+    TRIMMED fragments with single spaces (unchanged behaviour), while the
+    live/streamed text keeps the fragment exactly as it arrived.
+    """
+    text = _CTRL_RE.sub("", str(text or ""))
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
-    return text.strip()
+    return text if preserve_edges else text.strip()
 
 # ── Greeting trigger guard ───────────────────────────────────────────────────
 # A bare "hi" (or any pure greeting, including the "hi jarvis" wake phrase) is
@@ -7277,7 +7287,19 @@ class JarvisLive:
                         sc = response.server_content
 
                         if sc.output_transcription and sc.output_transcription.text:
-                            txt = _clean_transcript(sc.output_transcription.text)
+                            # TWO views of the same event, deliberately:
+                            #  * ``fragment`` keeps the edges - it is what is
+                            #    STREAMED to the screen and to the voice, where
+                            #    the leading space is the word boundary the model
+                            #    actually sent ("displayed" + " a" -> "displayed a");
+                            #  * ``txt`` is the trimmed form the accumulated
+                            #    whole-reply text has always used, so the
+                            #    single-space join, the greeting match, the
+                            #    session ledger and the memory write are
+                            #    byte-for-byte what they were.
+                            fragment = _clean_transcript(
+                                sc.output_transcription.text, preserve_edges=True)
+                            txt = fragment.strip()
                             if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
                                 # First reply text of this turn: the moment the
@@ -7306,8 +7328,11 @@ class JarvisLive:
                                 # the live speech sink NOW, so the answer is
                                 # readable and audible while it is still being
                                 # generated instead of after the turn ends.
+                                # The EDGE-PRESERVING fragment is what gets
+                                # streamed: the trimmed form would weld this
+                                # word to the previous one.
                                 elif self.voice_mode() == "local":
-                                    self._stream_reply_text(txt)
+                                    self._stream_reply_text(fragment)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
