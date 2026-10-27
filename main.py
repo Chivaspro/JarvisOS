@@ -3401,6 +3401,66 @@ class JarvisLive:
         except Exception:
             return str(txt or "")
 
+    @staticmethod
+    def _reply_stream_enabled() -> bool:
+        """Stream reply text to the screen and the voice while it is written?
+
+        Off only when BOTH realtime speech and sentence streaming are disabled
+        (Settings ▸ Automation): that is the documented synchronized
+        final-response fallback, where the complete reply is published at the
+        same moment as its audio. A missing settings layer never disables it.
+        """
+        try:
+            from config.settings import get_feature
+            return bool(get_feature("tts_realtime", True)
+                        or get_feature("tts_streaming", True))
+        except Exception:
+            return True
+
+    def _stream_provider_answer(self, aip, cfg: dict, text: str, system,
+                                history) -> str:
+        """Stream one provider answer to the screen and the voice engine.
+
+        Returns the complete reply text. Raises ONLY when nothing was produced
+        at all (the caller then re-asks with the one-shot call); a failure after
+        the first delta keeps what was already shown and spoken - repeating it
+        would speak the answer twice - and reports the interruption on the
+        activity line plus the turn's timeline.
+        """
+        sink = self._speech_sink()
+        if sink is not None:
+            sink.prepare(timeout=8.0)
+        parts: list[str] = []
+        try:
+            for delta in aip.chat_stream(cfg, text, system=system, history=history):
+                if not delta:
+                    continue
+                parts.append(str(delta))
+                self._stream_reply_text(str(delta))
+            self._timeline.char_count("".join(parts))
+            return "".join(parts)
+        except Exception as exc:
+            if not parts:
+                raise
+            # The user has already read/heard part of the answer: report the
+            # interruption, never silently truncate and never re-ask.
+            _timeline.note("provider_error", exc)
+            # Scrubbed: a provider error body can quote the credential that was
+            # sent to it, and this line goes to the activity log and console.
+            _detail = str(exc)
+            try:
+                from observability.logger import scrub_text
+                _detail = scrub_text(_detail)
+            except Exception:
+                _detail = _detail[:120]
+            self.ui.write_log(f"WARN: The provider stream was interrupted — "
+                              f"the answer above is partial ({_detail})")
+            try:
+                self._finish_reply_stream("".join(parts))
+            except Exception:
+                pass
+            return "".join(parts)
+
     def _stream_reply_text(self, txt: str) -> None:
         """Show AND speak this turn's reply as it streams in.
 
@@ -3410,6 +3470,10 @@ class JarvisLive:
         model is still writing the rest.
         """
         try:
+            # Realtime/streaming disabled = the synchronized fallback: the
+            # complete reply is published with its audio, never piecemeal.
+            if not self._reply_stream_enabled():
+                return
             # No live renderer means the ordinary whole-reply path owns this
             # turn: streaming only the TEXT would suppress the fallback speech
             # at turn end, so nothing is streamed until the sink exists.
@@ -4177,6 +4241,7 @@ class JarvisLive:
         except Exception:
             task_id = task_id or ""
         _provider_ok = True
+        _streamed = False
         # This turn's latency record starts at the typed request; everything
         # below is measured from here.
         self._begin_turn_timeline("text", request=text)
@@ -4200,7 +4265,19 @@ class JarvisLive:
             if (history and history[-1]["role"] == "user"
                     and history[-1]["content"].strip() == str(text).strip()):
                 history = history[:-1]
-            reply = _aip.chat(cfg, text, system=system, history=history)
+            if self._reply_stream_enabled():
+                # Realtime: the reply is shown AND spoken while it is written.
+                # A stream that produced nothing at all falls back to the
+                # one-shot call inside the same turn.
+                try:
+                    reply = self._stream_provider_answer(_aip, cfg, text, system,
+                                                         history)
+                    _streamed = True
+                except Exception:
+                    reply = _aip.chat(cfg, text, system=system, history=history)
+            else:
+                # Synchronized fallback: complete text, then its audio.
+                reply = _aip.chat(cfg, text, system=system, history=history)
             # The provider finished generating the text (audio still pending).
             _timeline.mark("stream_end")
         except Exception as exc:
@@ -4221,23 +4298,29 @@ class JarvisLive:
             except Exception:
                 pass
             self._clear_turn_task(task_id)
-        # First visible text of this turn: the reply lands on screen here (the
-        # streamed path marks its own first delta instead).
-        self.ui.write_log(f"JARVIS: {reply}")
-        _timeline.mark("first_text")
-        _timeline.char_count(reply)
+        if _streamed:
+            # The stream row IS the record: it is closed (and the voice flushed)
+            # here, so the same reply is never logged a second time.
+            self._finish_reply_stream(reply)
+        else:
+            # First visible text of this turn: the whole reply lands at once.
+            self.ui.write_log(f"JARVIS: {reply}")
+            _timeline.mark("first_text")
+            _timeline.char_count(reply)
         self._session_log.append(f"assistant: {reply}")
         try:
             from core.brain_bridge import record_reply
             record_reply(reply)
         except Exception:
             pass
-        # Speak the reply through the shared local-voice path (serialised, and
-        # it drives the HUD speaking state).
-        try:
-            self.speak_local(reply)
-        except Exception as exc:
-            print(f"[Provider] TTS failed: {exc}")
+        if not _streamed:
+            # Speak the reply through the shared local-voice path (serialised,
+            # and it drives the HUD speaking state). A streamed reply is already
+            # being spoken by the live sink.
+            try:
+                self.speak_local(reply)
+            except Exception as exc:
+                print(f"[Provider] TTS failed: {exc}")
 
     # ── Automatic task teardown (brain/task_engine.py) ──────────────────────
     # One record per user request. Every method is guarded: a failure here

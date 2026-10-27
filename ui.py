@@ -40,7 +40,8 @@ from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QDesktopServices,
-    QPen, QPixmap, QRadialGradient, QShortcut, QMouseEvent, QTextCursor,
+    QPen, QPixmap, QRadialGradient, QShortcut, QMouseEvent, QTextCursor, QTextDocument,
+    QPalette,
 )
 
 try:
@@ -113,7 +114,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSlider,
     QListWidget, QListWidgetItem, QGridLayout, QGraphicsOpacityEffect, QInputDialog,
-    QAbstractItemView, QTextBrowser, QMenu, QMessageBox,
+    QAbstractItemView, QTextBrowser, QMenu, QMessageBox, QDialog,
 )
 
 def _base_dir() -> Path:
@@ -182,6 +183,13 @@ STARTUP_CORE_FADE_IN_MS = 420
 STARTUP_GLOW_FADE_MS = 1800
 STARTUP_GLOW_SCALE = 1.62
 STARTUP_HITBOX_PAD = 30
+# Launch intro: the whole HUD fades in while the reactor blooms up from a
+# smaller size. Tune these two to taste.
+STARTUP_INTRO_MS = 1100            # fade-in + grow duration
+STARTUP_INTRO_START_SCALE = 0.74   # reactor starts at 74 % of its startup size
+# Closing: the HUD fades out completely, THEN the app closes. No text, no dark
+# backdrop, no flash.
+SHUTDOWN_FADE_MS = 520
 # Core backdrop painted under the logo rings. 0 = fully transparent (default):
 # the logo then composites directly over whatever panel is behind it, so its
 # background ALWAYS matches the main panel / command deck exactly. Raise it
@@ -878,6 +886,284 @@ class MetricBar(QWidget):
 
 
 
+# ── Markdown → HTML (one renderer for every Markdown surface) ────────────────
+# Research/content cards, the expanded viewer, the QuickChat popup AND the chat
+# message bubbles all render through these module-level functions. A chat
+# bubble passes its own base colour and no COPY anchors (a QLabel has no
+# clipboard stash); a QTextBrowser surface passes a key factory so fenced code
+# blocks keep the one-click COPY button.
+#
+# Every value is escaped before any formatting regex runs, so model output can
+# never inject HTML into any surface.
+_MD_HEADING_PT = {1: '20pt', 2: '15pt', 3: '12pt', 4: '10.5pt', 5: '9.5pt', 6: '9pt'}
+
+
+def _md_escape(text: str) -> str:
+    import html
+    return html.escape(str(text or ''), quote=False)
+
+
+def _md_safe_url(url: str) -> str | None:
+    """Only http(s) URLs ever become links — nothing else can leave the surface."""
+    from urllib.parse import urlparse
+    u = str(url or '').strip().strip('<>')
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return None
+    if parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
+        return None
+    return u
+
+
+def _inline_md_html(text: str, base_color: str | None = None) -> str:
+    """Convert inline Markdown without ever treating source text as raw HTML."""
+    import re, html
+    raw = str(text or '')
+    protected: list[str] = []
+
+    def protect(value: str) -> str:
+        token = f'\x00MD{len(protected)}\x00'
+        protected.append(value)
+        return token
+
+    # Escape first so AI output can never inject arbitrary HTML.
+    out = html.escape(raw, quote=False)
+
+    # Images become safe clickable links to the image instead of silently
+    # loading remote content in QTextBrowser.
+    def image_repl(m):
+        alt = html.escape(m.group(1), quote=False)
+        url = _md_safe_url(m.group(2))
+        if not url:
+            return alt
+        return protect(f'<a href="{html.escape(url, quote=True)}" style="color:{C.PRI};text-decoration:none;">[IMAGE: {alt}]</a>')
+
+    out = re.sub(r'!\[([^\]]*)\]\((https?://[^)\s]+)\)', image_repl, out)
+
+    # Markdown links.
+    def link_repl(m):
+        label = html.escape(m.group(1), quote=False)
+        url = _md_safe_url(m.group(2))
+        if not url:
+            return label
+        return protect(f'<a href="{html.escape(url, quote=True)}" style="color:{C.PRI};text-decoration:underline;">{label}</a>')
+
+    out = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', link_repl, out)
+
+    # Autolink bare URLs, preserving trailing punctuation outside the anchor.
+    def url_repl(m):
+        url = m.group(1)
+        trail = ''
+        while url and url[-1] in '.,;:!?)]':
+            trail = url[-1] + trail
+            url = url[:-1]
+        safe = _md_safe_url(url)
+        if not safe:
+            return m.group(0)
+        return protect(f'<a href="{html.escape(safe, quote=True)}" style="color:{C.PRI};text-decoration:underline;">{html.escape(url, quote=False)}</a>') + html.escape(trail)
+
+    out = re.sub(r'(?<!["\'>])(https?://[^\s<>]+)', url_repl, out)
+
+    # Inline code, bold, then italic. Code/links are protected from formatting regexes.
+    out = re.sub(r'`([^`\n]+)`', lambda m: protect(
+        f'<span style="background:{C.DARK};border:1px solid {C.BORDER_B};padding:1px 4px;">'
+        f'<font face="Share Tech Mono" color="{C.TEXT_MED}">{html.escape(m.group(1), quote=False)}</font></span>'
+    ), out)
+    out = re.sub(r'(\*\*|__)(.+?)\1', lambda m: f'<b><font color="{C.WHITE}">{m.group(2)}</font></b>', out)
+    out = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<i>\1</i>', out)
+    out = re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'<i>\1</i>', out)
+
+    for i, fragment in enumerate(protected):
+        out = out.replace(f'\x00MD{i}\x00', fragment)
+    return out
+
+
+def _code_block_md_html(code: str, language: str = '',
+                        copy_key: str | None = None) -> str:
+    """One fenced code block; the COPY anchor only exists when *copy_key* is given."""
+    lang = _md_escape(str(language or '').strip().lower())
+    label = f'CODE · {lang}' if lang else 'CODE'
+    safe_code = _md_escape(code)
+    copy_anchor = (
+        f'&nbsp;&nbsp;<a href="copy://{copy_key}" style="color:{C.WHITE};text-decoration:none;">[ COPY ]</a>'
+        if copy_key else ''
+    )
+    return (
+        f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:8px 0;">'
+        f'<tr><td style="background:{C.DARK};border:1px solid {C.BORDER_B};padding:0;">'
+        f'<div style="background:rgba(0,92,120,55);border-bottom:1px solid {C.BORDER_B};padding:5px 8px;">'
+        f'<span style="color:{C.PRI};font-weight:700;font-size:8pt;">{label}</span>'
+        f'{copy_anchor}'
+        f'</div>'
+        f'<pre style="margin:0;padding:9px;color:{C.TEXT};font-family:\'Share Tech Mono\';font-size:8.5pt;white-space:pre-wrap;">{safe_code}</pre>'
+        f'</td></tr></table>'
+    )
+
+
+def _render_markdown_html(markdown: str, base_color: str | None = None,
+                          copy_key_factory=None) -> str:
+    """Markdown → the HTML every JARVIS surface paints.
+
+    ``base_color`` is the surface body colour (chat bubbles pass their own;
+    the default is the standard text token). ``copy_key_factory``, when given,
+    stashes each fenced block so its table keeps a working COPY anchor.
+    """
+    import re
+    text = str(markdown or '').replace('\r\n', '\n').replace('\r', '\n')
+    lines = text.split('\n')
+    chunks: list[str] = []
+    para: list[str] = []
+    in_code = False
+    code_lines: list[str] = []
+    code_lang = ''
+    list_kind: str | None = None
+    list_items: list[str] = []
+    quote_lines: list[str] = []
+    table_lines: list[str] = []
+
+    def inline(value: str) -> str:
+        return _inline_md_html(value, base_color)
+
+    def code_block(code_text: str, language: str) -> str:
+        key = None
+        if copy_key_factory is not None:
+            try:
+                key = copy_key_factory(code_text)
+            except Exception:
+                key = None
+        return _code_block_md_html(code_text, language, copy_key=key)
+
+    def flush_para():
+        nonlocal para
+        if not para:
+            return
+        body = '<br/>'.join(inline(x) for x in para)
+        chunks.append(f'<p style="margin:8px 0;line-height:1.45;">{body}</p>')
+        para = []
+
+    def flush_list():
+        nonlocal list_kind, list_items
+        if not list_items:
+            list_kind = None
+            return
+        tag = 'ul' if list_kind == 'ul' else 'ol'
+        items = ''.join(f'<li style="margin:4px 0;">{x}</li>' for x in list_items)
+        chunks.append(f'<{tag} style="margin:6px 0 9px 18px;padding-left:14px;">{items}</{tag}>')
+        list_items = []
+        list_kind = None
+
+    def flush_quote():
+        nonlocal quote_lines
+        if not quote_lines:
+            return
+        body = '<br/>'.join(inline(x) for x in quote_lines)
+        chunks.append(
+            f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:7px 0;">'
+            f'<tr><td style="background:rgba(0,76,102,45);border-left:3px solid {C.PRI};padding:7px 10px;color:{C.TEXT_MED};">{body}</td></tr></table>'
+        )
+        quote_lines = []
+
+    def flush_table():
+        nonlocal table_lines
+        if not table_lines:
+            return
+        parsed = []
+        for raw in table_lines:
+            cells = [cell.strip() for cell in raw.strip().strip('|').split('|')]
+            if cells and all(re.match(r'^:?-{3,}:?$', cell.replace(' ', '')) for cell in cells):
+                continue
+            parsed.append(cells)
+        table_lines = []
+        if not parsed:
+            return
+        cols = max(len(row) for row in parsed)
+        header_cells = parsed[0] + [''] * (cols - len(parsed[0]))
+        html = [f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:8px 0;border-collapse:collapse;">']
+        html.append('<tr>')
+        for cell in header_cells:
+            html.append(f'<td style="background:rgba(0,92,120,70);border:1px solid {C.BORDER_B};padding:6px 8px;color:{C.PRI};font-weight:700;">{inline(cell)}</td>')
+        html.append('</tr>')
+        for row in parsed[1:]:
+            cells = row + [''] * (cols - len(row))
+            html.append('<tr>')
+            for cell in cells[:cols]:
+                html.append(f'<td style="background:rgba(1,15,25,90);border:1px solid {C.BORDER_B};padding:5px 8px;color:{C.TEXT};">{inline(cell)}</td>')
+            html.append('</tr>')
+        html.append('</table>')
+        chunks.append(''.join(html))
+
+    for line in lines:
+        fence = re.match(r'^\s*```\s*([\w.+-]*)\s*$', line)
+        if fence:
+            flush_table(); flush_para(); flush_list(); flush_quote()
+            if not in_code:
+                in_code = True; code_lang = fence.group(1); code_lines = []
+            else:
+                chunks.append(code_block('\n'.join(code_lines), code_lang))
+                in_code = False; code_lang = ''; code_lines = []
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+
+        if re.match(r'^\s*\|.*\|\s*$', line):
+            flush_para(); flush_list(); flush_quote()
+            table_lines.append(line)
+            continue
+        flush_table()
+
+        if not line.strip():
+            flush_para(); flush_list(); flush_quote(); continue
+        if re.match(r'^\s*(---+|\*\*\*+)\s*$', line):
+            flush_para(); flush_list(); flush_quote()
+            chunks.append(f'<hr style="border:none;border-top:1px solid {C.BORDER_B};margin:10px 0;">')
+            continue
+
+        m = re.match(r'^\s*(#{1,6})\s+(.+?)\s*#*\s*$', line)
+        if m:
+            flush_para(); flush_list(); flush_quote()
+            level = len(m.group(1))
+            size = _MD_HEADING_PT.get(level, '9pt')
+            head_color = C.WHITE if level <= 2 else C.PRI
+            spacing = '1.2px' if level == 1 else ('0.7px' if level == 2 else '0.3px')
+            top = 16 if level == 1 else (13 if level == 2 else 12)
+            chunks.append(
+                f'<h{level} style="color:{head_color};font-family:Orbitron;'
+                f'font-size:{size};font-weight:800;letter-spacing:{spacing};'
+                f'margin:{top}px 0 6px 0;">{inline(m.group(2))}</h{level}>'
+            )
+            if level <= 2:
+                bar = 'rgba(0,212,255,110)' if level == 1 else C.BORDER_B
+                chunks.append(f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:0 0 9px 0;"><tr><td height="1" style="background:{bar};font-size:1px;line-height:1px;">&nbsp;</td></tr></table>')
+            continue
+
+        m = re.match(r'^\s*>\s?(.*)$', line)
+        if m:
+            flush_para(); flush_list(); quote_lines.append(m.group(1)); continue
+
+        m = re.match(r'^\s*[-+*]\s+(.+)$', line)
+        if m:
+            flush_para(); flush_quote()
+            if list_kind not in (None, 'ul'): flush_list()
+            list_kind = 'ul'; list_items.append(inline(m.group(1))); continue
+
+        m = re.match(r'^\s*\d+[.)]\s+(.+)$', line)
+        if m:
+            flush_para(); flush_quote()
+            if list_kind not in (None, 'ol'): flush_list()
+            list_kind = 'ol'; list_items.append(inline(m.group(1))); continue
+
+        flush_list(); flush_quote(); para.append(line)
+
+    if in_code:
+        chunks.append(code_block('\n'.join(code_lines), code_lang))
+    flush_para(); flush_list(); flush_quote(); flush_table()
+    root_color = base_color or C.TEXT
+    return (f'<div style="color:{root_color};font-family:Rajdhani;font-size:10pt;">'
+            f'{"".join(chunks)}</div>')
+
+
 class MarkdownTextBrowser(QTextBrowser):
     """JARVIS markdown surface with safe links and one-click code copying.
 
@@ -1001,177 +1287,20 @@ class MarkdownTextBrowser(QTextBrowser):
         return key
 
     def _inline_html(self, text: str) -> str:
-        """Convert inline Markdown without ever treating source text as raw HTML."""
-        import re, html
-        raw = str(text or '')
-        protected: list[str] = []
-
-        def protect(value: str) -> str:
-            token = f'\x00MD{len(protected)}\x00'
-            protected.append(value)
-            return token
-
-        # Escape first so AI output can never inject arbitrary HTML.
-        out = html.escape(raw, quote=False)
-
-        # Images become safe clickable links to the image instead of silently
-        # loading remote content in QTextBrowser.
-        def image_repl(m):
-            alt = html.escape(m.group(1), quote=False)
-            url = self._safe_url(m.group(2))
-            if not url:
-                return alt
-            return protect(f'<a href="{html.escape(url, quote=True)}" style="color:{C.PRI};text-decoration:none;">[IMAGE: {alt}]</a>')
-
-        out = re.sub(r'!\[([^\]]*)\]\((https?://[^)\s]+)\)', image_repl, out)
-
-        # Markdown links.
-        def link_repl(m):
-            label = html.escape(m.group(1), quote=False)
-            url = self._safe_url(m.group(2))
-            if not url:
-                return label
-            return protect(f'<a href="{html.escape(url, quote=True)}" style="color:{C.PRI};text-decoration:underline;">{label}</a>')
-
-        out = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)', link_repl, out)
-
-        # Autolink bare URLs, preserving trailing punctuation outside the anchor.
-        def url_repl(m):
-            url = m.group(1)
-            trail = ''
-            while url and url[-1] in '.,;:!?)]':
-                trail = url[-1] + trail
-                url = url[:-1]
-            safe = self._safe_url(url)
-            if not safe:
-                return m.group(0)
-            return protect(f'<a href="{html.escape(safe, quote=True)}" style="color:{C.PRI};text-decoration:underline;">{html.escape(url, quote=False)}</a>') + html.escape(trail)
-
-        out = re.sub(r'(?<!["\'>])(https?://[^\s<>]+)', url_repl, out)
-
-        # Inline code, bold, then italic. Code/links are protected from formatting regexes.
-        out = re.sub(r'`([^`\n]+)`', lambda m: protect(
-            f'<span style="background:{C.DARK};border:1px solid {C.BORDER_B};padding:1px 4px;">'
-            f'<font face="Share Tech Mono" color="{C.TEXT_MED}">{html.escape(m.group(1), quote=False)}</font></span>'
-        ), out)
-        out = re.sub(r'(\*\*|__)(.+?)\1', r'<b>\2</b>', out)
-        out = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<i>\1</i>', out)
-        out = re.sub(r'(?<!_)_([^_\n]+)_(?!_)', r'<i>\1</i>', out)
-
-        for i, fragment in enumerate(protected):
-            out = out.replace(f'\x00MD{i}\x00', fragment)
-        return out
+        """Inline Markdown via the shared module renderer (single source)."""
+        return _inline_md_html(text)
 
     def _code_block_html(self, code: str, language: str = '') -> str:
-        import html
-        key = self._stash(str(code))
-        lang = html.escape(str(language or '').strip().lower(), quote=False)
-        label = f'CODE · {lang}' if lang else 'CODE'
-        safe_code = html.escape(str(code), quote=False)
-        return (
-            f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:8px 0;">'
-            f'<tr><td style="background:{C.DARK};border:1px solid {C.BORDER_B};padding:0;">'
-            f'<div style="background:rgba(0,92,120,55);border-bottom:1px solid {C.BORDER_B};padding:5px 8px;">'
-            f'<span style="color:{C.PRI};font-weight:700;font-size:8pt;">{label}</span>'
-            f'&nbsp;&nbsp;<a href="copy://{key}" style="color:{C.WHITE};text-decoration:none;">[ COPY ]</a>'
-            f'</div>'
-            f'<pre style="margin:0;padding:9px;color:{C.TEXT};font-family:\'Share Tech Mono\';font-size:8.5pt;white-space:pre-wrap;">{safe_code}</pre>'
-            f'</td></tr></table>'
-        )
+        """Fenced block with a working COPY anchor (shared module renderer)."""
+        return _code_block_md_html(code, language, copy_key=self._stash(str(code)))
 
     def markdown_to_html(self, markdown: str) -> str:
-        import re
-        text = str(markdown or '').replace('\r\n', '\n').replace('\r', '\n')
-        lines = text.split('\n')
-        chunks: list[str] = []
-        para: list[str] = []
-        in_code = False
-        code_lines: list[str] = []
-        code_lang = ''
-        list_kind: str | None = None
-        list_items: list[str] = []
-        quote_lines: list[str] = []
+        """Markdown → HTML via the shared module renderer (single source).
 
-        def flush_para():
-            nonlocal para
-            if not para:
-                return
-            body = '<br/>'.join(self._inline_html(x) for x in para)
-            chunks.append(f'<p style="margin:7px 0;line-height:1.4;">{body}</p>')
-            para = []
-
-        def flush_list():
-            nonlocal list_kind, list_items
-            if not list_items:
-                list_kind = None
-                return
-            tag = 'ul' if list_kind == 'ul' else 'ol'
-            items = ''.join(f'<li style="margin:3px 0;">{x}</li>' for x in list_items)
-            chunks.append(f'<{tag} style="margin:5px 0 8px 18px;padding-left:14px;">{items}</{tag}>')
-            list_items = []
-            list_kind = None
-
-        def flush_quote():
-            nonlocal quote_lines
-            if not quote_lines:
-                return
-            body = '<br/>'.join(self._inline_html(x) for x in quote_lines)
-            chunks.append(
-                f'<table width="100%" cellspacing="0" cellpadding="0" style="margin:7px 0;">'
-                f'<tr><td style="background:rgba(0,76,102,45);border-left:3px solid {C.PRI};padding:7px 10px;color:{C.TEXT_MED};">{body}</td></tr></table>'
-            )
-            quote_lines = []
-
-        for line in lines:
-            fence = re.match(r'^\s*```\s*([\w.+-]*)\s*$', line)
-            if fence:
-                flush_para(); flush_list(); flush_quote()
-                if not in_code:
-                    in_code = True; code_lang = fence.group(1); code_lines = []
-                else:
-                    chunks.append(self._code_block_html('\n'.join(code_lines), code_lang))
-                    in_code = False; code_lang = ''; code_lines = []
-                continue
-            if in_code:
-                code_lines.append(line)
-                continue
-
-            if not line.strip():
-                flush_para(); flush_list(); flush_quote(); continue
-            if re.match(r'^\s*(---+|\*\*\*+)\s*$', line):
-                flush_para(); flush_list(); flush_quote()
-                chunks.append(f'<hr style="border:none;border-top:1px solid {C.BORDER_B};margin:10px 0;">')
-                continue
-
-            m = re.match(r'^\s*(#{1,6})\s+(.+?)\s*#*\s*$', line)
-            if m:
-                flush_para(); flush_list(); flush_quote()
-                level = len(m.group(1)); sizes = {1:'14pt',2:'12pt',3:'11pt',4:'10pt',5:'9.5pt',6:'9pt'}
-                chunks.append(f'<h{level} style="color:{C.WHITE if level<=2 else C.PRI};font-family:Orbitron;font-size:{sizes[level]};margin:10px 0 5px 0;">{self._inline_html(m.group(2))}</h{level}>')
-                continue
-
-            m = re.match(r'^\s*>\s?(.*)$', line)
-            if m:
-                flush_para(); flush_list(); quote_lines.append(m.group(1)); continue
-
-            m = re.match(r'^\s*[-+*]\s+(.+)$', line)
-            if m:
-                flush_para(); flush_quote()
-                if list_kind not in (None, 'ul'): flush_list()
-                list_kind = 'ul'; list_items.append(self._inline_html(m.group(1))); continue
-
-            m = re.match(r'^\s*\d+[.)]\s+(.+)$', line)
-            if m:
-                flush_para(); flush_quote()
-                if list_kind not in (None, 'ol'): flush_list()
-                list_kind = 'ol'; list_items.append(self._inline_html(m.group(1))); continue
-
-            flush_list(); flush_quote(); para.append(line)
-
-        if in_code:
-            chunks.append(self._code_block_html('\n'.join(code_lines), code_lang))
-        flush_para(); flush_list(); flush_quote()
-        return f'<div style="color:{C.TEXT};font-family:Rajdhani;font-size:10pt;">{"".join(chunks)}</div>'
+        This surface keeps its COPY anchors: each fenced block is stashed so
+        ``copy://`` clicks can reach the clipboard.
+        """
+        return _render_markdown_html(markdown, copy_key_factory=self._stash)
 
     def set_markdown(self, markdown: str) -> None:
         self._md_clipboard_items.clear()
@@ -5409,6 +5538,9 @@ class _CommandWindow(QFrame):
         super().__init__(None)
         self._host = host
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
@@ -5424,6 +5556,34 @@ class _CommandWindow(QFrame):
         self._chat_scroll_pending = False
         self._chat_scroll_animation = None
         self._build()
+
+    def paintEvent(self, event) -> None:
+        """Paint the command deck's dark shell without platform background erases."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        cut = max(12.0, min(18.0, min(rect.width(), rect.height()) * 0.035))
+        path = QPainterPath()
+        path.moveTo(rect.left() + cut, rect.top())
+        path.lineTo(rect.right() - cut, rect.top())
+        path.lineTo(rect.right(), rect.top() + cut)
+        path.lineTo(rect.right(), rect.bottom() - cut)
+        path.lineTo(rect.right() - cut, rect.bottom())
+        path.lineTo(rect.left() + cut, rect.bottom())
+        path.lineTo(rect.left(), rect.bottom() - cut)
+        path.lineTo(rect.left(), rect.top() + cut)
+        path.closeSubpath()
+        fill = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        fill.setColorAt(0.0, QColor(3, 20, 31, 248))
+        fill.setColorAt(0.52, QColor(2, 9, 17, 250))
+        fill.setColorAt(1.0, QColor(3, 18, 28, 248))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(fill))
+        painter.drawPath(path)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(88, 214, 245, 115), 1.1))
+        painter.drawPath(path)
+        painter.end()
 
     def run_on_ui(self, fn) -> None:
         """Run ``fn`` on the GUI thread — the host owns the marshalling.
@@ -5472,6 +5632,16 @@ class _CommandWindow(QFrame):
         self._online.setStyleSheet(f'color:{C.GREEN};font:700 7pt "Exo 2";background:transparent;border:none;padding:0px;')
         hb.addWidget(self._online)
         hb.addStretch(1)
+        minimize_btn = QPushButton('−', hdr)
+        minimize_btn.setToolTip('Minimize the Chat Panel; J.A.R.V.I.S. keeps running')
+        minimize_btn.setFixedSize(26, 24)
+        minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        minimize_btn.setStyleSheet(
+            f'QPushButton {{ background:transparent;color:{C.TEXT_MED};border:none;font-size:15px; }}'
+            f'QPushButton:hover {{ color:{C.PRI};background:rgba(0,72,98,100);border-radius:6px; }}'
+        )
+        minimize_btn.clicked.connect(self.hide)
+        hb.addWidget(minimize_btn)
         close_btn = QPushButton('×')
         close_btn.setToolTip('Close J.A.R.V.I.S. completely')
         close_btn.setFixedSize(26, 24)
@@ -5828,8 +5998,6 @@ class _CommandWindow(QFrame):
 
     def _close_jarvis(self):
         try:
-            if _sfx_enabled(getattr(self, '_host', None)):
-                _sfx('close')
             self._host._close_all_ui()
         except Exception:
             try:
@@ -6550,6 +6718,26 @@ class _CommandWindow(QFrame):
             lbl = getattr(self, '_chat_activity', None)
             if lbl is not None:
                 lbl.hide()
+        except Exception:
+            pass
+
+    def apply_coding_preview(self, kind: str, payload: dict | None = None) -> None:
+        """Legacy chat surface: no coding card — keep the honest indicator word.
+
+        This window only exists when the refined panel failed to build. The
+        real coding progress still reaches the activity indicator, so the user
+        can always tell that (and what) J.A.R.V.I.S. is coding.
+        """
+        try:
+            p = dict(payload or {})
+            kind = str(kind or '').strip().lower()
+            if kind in ('done', 'finished', 'complete', 'completed',
+                        'failed', 'error'):
+                self.clear_chat_activity()
+                return
+            detail = str(p.get('stage') or p.get('path') or p.get('summary')
+                         or p.get('description') or '').strip()[:60]
+            self.set_chat_activity(f'CODE · {detail}' if detail else 'CODE')
         except Exception:
             pass
 
@@ -8745,12 +8933,13 @@ class _VisionLoader(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(236, 74)
+        self.setFixedSize(292, 72)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._title = 'PREPARING CAMERA'
         self._pinned_title = ''      # caller-supplied caption (wins over stages)
         self._value = 0            # real, stage-derived percentage
         self._failed = False
+        self._detail = ''
         self._shimmer = 0.0
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
@@ -8782,6 +8971,7 @@ class _VisionLoader(QWidget):
         """Arm the indicator for a brand-new operation at a real 0 %."""
         self._value = 0
         self._failed = False
+        self._detail = ''
         self._shimmer = 0.0
         self._pinned_title = str(title or '')
         self._title = self._pinned_title or 'WORKING'
@@ -8796,7 +8986,8 @@ class _VisionLoader(QWidget):
         if failed:
             # A failed attempt must not sit on an arbitrary percentage.
             self._value = 0
-            self._title = 'CAMERA UNAVAILABLE'
+            self._title = 'CAMERA OFF OR UNAVAILABLE'
+            self._detail = 'Turn on your camera and check Windows camera permissions.'
         else:
             self._value = max(0, min(99, int(percent)))
             if not self._pinned_title:
@@ -8820,10 +9011,12 @@ class _VisionLoader(QWidget):
             pass
         self.update()
 
-    def halt(self, reason: str = '') -> None:
-        """Failure / cancellation / timeout: stop the indicator, never stick."""
+    def halt(self, reason: str = '', detail: str = '') -> None:
+        """Failure / cancellation / timeout: stop and explain the real issue."""
         self._failed = True
-        self._title = (reason or 'CAMERA UNAVAILABLE').upper()
+        self._title = (reason or 'CAMERA OFF OR UNAVAILABLE').upper()
+        self._detail = str(detail or
+            'Turn on your camera and check Windows camera permissions.')
         try:
             self._tmr.stop()
         except Exception:
@@ -8853,48 +9046,59 @@ class _VisionLoader(QWidget):
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         W, H = self.width(), self.height()
-        # Readable plate so the HUD text never dissolves into a bright camera.
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(2, 11, 19, 222)))
-        p.drawRoundedRect(QRectF(0, 0, W - 1, H - 1), 7, 7)
-        p.setPen(QPen(QColor(88, 214, 245, 70), 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(0.5, 0.5, W - 2, H - 2), 7, 7)
-
+        # Transparent by design: no plate, filled box, or border behind the loader.
         accent = QColor(244, 178, 74) if self._failed else qcol(C.PRI)
-        f = QFont('Exo 2', 6, QFont.Weight.Bold)
-        p.setFont(f)
+        p.setFont(QFont('Exo 2', 7, QFont.Weight.Bold))
         p.setPen(QPen(accent, 1))
-        p.drawText(QRectF(12, 9, W - 24, 14),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        p.drawText(QRectF(0, 0, W, 18),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                    self._title)
-        pf = QFont('Share Tech Mono', 12, QFont.Weight.Bold)
-        p.setFont(pf)
-        p.setPen(QPen(qcol(C.WHITE, 235), 1))
-        p.drawText(QRectF(12, 26, W - 24, 22),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   f'{self._value:02d}%')
 
-        # Progress track + real fill.
-        bx, by, bw, bh = 12.0, H - 20.0, W - 24.0, 6.0
+        if self._failed:
+            p.setFont(QFont('Segoe UI', 8, QFont.Weight.Medium))
+            p.setPen(QPen(qcol(C.TEXT), 1))
+            # Wrap deterministically instead of mixing Qt.AlignmentFlag and
+            # Qt.TextFlag enums (which can fail on some PyQt6 builds).
+            words = str(self._detail or '').split()
+            lines = []
+            line = ''
+            for word in words:
+                candidate = (line + ' ' + word).strip()
+                if line and len(candidate) > 43:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            if line:
+                lines.append(line)
+            detail_text = '\n'.join(lines[:2])
+            p.drawText(QRectF(8, 18, W - 16, 39),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                       detail_text)
+        else:
+            p.setFont(QFont('Share Tech Mono', 12, QFont.Weight.Bold))
+            p.setPen(QPen(qcol(C.WHITE, 235), 1))
+            p.drawText(QRectF(0, 17, W, 25),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                       f'{self._value:02d}%')
+
+        # A minimal, unboxed progress line keeps loading visible without a panel fill.
+        bx, by, bw, bh = 7.0, H - 9.0, W - 14.0, 3.0
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(88, 214, 245, 34)))
-        p.drawRoundedRect(QRectF(bx, by, bw, bh), 3, 3)
+        p.setBrush(QBrush(QColor(88, 214, 245, 50)))
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), 1.5, 1.5)
         frac = max(0.0, min(1.0, self._value / 100.0))
         if frac > 0:
-            p.setBrush(QBrush(QColor(accent.red(), accent.green(),
-                                     accent.blue(), 210)))
-            p.drawRoundedRect(QRectF(bx, by, max(bh, bw * frac), bh), 3, 3)
-        # Shimmer: an activity marker that always stays inside the real fill.
+            p.setBrush(QBrush(QColor(accent.red(), accent.green(), accent.blue(), 220)))
+            p.drawRoundedRect(QRectF(bx, by, max(bh, bw * frac), bh), 1.5, 1.5)
         if self._tmr.isActive() and 0 < self._value < 100 and not self._failed:
             x = bx + (bw * frac) * self._shimmer
-            g = QLinearGradient(x, by, x + 26, by)
+            g = QLinearGradient(x, by, x + 22, by)
             g.setColorAt(0.0, QColor(255, 255, 255, 0))
-            g.setColorAt(0.5, QColor(255, 255, 255, 90))
+            g.setColorAt(0.5, QColor(255, 255, 255, 100))
             g.setColorAt(1.0, QColor(255, 255, 255, 0))
             p.setBrush(QBrush(g))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(QRectF(bx, by, max(bh, bw * frac), bh), 3, 3)
+            p.drawRoundedRect(QRectF(bx, by, max(bh, bw * frac), bh), 1.5, 1.5)
         p.end()
 
 
@@ -9794,14 +9998,31 @@ class _InlineVisionView(QFrame):
             return
         if stage.startswith('failed'):
             reason = stage.split(':', 1)[1] if ':' in stage else ''
-            self._loader.halt({
-                'no_opencv': 'OPENCV UNAVAILABLE',
-                'disabled': 'CAMERA DISABLED',
-                'device_unavailable': 'CAMERA UNAVAILABLE',
-            }.get(reason, 'SCAN FAILED' if self._scan_progress
-                            else 'CAMERA UNAVAILABLE'))
-            if self._scan_progress:
-                # A scan that failed still has to terminate its indicator.
+            was_scan = bool(self._scan_progress)
+            labels = {
+                'no_opencv': 'CAMERA SUPPORT UNAVAILABLE',
+                'disabled': 'CAMERA ACCESS IS DISABLED',
+                'device_unavailable': 'CAMERA OFF OR UNAVAILABLE',
+            }
+            title = labels.get(reason, 'VISION SCAN FAILED' if was_scan
+                               else 'CAMERA OFF OR UNAVAILABLE')
+            if not was_scan:
+                self._loading = False
+                self._status = 'VISION CAMERA · OFF OR UNAVAILABLE'
+                try:
+                    self._loading_timer.stop()
+                except Exception:
+                    pass
+                self._loader.halt(
+                    title,
+                    'Turn on your camera and check Windows camera permissions.'
+                )
+                self._loader.show()
+                self._loader.raise_()
+                self._position_loader()
+                self.update()
+            else:
+                self._loader.halt(title, 'Please retry the Vision scan.')
                 self._retire_progress()
                 QTimer.singleShot(1400, self._loader.hide_progress)
             return
@@ -9943,6 +10164,22 @@ class _InlineVisionView(QFrame):
             pass
         self.update()
 
+    def show_camera_error(self, reason: str = 'CAMERA OFF OR UNAVAILABLE',
+                          detail: str = 'Turn on your camera and check Windows camera permissions.') -> None:
+        """Stop the initializing state and show a readable, transparent error."""
+        self._loading = False
+        self._status = 'VISION CAMERA · OFF OR UNAVAILABLE'
+        try:
+            self._loading_timer.stop()
+        except Exception:
+            pass
+        self._retire_progress()
+        self._loader.halt(reason, detail)
+        self._loader.show()
+        self._loader.raise_()
+        self._position_loader()
+        self.update()
+
     def end_stream(self):
         """Release the decoded frame so a hidden stage holds no image memory."""
         try:
@@ -9970,18 +10207,22 @@ class _InlineVisionView(QFrame):
 
     def _loading_timeout(self):
         if self._loading and self._frame_count == 0:
-            self._status = 'VISION CAMERA · NO SIGNAL'
-            # The indicator must always terminate: a stalled open ends here in
-            # an explicit failed state rather than sticking at a percentage.
-            self._loader.halt('NO SIGNAL')
+            self._loading = False
+            self._status = 'VISION CAMERA · OFF OR UNAVAILABLE'
+            # Keep a human-readable explanation visible until Vision is closed.
+            self._loader.halt(
+                'CAMERA OFF OR UNAVAILABLE',
+                'Your camera is not on or could not be opened. Turn it on and check Windows camera permissions.'
+            )
             self._retire_progress()
-            QTimer.singleShot(1200, self._loader.hide_progress)
+            self._position_loader()
             self.update()
 
     def _position_loader(self):
         try:
-            self._loader.move((self.width() - self._loader.width()) // 2,
-                              max(6.0, self.height() - self._loader.height() - 16.0))
+            x = max(0, (self.width() - self._loader.width()) // 2)
+            y = max(0, (self.height() - self._loader.height()) // 2)
+            self._loader.move(x, y)
         except Exception:
             pass
 
@@ -10153,24 +10394,16 @@ class _InlineVisionView(QFrame):
         r=QRectF(self.rect()).adjusted(1,1,-1,-1)
         W,H=self.width(),self.height()
         live = not self._frame.isNull()
-        # Nothing dark sits behind or over a live feed: the glass field, grid
-        # and glow bands are painted ONLY while there is no frame to show, so
-        # the HUD chrome can never dim the camera picture.
-        if not live:
-            p.setBrush(QBrush(QColor(2,8,16,235)))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(r, 10, 10)
+    def _paint_scene(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        W, H = self.width(), self.height()
+        live = not self._frame.isNull()
+        # Vision stays genuinely transparent when no feed is available: no dark
+        # placeholder card, grid, background fill, or always-on outer stroke.
         p.save()
         p.setClipRect(r)
-        if not live:
-            p.setPen(QPen(QColor(0,170,210,24),1))
-            for x in range(0,W,24):
-                p.drawLine(x,0,x,H)
-            for y in range(0,H,24):
-                p.drawLine(0,y,W,y)
-            # corner glow bands
-            p.setPen(QPen(QColor(0,212,255,55),1)); p.drawLine(0,22,W,22)
-            p.setPen(QPen(QColor(244,178,74,30),1)); p.drawLine(0,H-18,W,H-18)
         if live:
             key = (self._frame_serial, W, H, round(self._zoom, 3), self._invert,
                    72 if self._low_light else self._brightness)
@@ -10332,19 +10565,10 @@ class _InlineVisionView(QFrame):
                 p.drawRoundedRect(r, 9, 9)
 
             # No outer Vision frame or stroke unless EDGE TRACE is explicitly enabled.
-        else:
-            # Explicit connection state while the camera is starting. The old
-            # "INITIALISING OPTICAL LINK" caption is gone: the stage-driven
-            # progress indicator below now carries that information (operation +
-            # real percentage), and drawing both read as duplicate text.
-            status_x = max(8.0, (W - 240.0) / 2.0)
-            self._draw_text(p, self._status, status_x, H/2 + 22, 7, C.PRI)
-        # HUD corners
-        p.setPen(QPen(QColor(88,214,245,190),1.8))
-        L=22; m=7
-        for x,y,dx,dy in ((m,m,1,1),(W-m,m,-1,1),(m,H-m,1,-1),(W-m,H-m,-1,-1)):
-            p.drawLine(QPointF(x,y),QPointF(x+dx*L,y)); p.drawLine(QPointF(x,y),QPointF(x,y+dy*L))
-        p.restore(); p.end()
+        # No text or default frame is painted over the feed/loading indicator.
+        # Optional overlays (reticle, detection boxes, EDGE TRACE) remain user-controlled.
+        p.restore()
+        p.end()
 
 class _ScaledImageLabel(QLabel):
     """Transparent Image View surface with smooth zoom + pan.
@@ -10658,6 +10882,9 @@ class _ChatBubble(QFrame):
         self._body.setAlignment(Qt.AlignmentFlag.AlignRight if self._you else Qt.AlignmentFlag.AlignLeft)
         self._body.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         _body_color = C.TEXT_DIM if self._muted else (C.WHITE if self._you else C.TEXT)
+        # The Markdown renderer paints the body text itself, so it needs the
+        # same colour the plain-text stylesheet would have used.
+        self._base_color = _body_color
         self._body.setStyleSheet(
             f'color:{_body_color};'
             'font-family:Rajdhani;font-size:10pt;font-weight:560;'
@@ -10680,15 +10907,59 @@ class _ChatBubble(QFrame):
 
     def set_text(self, text: str) -> None:
         self._raw_text = str(text or '')
+        self._render_body()
+
+    def append_text(self, text: str) -> None:
+        self._raw_text += str(text or '')
+        self._render_body()
+
+    def _render_body(self) -> None:
+        """Render the message as Markdown, with a safe plain-text fallback.
+
+        Both identities render Markdown now: ``**bold**``, headings, lists and
+        fenced code used to show as literal symbols. The shared renderer
+        escapes all source text first, so the fallback path is only a belt for
+        a renderer failure — never an HTML-injection window.
+        """
+        try:
+            html = _render_markdown_html(self._raw_text, base_color=self._base_color)
+            if html:
+                self._body.setText(html)
+                self._resize_rich_naturally()
+                return
+        except Exception:
+            pass
         self._body.setText(self._linkify(self._raw_text))
         self._body.adjustSize()
         self._resize_naturally()
 
-    def append_text(self, text: str) -> None:
-        self._raw_text += str(text or '')
-        self._body.setText(self._linkify(self._raw_text))
-        self._body.adjustSize()
-        self._resize_naturally()
+    def _resize_rich_naturally(self) -> None:
+        """Size the bubble from the RENDERED rich text.
+
+        The plain-text measurement cannot see a 20pt heading or a wide code
+        line, so a Markdown bubble measures through a ``QTextDocument`` — the
+        same engine the label paints with — and keeps a small slack so no line
+        is ever clipped.
+        """
+        try:
+            doc = QTextDocument()
+            doc.setDocumentMargin(0.0)
+            doc.setDefaultFont(self._body.font())
+            doc.setHtml(self._body.text())
+            doc.setTextWidth(-1.0)
+            ideal = float(doc.idealWidth())
+            horizontal_padding = 18
+            width = min(self._max_width,
+                        max(28, int(math.ceil(ideal)) + horizontal_padding))
+            body_width = max(1, int(width) - horizontal_padding)
+            doc.setTextWidth(float(body_width))
+            height = int(math.ceil(doc.size().height())) + 2
+            self.setFixedWidth(int(width))
+            self._body.setFixedSize(body_width, max(18, height))
+            self._body.updateGeometry()
+            self.adjustSize()
+        except Exception:
+            self._resize_naturally()
 
     def _resize_naturally(self) -> None:
         if self._body is None:
@@ -10719,9 +10990,9 @@ class _ChatBubble(QFrame):
 
     def set_bubble_width(self, width: int) -> None:
         # This is only the maximum allowed width.  Short messages are still
-        # sized from their measured text in _resize_naturally().
+        # sized from their measured text in _render_body().
         self._max_width = max(180, int(width))
-        self._resize_naturally()
+        self._render_body()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -10987,6 +11258,45 @@ def _ChatImageRowInit(self, pixmap, caption, you, parent=None):
 _ChatImageRow.__init__ = _ChatImageRowInit
 
 
+#: Activity categories ``main.py`` already sends for real tool work → the word
+#: the chat shows. "CODE · game" must read CODING, "FIND · tariffs" must read
+#: RESEARCHING; a generic WORKING for all of them hid what J.A.R.V.I.S. was
+#: actually doing.
+_ACTIVITY_WORDS = {
+    'SMART': 'THINKING',
+    'SEARCH': 'SEARCHING',
+    'FIND': 'RESEARCHING',
+    'CODE': 'CODING',
+    'REVIEW': 'REVIEWING',
+    'VIEW': 'VIEWING',
+    'GENERATE': 'GENERATING',
+    'ANALYZE': 'ANALYZING',
+    'AUTOMATE': 'AUTOMATING',
+}
+
+
+def chat_activity_word(activity: str) -> str:
+    """The honest word(s) for the typing row, from a real activity string.
+
+    ``main.py`` sends ``"CATEGORY · detail"`` for tool work (for example
+    ``"CODE · game.py"``). The leading category maps to a real verb and the
+    detail is preserved (``"CODING · game.py"``), so coding, researching and
+    searching no longer look identical. Strings that do not start with a known
+    category keep the previous THINKING/WORKING contract.
+    """
+    text = str(activity or '').strip()
+    if not text:
+        return 'WORKING'
+    head, _, detail = text.partition('·')
+    word = _ACTIVITY_WORDS.get(head.strip().upper())
+    if word:
+        detail = detail.strip()
+        return f'{word} · {detail}' if detail else word
+    lowered = text.lower()
+    return 'THINKING' if ('think' in lowered or 'reason' in lowered
+                          or lowered in {'processing', 'working'}) else 'WORKING'
+
+
 class _TypingIndicatorRow(QWidget):
     """Messenger-like J.A.R.V.I.S. working row: animated dots plus a word.
 
@@ -10994,6 +11304,10 @@ class _TypingIndicatorRow(QWidget):
     turn looked exactly like a slow one. The label is the visible promise the
     response watchdog can then honestly withdraw.
     """
+    #: Wide enough for a verb AND its real detail ("CODING · game.py"). The old
+    #: 240 px clipped anything longer than a single generic word.
+    _MAX_BUBBLE_W = 430
+
     def __init__(self, parent=None, label: str = 'WORKING'):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -11007,7 +11321,7 @@ class _TypingIndicatorRow(QWidget):
         self._bubble = QFrame(self)
         self._bubble.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._bubble.setMinimumSize(0, 34)
-        self._bubble.setMaximumWidth(240)
+        self._bubble.setMaximumWidth(self._MAX_BUBBLE_W)
         self._bubble.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._bubble.setFixedHeight(34)
         # Messenger-style typing bubble: the animated dots start from the
@@ -11053,9 +11367,15 @@ class _TypingIndicatorRow(QWidget):
         try:
             dots = max(14, self._dots.fontMetrics().horizontalAdvance(
                 self._dots.text()))
-            word = self._label.fontMetrics().horizontalAdvance(self._label.text())
+            word = max(self._label.fontMetrics().horizontalAdvance(
+                self._label.text()), self._label.sizeHint().width())
             # 11px left + 6px gap + 11px right, matching the bubble margins.
-            self._bubble.setFixedWidth(min(240, 28 + dots + word))
+            width = min(self._MAX_BUBBLE_W, 28 + dots + word)
+            self._bubble.setFixedWidth(width)
+            # The word can never be wider than the space the bubble actually
+            # gives it: a font that does not resolve to the stylesheet family
+            # would otherwise clip the very promise the watchdog must withdraw.
+            self._label.setMaximumWidth(max(10, width - 28 - dots))
         except Exception:
             pass
 
@@ -11193,6 +11513,890 @@ class _FileAttachmentCard(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
 
 
+class _ChatGradientViewport(QWidget):
+    """Stable frosted-gradient backing with soft glow and angular corner marks."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = QRectF(self.rect())
+            if r.width() <= 0 or r.height() <= 0:
+                return
+
+            # Dark-to-deeper-blue gradient, with diffuse radial pools that create
+            # the soft, frosted/backdrop-blur impression without blurring text.
+            base = QLinearGradient(r.topLeft(), r.bottomRight())
+            base.setColorAt(0.0, QColor(8, 31, 46, 255))
+            base.setColorAt(0.42, QColor(3, 17, 29, 255))
+            base.setColorAt(1.0, QColor(2, 11, 21, 255))
+            p.fillRect(r, QBrush(base))
+
+            glow_a = QRadialGradient(QPointF(r.width() * 0.88, r.height() * 0.08),
+                                    max(80.0, r.width() * 0.78))
+            glow_a.setColorAt(0.0, QColor(0, 183, 224, 43))
+            glow_a.setColorAt(0.48, QColor(0, 118, 157, 17))
+            glow_a.setColorAt(1.0, QColor(0, 70, 110, 0))
+            p.fillRect(r, QBrush(glow_a))
+
+            glow_b = QRadialGradient(QPointF(r.width() * 0.04, r.height() * 0.96),
+                                    max(70.0, r.width() * 0.62))
+            glow_b.setColorAt(0.0, QColor(16, 91, 128, 35))
+            glow_b.setColorAt(0.55, QColor(9, 57, 85, 13))
+            glow_b.setColorAt(1.0, QColor(3, 20, 34, 0))
+            p.fillRect(r, QBrush(glow_b))
+
+            # Corner-only linework: rounded caps and joins stay smooth; there is
+            # deliberately no continuous rectangular stroke around the log.
+            margin, arm = 6.0, 18.0
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(88, 214, 245, 105), 1.35,
+                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            corners = (
+                (margin, margin, 1, 1),
+                (r.width() - margin, margin, -1, 1),
+                (margin, r.height() - margin, 1, -1),
+                (r.width() - margin, r.height() - margin, -1, -1),
+            )
+            for x, y, dx, dy in corners:
+                p.drawLine(QPointF(x, y), QPointF(x + dx * arm, y))
+                p.drawLine(QPointF(x, y), QPointF(x, y + dy * arm))
+        finally:
+            p.end()
+
+
+class _MarkdownExpandShell(QFrame):
+    """Expanded Markdown shell matching the live Activity/HUD panel chassis."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background:transparent;border:none;")
+        self._glow_timer = QTimer(self)
+        self._glow_timer.setInterval(65)
+        self._glow_timer.timeout.connect(self._pulse)
+        self._glow_timer.start()
+
+    def _pulse(self):
+        self._phase = (self._phase + 0.07) % math.tau
+        self.update()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        if not self._glow_timer.isActive():
+            self._glow_timer.start()
+
+    def hideEvent(self, event):  # noqa: N802
+        self._glow_timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0)
+            if r.width() <= 0 or r.height() <= 0:
+                return
+            cut = max(10.0, min(16.0, min(r.width(), r.height()) * 0.045))
+            path = QPainterPath()
+            path.moveTo(QPointF(r.left() + cut, r.top()))
+            path.lineTo(QPointF(r.right() - cut, r.top()))
+            path.lineTo(QPointF(r.right(), r.top() + cut))
+            path.lineTo(QPointF(r.right(), r.bottom() - cut))
+            path.lineTo(QPointF(r.right() - cut, r.bottom()))
+            path.lineTo(QPointF(r.left() + cut, r.bottom()))
+            path.lineTo(QPointF(r.left(), r.bottom() - cut))
+            path.lineTo(QPointF(r.left(), r.top() + cut))
+            path.closeSubpath()
+
+            # The Activity panel's hard-cut shell, with a dark glass fill so the
+            # Markdown document stays readable rather than showing desktop bleed.
+            grad = QLinearGradient(r.topLeft(), r.bottomRight())
+            grad.setColorAt(0.0, QColor(5, 25, 37, 250))
+            grad.setColorAt(0.48, QColor(2, 12, 21, 252))
+            grad.setColorAt(1.0, QColor(3, 19, 29, 250))
+            p.fillPath(path, QBrush(grad))
+
+            p.save()
+            p.setClipPath(path)
+            glow = QRadialGradient(QPointF(r.width() * 0.90, r.height() * 0.05),
+                                   max(90.0, r.width() * 0.72))
+            glow.setColorAt(0.0, QColor(0, 183, 224, 38))
+            glow.setColorAt(0.52, QColor(0, 118, 157, 13))
+            glow.setColorAt(1.0, QColor(0, 70, 110, 0))
+            p.fillRect(r, QBrush(glow))
+            p.setPen(QPen(QColor(88, 214, 245, 16), 1.0))
+            for x in range(12, int(r.width()), 30):
+                p.drawLine(int(r.left() + x), int(r.top()), int(r.left() + x), int(r.bottom()))
+            for y in range(12, int(r.height()), 30):
+                p.drawLine(int(r.left()), int(r.top() + y), int(r.right()), int(r.top() + y))
+            p.restore()
+
+            pulse = 0.5 + 0.5 * math.sin(self._phase)
+            for width, base_a, gain in ((7.0, 18, 16), (3.0, 42, 30)):
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(86, 214, 245, int(base_a + gain * pulse)), width))
+                p.drawPath(path)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(88, 214, 245, int(142 + 48 * pulse)), 1.1))
+            p.drawPath(path)
+            p.setPen(QPen(QColor(88, 214, 245, 72), 1.0))
+            tick = min(14.0, max(8.0, r.width() * 0.035))
+            for frac in (0.22, 0.50, 0.78):
+                x = r.left() + r.width() * frac
+                p.drawLine(QPointF(x, r.top() + 2), QPointF(x + tick, r.top() + 2))
+                p.drawLine(QPointF(x - tick, r.bottom() - 2), QPointF(x, r.bottom() - 2))
+            p.setPen(QPen(QColor(244, 178, 74, 92), 1.0))
+            p.drawLine(QPointF(r.left() + 3, r.top() + cut + 5),
+                       QPointF(r.left() + 3, r.top() + cut + 15))
+            p.drawLine(QPointF(r.right() - 3, r.bottom() - cut - 5),
+                       QPointF(r.right() - 3, r.bottom() - cut - 15))
+        finally:
+            p.end()
+
+
+class _MarkdownDragBar(QWidget):
+    """Simple drag surface for the frameless expanded Markdown panel."""
+
+    def __init__(self, dialog, parent=None):
+        super().__init__(parent)
+        self._dialog = dialog
+        self._drag_offset = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self._dialog.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._dialog.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+def open_markdown_detail(parent, title: str, markdown: str,
+                         subtitle: str = 'RESEARCH / MARKDOWN DETAIL') -> None:
+    """The one expanded Markdown viewer, shared by every Markdown surface.
+
+    Research/content cards and the live coding card all open this same HUD
+    dialog, so the expanded view, its shell and its COPY control never drift
+    apart between surfaces.
+    """
+    title = str(title or 'Markdown detail').strip() or 'Markdown detail'
+    markdown = str(markdown or '')
+    dlg = QDialog(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+    dlg.setWindowTitle(title)
+    dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    dlg.resize(820, 610)
+    outer = QVBoxLayout(dlg)
+    outer.setContentsMargins(0, 0, 0, 0)
+    # Use the exact same animated angular shell as Activity/other HUD panels.
+    # The shared settings backdrop supplies the dark field and grid; the
+    # shell owns the pulsing cyan perimeter and calibration marks.
+    shell = _HudPanel(dlg)
+    shell.setObjectName('HudPanel')
+    shell.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    shell.setStyleSheet(_panel_design_css())
+    shell.setMinimumSize(560, 380)
+    try:
+        backdrop = _ControlCenterBackdrop(shell)
+        backdrop.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        backdrop.setGeometry(shell.rect())
+        backdrop.lower()
+        shell._settings_backdrop = backdrop
+
+        def _fit_markdown_backdrop(ev, _shell=shell, _bg=backdrop):
+            QFrame.resizeEvent(_shell, ev)
+            try:
+                _bg.setGeometry(_shell.rect())
+                _bg.lower()
+            except Exception:
+                pass
+        shell.resizeEvent = _fit_markdown_backdrop
+    except Exception:
+        pass
+    shell_lay = QVBoxLayout(shell)
+    shell_lay.setContentsMargins(13, 9, 13, 12)
+    shell_lay.setSpacing(7)
+
+    rail = _MarkdownDragBar(dlg, shell)
+    rail.setFixedHeight(36)
+    rail_row = QHBoxLayout(rail)
+    rail_row.setContentsMargins(4, 0, 2, 0)
+    rail_row.setSpacing(8)
+    marker = QLabel('⌕', rail)
+    marker.setStyleSheet(f'color:{C.PRI};font:800 13pt "Rajdhani";background:transparent;border:none;')
+    marker.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    rail_row.addWidget(marker)
+    title_stack = QWidget(rail)
+    title_stack.setStyleSheet('background:transparent;border:none;')
+    title_stack.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    title_layout = QVBoxLayout(title_stack)
+    title_layout.setContentsMargins(0, 0, 0, 0)
+    title_layout.setSpacing(0)
+    heading = QLabel(title.upper()[:100], title_stack)
+    heading.setStyleSheet(f'color:{C.WHITE};font:800 8pt "Orbitron";letter-spacing:1.1px;background:transparent;border:none;')
+    heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    subtitle_label = QLabel(str(subtitle or 'RESEARCH / MARKDOWN DETAIL'), title_stack)
+    subtitle_label.setStyleSheet(f'color:{C.TEXT_DIM};font:700 6pt "Exo 2";letter-spacing:1.0px;background:transparent;border:none;')
+    subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    title_layout.addWidget(heading)
+    title_layout.addWidget(subtitle_label)
+    rail_row.addWidget(title_stack, 1)
+
+    copy_btn = _AngularButton('COPY', rail, compact=True)
+    copy_btn.setFixedSize(78, 29)
+    copy_btn.set_tab_visual(True)
+    copy_btn.setToolTip('Copy the original Markdown source')
+    copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(markdown))
+    rail_row.addWidget(copy_btn)
+    close_btn = _AngularButton('×', rail, compact=True)
+    close_btn.setFixedSize(30, 29)
+    close_btn.set_tab_visual(True)
+    close_btn.setToolTip('Close expanded Markdown')
+    close_btn.clicked.connect(dlg.accept)
+    rail_row.addWidget(close_btn)
+    shell_lay.addWidget(rail)
+
+    rule = QFrame(shell)
+    rule.setFixedHeight(1)
+    rule.setStyleSheet('background:rgba(88,214,245,66);border:none;')
+    shell_lay.addWidget(rule)
+
+    view = MarkdownTextBrowser(shell)
+    view.setObjectName('ExpandedMarkdownView')
+    view.set_markdown(markdown)
+    view.setFrameShape(QFrame.Shape.NoFrame)
+    view.setStyleSheet(
+        f'QTextBrowser {{ background:rgba(1,15,25,88); color:{C.TEXT}; '
+        'border:none; padding:10px 12px; font:10pt "Rajdhani"; }'
+        'QScrollBar:vertical { width:5px; background:transparent; border:none; margin:3px 1px; }'
+        'QScrollBar::handle:vertical { background:rgba(88,214,245,115); border-radius:0; min-height:24px; }'
+        'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:none;}'
+    )
+    view.viewport().setAutoFillBackground(False)
+    view.viewport().setStyleSheet('background:transparent;border:none;')
+    shell_lay.addWidget(view, 1)
+    outer.addWidget(shell, 1)
+    dlg.exec()
+
+
+class _ChatMarkdownCard(QFrame):
+    """Compact in-chat Markdown result with clickable links, Copy and Expand."""
+
+    def __init__(self, title: str, markdown: str, parent=None):
+        super().__init__(parent)
+        self._title_text = str(title or 'RESEARCH').strip() or 'RESEARCH'
+        self._markdown = str(markdown or '')
+        self.setObjectName('ChatMarkdownCard')
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setStyleSheet(
+            '#ChatMarkdownCard { background:transparent; border:none; }'
+            'QLabel { background:transparent; border:none; }'
+        )
+        self.setMaximumWidth(720)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(11, 9, 11, 10)
+        root.setSpacing(7)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(7)
+        marker = QLabel('↗')
+        marker.setFixedWidth(16)
+        marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        marker.setStyleSheet(f'color:{C.PRI};font:900 11pt "Exo 2";')
+        header.addWidget(marker)
+        title_label = QLabel(self._title_text.upper()[:86])
+        title_label.setMinimumWidth(0)
+        title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        title_label.setToolTip(self._title_text)
+        title_label.setStyleSheet(
+            f'color:{C.PRI};font:800 7pt "Orbitron";letter-spacing:0.9px;')
+        header.addWidget(title_label, 1)
+        self._copy_btn = _AngularButton('COPY', self, compact=True)
+        self._copy_btn.setFixedSize(62, 26)
+        self._expand_btn = _AngularButton('EXPAND  ↗', self, compact=True)
+        self._expand_btn.setFixedSize(98, 26)
+        self._copy_btn.set_tab_visual(True)
+        self._expand_btn.set_tab_visual(True)
+        self._copy_btn.setToolTip('Copy the original Markdown source')
+        self._expand_btn.setToolTip('Open the full styled Markdown view')
+        self._copy_btn.clicked.connect(self.copy_markdown)
+        self._expand_btn.clicked.connect(self.expand_markdown)
+        header.addWidget(self._copy_btn)
+        header.addWidget(self._expand_btn)
+        root.addLayout(header)
+        divider = QFrame(self)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet('background:rgba(88,214,245,78);border:none;')
+        root.addWidget(divider)
+
+        self._preview = MarkdownTextBrowser(self)
+        self._preview.set_markdown(self._markdown)
+        self._preview.setFrameShape(QFrame.Shape.NoFrame)
+        self._preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._preview.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._preview.setFixedHeight(156)
+        self._preview.setStyleSheet(
+            f'QTextBrowser {{ background:transparent; border:none; color:{C.TEXT}; '
+            'padding:1px 2px; font:9.5pt "Rajdhani"; }'
+            'QScrollBar:vertical { width:4px; background:transparent; border:none; }'
+            'QScrollBar::handle:vertical { background:rgba(88,214,245,115); border-radius:0; }'
+            'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:none;}'
+        )
+        root.addWidget(self._preview)
+        self._preview.viewport().setAutoFillBackground(False)
+        self._preview.viewport().setStyleSheet('background:transparent;border:none;')
+
+    def paintEvent(self, event):  # noqa: N802
+        """Paint a rounded glass card while retaining the angular HUD accents."""
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8)
+            if r.width() <= 2 or r.height() <= 2:
+                return
+
+            radius = 12.0
+            path = QPainterPath()
+            path.addRoundedRect(r, radius, radius)
+
+            # A cool, dark glass gradient clipped to the rounded silhouette. The
+            # preview content and Copy/Expand controls remain untouched.
+            grad = QLinearGradient(r.topLeft(), r.bottomRight())
+            grad.setColorAt(0.0, QColor(6, 31, 46, 248))
+            grad.setColorAt(0.48, QColor(2, 15, 26, 250))
+            grad.setColorAt(1.0, QColor(1, 11, 20, 250))
+            p.fillPath(path, QBrush(grad))
+
+            p.save()
+            p.setClipPath(path)
+            glow = QRadialGradient(QPointF(r.width() * 0.86, r.height() * 0.03),
+                                   max(72.0, r.width() * 0.78))
+            glow.setColorAt(0.0, QColor(0, 183, 224, 27))
+            glow.setColorAt(0.55, QColor(0, 118, 157, 10))
+            glow.setColorAt(1.0, QColor(0, 70, 110, 0))
+            p.fillRect(r, QBrush(glow))
+            p.restore()
+
+            # A fine, low-contrast rounded perimeter; the brighter cyan strokes
+            # remain corner-only, matching the rest of the futuristic HUD.
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(88, 214, 245, 42), 0.9))
+            p.drawPath(path)
+
+            arm = 14.0
+            inset = 2.0
+            left, top = r.left() + inset, r.top() + inset
+            right, bottom = r.right() - inset, r.bottom() - inset
+            # Keep accent lines outside the rounded arc so the card reads as a
+            # rounded panel, not a clipped square with sharp corner strokes.
+            p.setPen(QPen(QColor(88, 214, 245, 165), 1.2,
+                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            segments = (
+                (QPointF(left + radius, top), QPointF(left + radius + arm, top)),
+                (QPointF(left, top + radius), QPointF(left, top + radius + arm)),
+                (QPointF(right - radius - arm, top), QPointF(right - radius, top)),
+                (QPointF(right, top + radius), QPointF(right, top + radius + arm)),
+                (QPointF(left + radius, bottom), QPointF(left + radius + arm, bottom)),
+                (QPointF(left, bottom - radius - arm), QPointF(left, bottom - radius)),
+                (QPointF(right - radius - arm, bottom), QPointF(right - radius, bottom)),
+                (QPointF(right, bottom - radius - arm), QPointF(right, bottom - radius)),
+            )
+            for a, b in segments:
+                p.drawLine(a, b)
+        finally:
+            p.end()
+
+    def copy_markdown(self) -> None:
+        try:
+            QApplication.clipboard().setText(self._markdown)
+            self._copy_btn.setText('COPIED')
+            QTimer.singleShot(1200, lambda: self._copy_btn.setText('COPY')
+                              if self._copy_btn is not None else None)
+        except Exception:
+            pass
+
+    def expand_markdown(self) -> None:
+        open_markdown_detail(self.window(), self._title_text or 'Research result',
+                             self._markdown)
+
+
+class _ChatCodingCard(QFrame):
+    """Live coding card: real stages, streamed code, real diffs.
+
+    Opened by the first real ``start`` event a coding action sends, updated by
+    every real progress event (stage / file / diff / run), and finalized by
+    the real ``done`` / ``failed`` event. Nothing here is simulated: a step
+    only appears because the coding action really reached it. The preview pane
+    types a written file out progressively; edits and autofixes show a real
+    unified diff with ``+``/``-`` colouring; the full text stays available
+    through COPY and the expanded view.
+    """
+
+    #: The preview pane grows to this height and then stops growing; the
+    #: EXPAND view carries the full content.
+    _PREVIEW_MAX_H = 170
+    #: Only this much of a written file is typed out live; the full text stays
+    #: available through EXPAND and COPY.
+    _STREAM_LIMIT = 4000
+    _STREAM_TICK_MS = 24
+
+    def __init__(self, title: str = 'CODING', language: str = 'python', parent=None):
+        super().__init__(parent)
+        self._title_text = str(title or 'CODING').strip() or 'CODING'
+        self._language = str(language or 'python').strip() or 'python'
+        self._finished = False
+        self._success = True
+        self._summary = ''
+        self._full_text = ''
+        self._pending = ''
+        self._streamed = 0
+        self._truncated = False
+        self._preview_kind = 'code'
+        self.setObjectName('ChatCodingCard')
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setStyleSheet(
+            '#ChatCodingCard { background:transparent; border:none; }'
+            'QLabel { background:transparent; border:none; }'
+        )
+        self.setMaximumWidth(720)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(11, 9, 11, 10)
+        root.setSpacing(7)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(7)
+        self._marker = QLabel('⚙')
+        self._marker.setFixedWidth(18)
+        self._marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._marker.setStyleSheet(f'color:{C.PRI};font:900 11pt "Exo 2";')
+        header.addWidget(self._marker)
+        self._title_label = QLabel(self._title_text.upper()[:64])
+        self._title_label.setMinimumWidth(0)
+        self._title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._title_label.setToolTip(self._title_text)
+        self._title_label.setStyleSheet(
+            f'color:{C.PRI};font:800 7pt "Orbitron";letter-spacing:0.9px;')
+        header.addWidget(self._title_label, 1)
+        self._counter_label = QLabel('')
+        self._counter_label.setStyleSheet(
+            f'color:{C.TEXT_DIM};font:700 6.3pt "Exo 2";letter-spacing:0.6px;')
+        header.addWidget(self._counter_label)
+        self._state_label = QLabel('CODING')
+        header.addWidget(self._state_label)
+        self._copy_btn = _AngularButton('COPY', self, compact=True)
+        self._copy_btn.setFixedSize(62, 26)
+        self._copy_btn.set_tab_visual(True)
+        self._copy_btn.setToolTip('Copy the code shown in this card')
+        self._copy_btn.clicked.connect(self.copy_code)
+        header.addWidget(self._copy_btn)
+        self._expand_btn = _AngularButton('EXPAND  ↗', self, compact=True)
+        self._expand_btn.setFixedSize(98, 26)
+        self._expand_btn.set_tab_visual(True)
+        self._expand_btn.setToolTip('Open the full styled code / diff view')
+        self._expand_btn.clicked.connect(self.expand_view)
+        header.addWidget(self._expand_btn)
+        root.addLayout(header)
+
+        stage_row = QHBoxLayout()
+        stage_row.setContentsMargins(2, 0, 2, 0)
+        stage_row.setSpacing(6)
+        self._dot = QLabel('●')
+        self._dot.setFixedWidth(10)
+        self._dot.setStyleSheet(f'color:{C.PRI};font:800 7pt "Rajdhani";')
+        stage_row.addWidget(self._dot)
+        self._stage_label = QLabel('Starting…')
+        self._stage_label.setWordWrap(True)
+        self._stage_label.setStyleSheet(
+            f'color:{C.TEXT_MED};font:600 8.2pt "Rajdhani";')
+        stage_row.addWidget(self._stage_label, 1)
+        root.addLayout(stage_row)
+
+        self._file_label = QLabel('')
+        self._file_label.setStyleSheet(
+            f'color:{C.PRI};font:700 7.2pt "Share Tech Mono";')
+        root.addWidget(self._file_label)
+
+        divider = QFrame(self)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet('background:rgba(88,214,245,78);border:none;')
+        root.addWidget(divider)
+
+        self._preview = QTextEdit(self)
+        self._preview.setReadOnly(True)
+        self._preview.setFrameShape(QFrame.Shape.NoFrame)
+        self._preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._preview.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._preview.setFixedHeight(0)
+        self._preview.setVisible(False)
+        self._preview.setStyleSheet(
+            'QTextEdit { background:rgba(1,15,25,120); border:1px solid rgba(10,134,184,90); '
+            'color:#cfeeff; padding:6px 8px; font:8.5pt "Share Tech Mono"; }'
+            'QScrollBar:vertical { width:4px; background:transparent; border:none; }'
+            'QScrollBar::handle:vertical { background:rgba(88,214,245,115); border-radius:0; }'
+            'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:none;}'
+        )
+        root.addWidget(self._preview)
+        try:
+            from ui_layout_parts import _CodeHighlighter
+            self._highlighter = _CodeHighlighter(self._preview.document(), self._language)
+        except Exception:
+            self._highlighter = None
+
+        self.set_state('CODING', tone='live')
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(self._STREAM_TICK_MS)
+        self._stream_timer.timeout.connect(self._tick_stream)
+        self._blink_on = True
+        self._blink = QTimer(self)
+        self._blink.setInterval(520)
+        self._blink.timeout.connect(self._blink_tick)
+        self._blink.start()
+
+    # ── state the window reads ────────────────────────────────────────────
+    @property
+    def is_finished(self) -> bool:
+        return bool(self._finished)
+
+    def language(self) -> str:
+        return self._language
+
+    def stage_text(self) -> str:
+        return str(self._stage_label.text())
+
+    def file_label_text(self) -> str:
+        return str(self._file_label.text())
+
+    def code_text(self) -> str:
+        return str(self._preview.toPlainText())
+
+    # ── updates (all real events) ─────────────────────────────────────────
+    def set_title(self, title: str) -> None:
+        self._title_text = str(title or 'CODING').strip() or 'CODING'
+        self._title_label.setText(self._title_text.upper()[:64])
+        self._title_label.setToolTip(self._title_text)
+
+    def set_state(self, state: str, tone: str = 'live') -> None:
+        palette = {
+            'live': (C.PRI, 'rgba(0,212,255,26)', 'rgba(0,212,255,120)'),
+            'warn': (C.ACC2, 'rgba(244,178,74,26)', 'rgba(244,178,74,130)'),
+            'done': (C.GREEN, 'rgba(46,204,113,26)', 'rgba(46,204,113,130)'),
+            'error': (C.RED, 'rgba(255,92,110,26)', 'rgba(255,92,110,130)'),
+        }
+        col, bg, br = palette.get(str(tone or 'live'), palette['live'])
+        self._state_label.setText(str(state or '').upper()[:24])
+        self._state_label.setStyleSheet(
+            f'color:{col};font:800 6.3pt "Exo 2";letter-spacing:0.8px;'
+            f'background:{bg};border:1px solid {br};border-radius:3px;padding:1px 6px;')
+
+    def set_stage(self, text: str) -> None:
+        body = str(text or '').strip()
+        if body:
+            self._stage_label.setText(body)
+
+    def set_counter(self, done, total) -> None:
+        try:
+            d, t = int(done or 0), int(total or 0)
+        except Exception:
+            d = t = 0
+        self._counter_label.setText(f'{d}/{t} FILES' if t else '')
+
+    def _blink_tick(self) -> None:
+        try:
+            if self._finished:
+                return
+            self._blink_on = not self._blink_on
+            col = C.PRI if self._blink_on else C.TEXT_DIM
+            self._dot.setStyleSheet(f'color:{col};font:800 7pt "Rajdhani";')
+        except Exception:
+            pass
+
+    # ── the streamed code pane ────────────────────────────────────────────
+    def _reset_preview(self, kind: str) -> None:
+        self._preview_kind = str(kind or 'code')
+        self._pending = ''
+        self._streamed = 0
+        self._truncated = False
+        self._stream_timer.stop()
+        self._preview.clear()
+        try:
+            self._preview.setVisible(True)
+        except Exception:
+            pass
+
+    def _grow_preview(self) -> None:
+        """Size the pane from the REAL line count.
+
+        The document layout is not available before the widget's first layout
+        pass (the card is built offscreen and only then inserted), so the pane
+        measures the rendered text itself; ``splitlines`` also splits on the
+        line separators Qt uses for ``<br/>`` in the diff HTML.
+        """
+        try:
+            text = str(self._preview.toPlainText())
+            lines = max(1, len(text.splitlines()) if text else 1)
+            line_h = max(10, int(self._preview.fontMetrics().lineSpacing()))
+            target = max(34, min(self._PREVIEW_MAX_H, lines * line_h + 18))
+            if target != self._preview.height():
+                self._preview.setFixedHeight(target)
+                self._preview.updateGeometry()
+        except Exception:
+            pass
+
+    def showEvent(self, event):  # noqa: N802
+        """First real layout: re-measure so the pane fits the content."""
+        super().showEvent(event)
+        QTimer.singleShot(0, self._grow_preview)
+
+    def stream_file(self, path: str, code: str, language: str = '',
+                    index=0, total=0) -> None:
+        """Type a written file out live in the preview pane."""
+        if language:
+            self._language = str(language)
+            if self._highlighter is not None:
+                try:
+                    self._highlighter.set_language(self._language)
+                except Exception:
+                    pass
+        self._file_label.setText(str(path or ''))
+        self.set_counter(index, total)
+        full = str(code or '')
+        self._full_text = full
+        self._reset_preview('code')
+        self._pending = full[:self._STREAM_LIMIT]
+        self._truncated = len(full) > self._STREAM_LIMIT
+        if not self._pending:
+            return
+        self._stream_timer.start()
+
+    def _tick_stream(self) -> None:
+        try:
+            remaining = self._pending[self._streamed:]
+            if not remaining:
+                self._finish_stream()
+                return
+            # A large file types out in about two seconds: the chunk scales
+            # with the size instead of letting it crawl or flash by.
+            step = max(24, int(math.ceil(len(self._pending) / 70.0)))
+            chunk = remaining[:step]
+            cursor = self._preview.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(chunk)
+            self._streamed += len(chunk)
+            self._preview.setTextCursor(cursor)
+            self._preview.ensureCursorVisible()
+            self._grow_preview()
+            if self._streamed >= len(self._pending):
+                self._finish_stream()
+        except Exception:
+            self._stream_timer.stop()
+
+    def _finish_stream(self) -> None:
+        self._stream_timer.stop()
+        if self._truncated:
+            self._truncated = False
+            try:
+                cursor = self._preview.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText('\n… truncated — EXPAND for the full file')
+                self._grow_preview()
+            except Exception:
+                pass
+
+    def flush_stream(self) -> None:
+        """Complete the typewriter immediately (finish/test path)."""
+        try:
+            if not self._stream_timer.isActive():
+                return
+            rest = self._pending[self._streamed:]
+            if rest:
+                cursor = self._preview.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText(rest)
+                self._streamed = len(self._pending)
+            self._finish_stream()
+            self._grow_preview()
+            self._preview.ensureCursorVisible()
+        except Exception:
+            self._stream_timer.stop()
+
+    def add_diff(self, path: str, diff: str) -> None:
+        """Show a real unified diff with +/− colouring."""
+        import html
+        self._file_label.setText(str(path or ''))
+        body = str(diff or '')
+        self._full_text = body
+        self._reset_preview('diff')
+        try:
+            rows = []
+            for line in body.split('\n'):
+                # HTML collapses runs of spaces; a diff's indentation is the
+                # code itself, so the spaces are made literal.
+                esc = (html.escape(line, quote=False)
+                       .replace('\t', '&nbsp;' * 4)
+                       .replace('  ', '&nbsp;&nbsp;'))
+                if line.startswith('+') and not line.startswith('+++'):
+                    rows.append(f'<span style="color:#7ce49a;">{esc}</span>')
+                elif line.startswith('-') and not line.startswith('---'):
+                    rows.append(f'<span style="color:#ff8f9d;">{esc}</span>')
+                elif line.startswith('@@'):
+                    rows.append(f'<span style="color:{C.PRI};">{esc}</span>')
+                else:
+                    rows.append(f'<span style="color:{C.TEXT_MED};">{esc or "&nbsp;"}</span>')
+            self._preview.setHtml('<br/>'.join(rows))
+        except Exception:
+            self._preview.setPlainText(body)
+        self._grow_preview()
+
+    def add_output(self, text: str) -> None:
+        """Append a run/verification line under whatever the pane shows."""
+        body = str(text or '').strip()
+        if not body:
+            return
+        try:
+            cursor = self._preview.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(f'\n▸ {body[:400]}')
+            self._preview.setTextCursor(cursor)
+            self._preview.ensureCursorVisible()
+            self._grow_preview()
+        except Exception:
+            pass
+
+    def finish(self, success: bool = True, summary: str = '') -> None:
+        self.flush_stream()
+        self._finished = True
+        self._success = bool(success)
+        head = str(summary or '').strip() or (
+            'Coding finished.' if success else 'The coding step did not complete.')
+        self._summary = head
+        self.set_stage(head)
+        if success:
+            self.set_state('✓ COMPLETE', tone='done')
+        else:
+            self.set_state('✕ FAILED', tone='error')
+        try:
+            self._blink.stop()
+            col = C.GREEN if success else C.RED
+            self._dot.setStyleSheet(f'color:{col};font:800 7pt "Rajdhani";')
+        except Exception:
+            pass
+        self.update()
+
+    # ── copy / expand ─────────────────────────────────────────────────────
+    def copy_code(self) -> None:
+        try:
+            QApplication.clipboard().setText(
+                self._full_text or self._preview.toPlainText())
+            self._copy_btn.setText('COPIED')
+            QTimer.singleShot(1200, lambda: self._copy_btn.setText('COPY')
+                              if self._copy_btn is not None else None)
+        except Exception:
+            pass
+
+    def expand_view(self) -> None:
+        """Open the full styled view (same dialog as every Markdown surface)."""
+        try:
+            body = self._full_text or self._preview.toPlainText()
+            lang = self._language if self._preview_kind == 'code' else 'diff'
+            markdown = (
+                f'## {self._title_text}\n\n'
+                f'**Status:** {self._summary or self._stage_label.text()}\n\n'
+                f'```{lang}\n{body}\n```\n'
+            )
+            open_markdown_detail(self.window(), f'CODE · {self._title_text}',
+                                 markdown, subtitle='LIVE CODE / DIFF DETAIL')
+        except Exception:
+            pass
+
+    def paintEvent(self, event):  # noqa: N802
+        """The same rounded glass language as the Markdown card, accented by
+        state: cyan while live, green when complete, red on failure."""
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            r = QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8)
+            if r.width() <= 2 or r.height() <= 2:
+                return
+            path = QPainterPath()
+            path.addRoundedRect(r, 12.0, 12.0)
+            grad = QLinearGradient(r.topLeft(), r.bottomRight())
+            grad.setColorAt(0.0, QColor(6, 31, 46, 248))
+            grad.setColorAt(0.48, QColor(2, 15, 26, 250))
+            grad.setColorAt(1.0, QColor(1, 11, 20, 250))
+            p.fillPath(path, QBrush(grad))
+
+            if self._finished:
+                accent = (46, 204, 113) if self._success else (255, 92, 110)
+            else:
+                accent = (0, 183, 224)
+            p.save()
+            p.setClipPath(path)
+            glow = QRadialGradient(QPointF(r.width() * 0.86, r.height() * 0.03),
+                                   max(72.0, r.width() * 0.78))
+            glow.setColorAt(0.0, QColor(accent[0], accent[1], accent[2], 27))
+            glow.setColorAt(0.55, QColor(accent[0], accent[1], accent[2], 10))
+            glow.setColorAt(1.0, QColor(accent[0], accent[1], accent[2], 0))
+            p.fillRect(r, QBrush(glow))
+            p.restore()
+
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(88, 214, 245, 42), 0.9))
+            p.drawPath(path)
+
+            arm = 14.0
+            inset = 2.0
+            left, top = r.left() + inset, r.top() + inset
+            right, bottom = r.right() - inset, r.bottom() - inset
+            p.setPen(QPen(QColor(88, 214, 245, 165), 1.2,
+                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            segments = (
+                (QPointF(left + 12.0, top), QPointF(left + 12.0 + arm, top)),
+                (QPointF(left, top + 12.0), QPointF(left, top + 12.0 + arm)),
+                (QPointF(right - 12.0 - arm, top), QPointF(right - 12.0, top)),
+                (QPointF(right, top + 12.0), QPointF(right, top + 12.0 + arm)),
+                (QPointF(left + 12.0, bottom), QPointF(left + 12.0 + arm, bottom)),
+                (QPointF(left, bottom - 12.0 - arm), QPointF(left, bottom - 12.0)),
+                (QPointF(right - 12.0 - arm, bottom), QPointF(right - 12.0, bottom)),
+                (QPointF(right, bottom - 12.0 - arm), QPointF(right, bottom - 12.0)),
+            )
+            for a, b in segments:
+                p.drawLine(a, b)
+        finally:
+            p.end()
+
+
 class _RoundedChatLog(QScrollArea):
     """Stable native chat surface; transparent viewport and real rounded rows."""
 
@@ -11206,27 +12410,32 @@ class _RoundedChatLog(QScrollArea):
         self.setObjectName('RoundedChatLog')
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        # Transparent chat surface: let the ReferenceDashboard/HUD remain
-        # visible behind the conversation. Prevent Qt's background erase from
-        # flashing white during scroll/update repaints.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # The scroll viewport paints its own dark glass gradient on every paint.
+        # This avoids native white erase flashes while giving the log soft, blurred
+        # cyan pools of light and the same restrained corner-line language as the tabs.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAutoFillBackground(False)
         self.setAcceptDrops(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet(
-            'QScrollArea { background:transparent; border:none; }'
+            'QScrollArea#RoundedChatLog { background:transparent; border:none; }'
             'QAbstractScrollArea::viewport { background:transparent; border:none; }'
             'QScrollBar:vertical { background:transparent; width:5px; border:none; margin:4px 1px 4px 1px; }'
-            'QScrollBar::handle:vertical { background:rgba(30,116,142,95); border-radius:2px; min-height:24px; }'
+            'QScrollBar::handle:vertical { background:rgba(30,156,190,110); border-radius:2px; min-height:24px; }'
             'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0px; border:none; }'
         )
-        self.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.viewport().setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setViewport(_ChatGradientViewport(self))
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.viewport().setAutoFillBackground(False)
+        self.viewport().setStyleSheet('background:transparent;border:none;')
         self._page = QWidget(self)
         self._page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self._page.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._page.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
         self._page.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self._page.setAutoFillBackground(False)
         self._page.setStyleSheet('background:transparent;border:none;')
@@ -11365,6 +12574,15 @@ class _RoundedChatLog(QScrollArea):
 
     def append_widget(self, widget) -> None:
         self._insert_before_stretch(widget)
+        self._request_scroll_bottom()
+
+    def append_markdown_card(self, title: str, markdown: str) -> None:
+        """Insert a research/content result directly into the chat conversation."""
+        card = _ChatMarkdownCard(str(title or 'RESEARCH'), str(markdown or ''), self._page)
+        viewport_width = int(self.viewport().width())
+        if viewport_width > 0:
+            card.setMaximumWidth(max(320, min(720, int(viewport_width * 0.92))))
+        self._insert_before_stretch(card)
         self._request_scroll_bottom()
 
     def append_notice(self, text: str, tone: str = 'warn') -> None:
@@ -12031,6 +13249,11 @@ class RefinedCommandWindow(_CommandWindow):
             self._chat_entries.append((display_who, body, is_user))
             if len(self._chat_entries) > 250:
                 del self._chat_entries[:-250]
+            # A real reply landing means the coding action returned; a card
+            # still marked "live" is finalized so it can never sit animating
+            # under a finished conversation.
+            if not is_user and getattr(self, '_coding_card', None) is not None:
+                self._coding_finish({}, success=True)
             self.chat.append_message(display_who, body, you=is_user,
                                      color=C.WHITE if is_user else C.PRI,
                                      category='you' if is_user else 'jarvis')
@@ -12038,6 +13261,170 @@ class RefinedCommandWindow(_CommandWindow):
             # survives even a crash that comes before the window is closed.
             if getattr(self, '_host', None) is not None and not getattr(self, '_suppress_record', False):
                 self.record_message('user' if is_user else 'assistant', body)
+        except Exception:
+            pass
+
+    # ── live coding card ──────────────────────────────────────────────────
+    def apply_coding_preview(self, kind: str, payload: dict | None = None) -> None:
+        """GUI-thread: route ONE real coding event into the live coding card.
+
+        The events come from the actual coding actions (dev agent / code
+        helper) — planning, writing a file, fixing, running — never simulated.
+        Unknown kinds are ignored; every path is guarded, because this is fed
+        from a worker thread through a queued signal.
+        """
+        try:
+            kind = str(kind or '').strip().lower()
+            p = dict(payload or {})
+            if not hasattr(self, '_coding_card'):
+                self._coding_card = None
+            if kind == 'start':
+                self._coding_begin(p)
+            elif kind in ('stage', 'file', 'diff', 'run', 'output', 'progress'):
+                self._coding_update(kind, p)
+            elif kind in ('done', 'finished', 'complete', 'completed'):
+                self._coding_finish(p, success=True)
+            elif kind in ('failed', 'error'):
+                self._coding_finish(p, success=False)
+        except Exception:
+            pass
+
+    def _live_coding_card(self):
+        """The live coding card, or ``None``.
+
+        Clearing the chat (a new conversation, a restore) deletes the card
+        widget while a build may still be running; a deleted Qt object is a
+        dead wrapper whose every call raises. Touch a real C++ method to tell
+        the two apart, and drop the reference so the next write event opens a
+        fresh card instead of swallowing the rest of the build.
+        """
+        card = getattr(self, '_coding_card', None)
+        if card is None:
+            return None
+        try:
+            card.width()          # RuntimeError once Qt has deleted the widget
+        except Exception:
+            self._coding_card = None
+            return None
+        try:
+            # A cleared chat detaches the rows before Qt gets around to the
+            # deferred delete (``deleteLater`` is not processed by
+            # ``processEvents``): a card no longer in the log is not live.
+            rows = getattr(self.chat, '_rows', None)
+            if rows is not None and card not in rows:
+                self._coding_card = None
+                return None
+        except Exception:
+            pass
+        try:
+            if card.is_finished:
+                return None
+        except Exception:
+            return None
+        return card
+
+    def _coding_keepalive(self, detail: str) -> None:
+        """Real coding progress re-arms the turn's promises for real.
+
+        A build runs for minutes. Without this, the silence watchdog would
+        falsely declare "NO RESPONSE" — and drop the dots — mid-build, which
+        is exactly the "I can't tell if he is working" state this card exists
+        to remove.
+        """
+        try:
+            short = ' '.join(str(detail or '').split())[:48]
+            self._cancel_indicator_settle()
+            self.chat.show_typing_indicator(chat_activity_word(f'CODE · {short}'))
+            self._set_busy(True)
+            self._arm_response_watchdog()
+        except Exception:
+            pass
+
+    def _coding_begin(self, payload: dict) -> None:
+        project = str(payload.get('project') or '').strip()
+        description = str(payload.get('description') or '').strip()
+        language = str(payload.get('language') or 'python').strip()
+        title = project or description or 'CODING'
+        card = self._live_coding_card()
+        if card is None:
+            card = _ChatCodingCard(title, language, self.chat._page)
+            viewport_width = int(self.chat.viewport().width())
+            if viewport_width > 0:
+                card.setMaximumWidth(max(320, min(720, int(viewport_width * 0.92))))
+            self._coding_card = card
+            self.chat.append_widget(card)
+        else:
+            card.set_title(title)
+        card.set_state('CODING', tone='live')
+        card.set_stage('Planning project structure…')
+        self._coding_keepalive(title)
+
+    def _coding_update(self, kind: str, payload: dict) -> None:
+        card = self._live_coding_card()
+        if card is None:
+            # A write/fix without a start (a legacy call path): open the card
+            # now so the real work is still visible. Passive stages do not
+            # open a card on their own.
+            if kind not in ('file', 'diff'):
+                return
+            self._coding_begin({'project': str(payload.get('project') or '')})
+            card = self._live_coding_card()
+            if card is None:
+                return
+
+        if kind == 'stage':
+            stage = str(payload.get('stage') or '').strip()
+            if stage:
+                card.set_stage(stage)
+            self._coding_keepalive(stage or card.stage_text() or 'working')
+        elif kind == 'progress':
+            stage = str(payload.get('stage') or payload.get('detail') or '').strip()
+            if stage:
+                card.set_stage(stage)
+            self._coding_keepalive(stage or card.stage_text() or 'working')
+        elif kind == 'file':
+            path = str(payload.get('path') or '')
+            code = str(payload.get('code') or '')
+            language = str(payload.get('language') or card.language() or 'python')
+            card.set_state('CODING', tone='live')
+            card.stream_file(path, code, language=language,
+                             index=payload.get('index') or 0,
+                             total=payload.get('total') or 0)
+            self._coding_keepalive(path or 'writing code')
+        elif kind == 'diff':
+            path = str(payload.get('path') or '')
+            diff = str(payload.get('diff') or '')
+            if diff:
+                card.set_state('FIXING', tone='warn')
+                card.add_diff(path, diff)
+            self._coding_keepalive(path or 'applying fix')
+        elif kind == 'run':
+            output = str(payload.get('output') or '').strip().replace('\n', ' ')
+            card.set_state('BUILDING', tone='live')
+            if output:
+                card.add_output(output)
+            self._coding_keepalive('running the project')
+        elif kind == 'output':
+            text = str(payload.get('text') or payload.get('output') or '').strip()
+            if text:
+                card.add_output(text)
+            self._coding_keepalive('verifying the result')
+
+    def _coding_finish(self, payload: dict, success: bool = True) -> None:
+        card = self._live_coding_card()
+        if card is None:
+            return
+        summary = str(payload.get('summary') or '').strip()
+        if not summary:
+            summary = ('Coding finished.' if success
+                       else 'The coding step did not complete.')
+        try:
+            card.finish(success=bool(payload.get('success', success)),
+                        summary=summary)
+        finally:
+            self._coding_card = None
+        try:
+            self.clear_chat_activity()
         except Exception:
             pass
 
@@ -12867,10 +14254,9 @@ class RefinedCommandWindow(_CommandWindow):
                 self.clear_chat_activity()
                 return
             self._cancel_indicator_settle()
-            lowered = text.lower()
-            label = 'THINKING' if (
-                'think' in lowered or 'reason' in lowered
-                or lowered in {'processing', 'working'}) else 'WORKING'
+            # The real category ("CODE · game") becomes the real word
+            # ("CODING · game"); free-form strings keep THINKING/WORKING.
+            label = chat_activity_word(text)
             self.chat.show_typing_indicator(label)
             self._set_busy(True)
             self._arm_response_watchdog()
@@ -12969,12 +14355,16 @@ class RefinedCommandWindow(_CommandWindow):
         """Show the REAL Laya runtime state in the ACTIVITY panel.
 
         Called from the GUI thread (main.py's classification lifecycle). The
-        state is derived from actual execution — never from the Settings flag:
+        state is derived from actual execution - never from the Settings flag:
 
-          * ``NOT USED``  — Laya disabled, abstained, or the primary model
-                            handled this task on its own.
-          * ``ACTIVE``    — Laya is deciding right now (role = high-level stage).
-          * ``COMPLETE``  — Laya finished and its routing was applied.
+          * ``IDLE``      - enabled, model available, no request decided yet.
+          * ``LOADING``   - the checkpoint is loading on CPU; this turn routes
+                            without Laya.
+          * ``NOT USED``  - Laya disabled, abstained, missing its package/model,
+                            or the primary model handled this task on its own.
+          * ``ACTIVE``    - Laya is deciding right now (role = high-level stage).
+          * ``COMPLETE``  - Laya finished and its routing was applied.
+          * ``ERROR``     - the load/decision failed; role carries the reason.
 
         Only factual, safe execution-stage information is shown (role is a
         short label such as 'deciding task approach' or 'routed → Gemini · SEARCH').
@@ -12983,19 +14373,33 @@ class RefinedCommandWindow(_CommandWindow):
         if label is None:
             return
         st = str(state or '').strip().upper()
-        if st not in ('NOT USED', 'ACTIVE', 'COMPLETE'):
-            st = 'NOT USED'
         role = str(role or '').strip().replace('\n', ' ')
+        if st not in ('IDLE', 'LOADING', 'NOT USED', 'ACTIVE', 'COMPLETE', 'ERROR'):
+            st = 'NOT USED'
+        if st == 'NOT USED' and role.lower() == 'idle':
+            st = 'IDLE'
         self._laya_status_state = st.lower().replace(' ', '_')
+        # The HUD is one narrow line: keep the reason readable, not a paragraph.
+        short = role[:72]
         try:
             if st == 'ACTIVE':
-                text, col = f'LAYA:  ACTIVE  ·  {role or "deciding"}', C.PRI
+                text, col = f'LAYA:  ACTIVE  ·  {short or "deciding"}', C.PRI
                 glow = 'rgba(0,212,255,20)'
             elif st == 'COMPLETE':
-                text, col = f'LAYA:  COMPLETE  ·  {role or "routed"}', C.GREEN
+                text, col = f'LAYA:  COMPLETE  ·  {short or "routed"}', C.GREEN
                 glow = 'rgba(46,204,113,18)'
+            elif st == 'LOADING':
+                text, col = f'LAYA:  LOADING  ·  {short or "starting on CPU"}', C.ACC2
+                glow = 'rgba(244,178,74,16)'
+            elif st == 'ERROR':
+                text, col = f'LAYA:  ERROR  ·  {short or "fallback active"}', C.RED
+                glow = 'rgba(255,92,110,16)'
+            elif st == 'IDLE':
+                text, col = 'LAYA:  IDLE  ·  no request decided yet', C.TEXT_DIM
+                glow = 'rgba(0,212,255,8)'
             else:
-                text, col = 'LAYA:  NOT USED', C.TEXT_DIM
+                text, col = ('LAYA:  NOT USED' +
+                             (f'  ·  {short}' if short else '')), C.TEXT_DIM
                 glow = 'rgba(0,212,255,8)'
             label.setText(text)
             label.setToolTip(f'{text}\n{role}'.strip() if role else text)
@@ -13056,7 +14460,10 @@ class RefinedCommandWindow(_CommandWindow):
         # doing phases even if a caller only reports the activity row.
         try:
             self._cancel_indicator_settle()
-            self.chat.show_typing_indicator('WORKING')
+            # Same word contract as set_chat_activity: the category IS the
+            # visible verb when one is known ("CODING · game").
+            self.chat.show_typing_indicator(chat_activity_word(
+                f'{category} · {detail}' if detail else category))
             self._set_busy(True)
             self._arm_response_watchdog()
         except Exception:
@@ -13168,7 +14575,7 @@ class RefinedCommandWindow(_CommandWindow):
                 'IDLE': ('● READY', C.GREEN, 'READY'),
                 'THINKING': ('◈ PROCESSING', C.PRI, 'ACTIVE'),
                 'SPEAKING': ('◉ SPEAKING', C.ACC, 'VOICE'),
-                'LISTENING': ('◉ LISTENING', C.PRI, 'VOICE'),
+                'LISTENING': ('• LISTENING', C.PRI, 'VOICE'),
                 'MUTED': ('⊘ MIC OFF', C.MUTED_C, 'MUTED'),
                 'RECONNECTING': ('⟳ RECONNECTING', C.PRI, 'LINK'),
                 'NEEDS KEY': ('⚠ NEEDS API KEY', C.ACC, 'SETUP'),
@@ -13189,9 +14596,12 @@ class RefinedCommandWindow(_CommandWindow):
             self._status_signal.setStyleSheet(
                 f'color:{color};font:800 7pt "Orbitron";letter-spacing:1px;'
             )
-            self._status_mode.setText(mode)
+            # The right-side label identifies the Voice surface; live state is
+            # already represented by the colored status label on the left.
+            self._status_mode.setText('VOICE')
+            self._status_mode.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._status_mode.setStyleSheet(
-                f'color:{color};font:800 6.5pt "Orbitron";letter-spacing:1px;'
+                f'color:{C.PRI};font:800 6.5pt "Orbitron";letter-spacing:0.85px;'
             )
             # The header mic control reflects the same live state, so the
             # microphone button itself says whether J.A.R.V.I.S. is muted,
@@ -13210,10 +14620,16 @@ class RefinedCommandWindow(_CommandWindow):
             pass
 
     def paintEvent(self, event) -> None:
-        """Paint only the HUD outline; never fill the whole panel."""
+        """Paint a stable blue-black command-deck surface and its cyan edge.
+
+        The old outline-only painter left the native window surface transparent.
+        On some Windows compositor/Qt combinations, repaints briefly revealed a
+        white surface behind the chat. Fill the clipped shell on every paint so
+        the background remains visually identical during scrolling and updates.
+        """
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         path = QPainterPath()
         cut = 14.0
         path.moveTo(r.left() + cut, r.top())
@@ -13225,11 +14641,18 @@ class RefinedCommandWindow(_CommandWindow):
         path.lineTo(r.left(), r.bottom() - cut)
         path.lineTo(r.left(), r.top() + cut)
         path.closeSubpath()
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(26, 92, 122, 205), 1.2))
+
+        fill = QLinearGradient(r.topLeft(), r.bottomRight())
+        fill.setColorAt(0.0, QColor(3, 20, 31, 248))
+        fill.setColorAt(0.52, QColor(2, 9, 17, 250))
+        fill.setColorAt(1.0, QColor(3, 18, 28, 248))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(fill))
         p.drawPath(path)
-        # very soft edge glow, intentionally transparent inside
-        p.setPen(QPen(QColor(0, 212, 255, 48), 3.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0, 212, 255, 40), 3.0))
+        p.drawPath(path)
+        p.setPen(QPen(QColor(26, 92, 122, 205), 1.2))
         p.drawPath(path)
         p.end()
 
@@ -13264,7 +14687,18 @@ class RefinedCommandWindow(_CommandWindow):
         )
         hl.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
         hl.addStretch(1)
-        close = QPushButton('×')
+        minimize = QPushButton('−', header)
+        minimize.setFixedSize(30, 30)
+        minimize.setToolTip('Minimize the Chat Panel; use the JARVIS reactor to reopen it')
+        minimize.setCursor(Qt.CursorShape.PointingHandCursor)
+        minimize.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        minimize.setStyleSheet(
+            f'QPushButton {{ color:{C.TEXT_MED}; background:transparent; border:none; font:700 16pt "Exo 2"; }}'
+            f'QPushButton:hover {{ color:{C.PRI}; background:rgba(0,72,98,100); border-radius:6px; }}'
+        )
+        minimize.clicked.connect(self.hide)
+        hl.addWidget(minimize, 0, Qt.AlignmentFlag.AlignVCenter)
+        close = QPushButton('×', header)
         close.setFixedSize(30, 30)
         close.setToolTip('Close J.A.R.V.I.S.')
         close.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -13283,10 +14717,12 @@ class RefinedCommandWindow(_CommandWindow):
         # -- Navigation tabs --------------------------------------------
         nav = QHBoxLayout(); nav.setSpacing(5)
         self._tab_btns = []
-        self._tab_keys = ('ACTIVITY', 'TOOLS', 'WEB', 'MIND', 'SYSTEM', 'SETTINGS')
+        # WEB and SYSTEM remain available as panels/actions, but their navigation
+        # buttons are removed to keep this top rail focused and balanced.
+        self._tab_keys = ('ACTIVITY', 'TOOLS', 'MIND', 'SETTINGS')
         _tab_icons = {
-            'ACTIVITY': 'activity', 'TOOLS': 'tools', 'WEB': 'web',
-            'MIND': 'memory', 'SYSTEM': 'system', 'SETTINGS': 'settings',
+            'ACTIVITY': 'activity', 'TOOLS': 'tools',
+            'MIND': 'memory', 'SETTINGS': 'settings',
         }
         for index, label in enumerate(self._tab_keys):
             b = _AngularButton(label, self, compact=True, icon=_tab_icons.get(label))
@@ -13329,25 +14765,32 @@ class RefinedCommandWindow(_CommandWindow):
         self._hud_values = {}
         self._hud_labels = {}
 
-        def hud_card(title_text, rows, width=176):
+        def hud_card(title_text, rows, width=168):
             card = QFrame(dashboard)
             card.setFixedWidth(width)
             card.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             card.setStyleSheet(f'QFrame {{ background:rgba(3,18,30,145); border:none; border-radius:10px; }}'
                                'QLabel { background:transparent; border:none; }')
-            cl = QVBoxLayout(card); cl.setContentsMargins(10, 8, 10, 8); cl.setSpacing(4)
-            head = QHBoxLayout(); head.setContentsMargins(0,0,0,0); head.setSpacing(6)
+            cl = QVBoxLayout(card); cl.setContentsMargins(8, 8, 8, 8); cl.setSpacing(4)
+            head = QHBoxLayout(); head.setContentsMargins(0,0,0,0); head.setSpacing(3)
+            head.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             cap = QLabel(title_text)
-            cap.setStyleSheet(f'color:{C.PRI}; font:900 7.8pt "Orbitron"; letter-spacing:1.4px;')
-            head.addWidget(cap, 1)
-            if title_text == 'SYSTEM':
-                # VISION + IMAGE share the same compact command rail. Neither
-                # creates a floating window; both take over the central stage.
-                self._vision_status_toggle = _AngularButton('VISION', card, compact=True, icon='eye_off')
+            cap.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            cap.setMinimumHeight(30)
+            cap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            cap.setMinimumWidth(0)
+            cap.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            cap.setToolTip(title_text)
+            cap.setStyleSheet(f'color:{C.PRI}; font:900 6.7pt "Orbitron"; letter-spacing:0.85px;background:transparent;border:none;')
+            head.addWidget(cap, 1, Qt.AlignmentFlag.AlignVCenter)
+            if title_text == 'QUICK INFO':
+                # Keep Vision / Image / Video together and aligned on one compact
+                # icon rail. The visible SYSTEM card is intentionally removed.
+                self._vision_status_toggle = _AngularButton('', card, compact=True, icon='eye_off')
                 self._vision_status_toggle.setCheckable(True)
-                self._vision_status_toggle.setFixedSize(78, 30)
+                self._vision_status_toggle.setFixedSize(24, 24)
                 self._vision_status_toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-                self._vision_status_toggle.set_tab_visual(True)
+                self._vision_status_toggle.set_flat_visual(True)
                 self._vision_status_toggle.setToolTip('Show / hide the live Vision camera stage')
                 self._vision_status_toggle.toggled.connect(self._on_vision_toggled)
                 self._vision_status_toggle.toggled.connect(
@@ -13355,20 +14798,18 @@ class RefinedCommandWindow(_CommandWindow):
                 )
                 head.addWidget(self._vision_status_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
 
-            if title_text == 'QUICK INFO':
-                # IMAGE belongs beside QUICK INFO, not inside SYSTEM. It is a flat
-                # text/icon control with no background fill or stroke.
                 self._image_status_toggle = _AngularButton('', card, compact=True, icon='image')
                 self._image_status_toggle.setCheckable(True)
-                self._image_status_toggle.setFixedSize(30, 30)
+                self._image_status_toggle.setFixedSize(24, 24)
                 self._image_status_toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
                 self._image_status_toggle.set_flat_visual(True)
                 self._image_status_toggle.setToolTip('Show / hide Image View in the ReferenceDashboard')
                 self._image_status_toggle.toggled.connect(self._on_image_toggled)
                 head.addWidget(self._image_status_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
+
                 self._video_status_toggle = _AngularButton('', card, compact=True, icon='video')
                 self._video_status_toggle.setCheckable(True)
-                self._video_status_toggle.setFixedSize(30, 30)
+                self._video_status_toggle.setFixedSize(24, 24)
                 self._video_status_toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
                 self._video_status_toggle.set_flat_visual(True)
                 self._video_status_toggle.setToolTip('Show / hide Video View in the ReferenceDashboard')
@@ -13387,12 +14828,19 @@ class RefinedCommandWindow(_CommandWindow):
                 ico.setStyleSheet(f'color:{C.PRI}; font:11pt "Segoe UI Symbol";')
                 row.addWidget(ico)
                 lab = QLabel(name)
-                lab.setStyleSheet(f'color:{C.TEXT}; font:700 7.5pt "Rajdhani";')
+                lab.setMinimumWidth(0)
+                lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+                lab.setToolTip(name)
+                lab.setStyleSheet(f'color:{C.TEXT}; font:700 7.2pt "Rajdhani"; background:transparent;border:none;')
                 row.addWidget(lab, 1)
                 val = QLabel(value)
+                val.setMinimumWidth(0)
+                val.setMaximumWidth(64)
+                val.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
                 val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                val.setToolTip(value)
                 status_col = C.GREEN if value.strip().startswith('●') else C.WHITE
-                val.setStyleSheet(f'color:{status_col}; font:700 7pt "Orbitron"; letter-spacing:0.4px;')
+                val.setStyleSheet(f'color:{status_col}; font:700 6.7pt "Orbitron"; letter-spacing:0.2px; background:transparent;border:none;')
                 row.addWidget(val)
                 self._hud_labels[key] = lab
                 self._hud_values[key] = val
@@ -13407,6 +14855,9 @@ class RefinedCommandWindow(_CommandWindow):
         left_wrap.setObjectName('VisionLeftGroup')
         left_wrap.setStyleSheet('QWidget#VisionLeftGroup { background:transparent; border:none; }')
         left_col = QVBoxLayout(left_wrap); left_col.setContentsMargins(0,0,0,0); left_col.setSpacing(7)
+        # Keep the SYSTEM telemetry card in the ReferenceDashboard. Only the
+        # SYSTEM navigation tab was requested to be removed; live CPU/RAM/GPU/
+        # temperature status must remain visible here.
         left_col.addWidget(hud_card('SYSTEM', [
             ('cpu', 'CPU', '--%', '▣'), ('ram', 'RAM', '--%', '▤'),
             ('gpu', 'GPU', '--%', '◈'), ('temp', 'TEMP', '--°C', '♨')
@@ -13535,7 +14986,7 @@ class RefinedCommandWindow(_CommandWindow):
         controls_l.addWidget(self._vision_center_reticle)
 
         self._vision_edge_outline = _VisionSwitch('EDGE TRACE', vision_controls, tip='Keep a clean cyan outline around the camera surface')
-        self._vision_edge_outline.setChecked(True)
+        self._vision_edge_outline.setChecked(False)
         controls_l.addWidget(self._vision_edge_outline)
 
         self._vision_track_ids = _VisionSwitch('TRACK IDS', vision_controls, tip='Show persistent IDs when the detector can provide them')
@@ -13692,7 +15143,12 @@ class RefinedCommandWindow(_CommandWindow):
         self._doing_animations = {}
         self._doing_pulse_animations = {}
         self._doing_generation = {}
-        for category in ('SEARCH', 'CODE', 'REVIEW', 'VIEW', 'FIND', 'GENERATE', 'ANALYZE', 'AUTOMATE'):
+        # SMART is the Smart Decision row: it names the layer that actually
+        # decided a route (a deterministic rule, Laya, or the vocabulary) and
+        # the exact tool/action it chose. It sits first because it is the
+        # decision every other row then carries out.
+        for category in ('SMART', 'SEARCH', 'CODE', 'REVIEW', 'VIEW', 'FIND',
+                         'GENERATE', 'ANALYZE', 'AUTOMATE'):
             row = _ActivityRow(category, doing_card)
             detail = row.detail_label
             effect = QGraphicsOpacityEffect(row)
@@ -13763,6 +15219,12 @@ class RefinedCommandWindow(_CommandWindow):
                     self._vision_person_filter):
             _sw.toggled.connect(self._sync_vision_options)
         self._restore_vision_options()
+        # The camera surface starts clean: no outer edge stroke until the user
+        # explicitly enables it in Vision controls during this session.
+        try:
+            self._vision_edge_outline.setChecked(False)
+        except Exception:
+            pass
         self._restore_inference_controls()
         self._apply_inference_controls(save=False)
         layout.addWidget(dashboard, 0)
@@ -13776,28 +15238,112 @@ class RefinedCommandWindow(_CommandWindow):
         self.chat.setAcceptDrops(True)
         self.chat.setMinimumHeight(200)
         self._chat_entries = []
-        # ── Chat header: compact toggle to hide SYS/VIS/NEWS ───────────────
-        chat_hdr = QHBoxLayout()
-        chat_hdr.setSpacing(6)
-        _lbl = QLabel('CHAT LOG')
-        _lbl.setStyleSheet(
-            f'color:{C.PRI}; font:800 7pt "Orbitron"; letter-spacing:1.5px; '
-            f'background:transparent;'
+        # ── Chat header + live status rail ─────────────────────────────────
+        # One clean, text-only header for the chat log. Status, date/time and
+        # voice mode live on this top line; no filled box or border surrounds it.
+        chat_header_frame = QFrame(self)
+        chat_header_frame.setObjectName('ChatLogHeader')
+        chat_header_frame.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        chat_header_frame.setStyleSheet(
+            'QFrame#ChatLogHeader { background:transparent; border:none; }'
+            'QLabel { background:transparent; border:none; }'
         )
-        chat_hdr.addWidget(_lbl)
-        chat_hdr.addStretch(1)
-        # Chat History is a mode of the Chat Log itself. Use the exact same
-        # angular/gradient visual treatment as the six main navigation tabs.
-        self._history_btn = _AngularButton('HISTORY', self, compact=True)
-        self._history_btn.setMinimumWidth(96)
-        self._history_btn.setFixedHeight(30)
+        chat_hdr = QGridLayout(chat_header_frame)
+        chat_header_frame.setFixedHeight(32)
+        chat_hdr.setContentsMargins(9, 1, 9, 1)
+        chat_hdr.setHorizontalSpacing(6)
+        chat_hdr.setVerticalSpacing(0)
+        # Three equal columns ensure the timestamp is centered against the full
+        # header width, not merely centered in whatever space remains between
+        # asymmetric side controls.
+        chat_hdr.setColumnStretch(0, 1)
+        chat_hdr.setColumnStretch(1, 1)
+        chat_hdr.setColumnStretch(2, 1)
+
+        # Left rail: title + live link state.
+        left_status = QWidget(chat_header_frame)
+        left_status.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        left_lay = QHBoxLayout(left_status)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(8)
+        _lbl = QLabel('CHAT LOG', left_status)
+        _lbl.setFixedHeight(26)
+        _lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        _lbl.setStyleSheet(
+            f'color:{C.PRI};font:800 7pt "Orbitron";letter-spacing:1.5px;'
+            'background:transparent;border:none;'
+        )
+        left_lay.addWidget(_lbl)
+        pipe = QLabel('|', left_status)
+        pipe.setFixedHeight(26)
+        pipe.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pipe.setStyleSheet(
+            f'color:{C.TEXT_DIM};font:700 8pt "Share Tech Mono";'
+            'background:transparent;border:none;'
+        )
+        left_lay.addWidget(pipe)
+
+        self._status_signal = QLabel('• LISTENING', left_status)
+        self._status_signal.setMinimumWidth(0)
+        self._status_signal.setFixedHeight(26)
+        self._status_signal.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self._status_signal.setStyleSheet(
+            f'color:{C.PRI};font:800 7pt "Orbitron";letter-spacing:0.45px;'
+            'background:transparent;border:none;'
+        )
+        left_lay.addWidget(self._status_signal)
+        left_lay.addStretch(1)
+        left_status.setMinimumWidth(0)
+        # Ignore the labels' natural width so the grid keeps three truly equal
+        # rails; each rail then centers/alines its own contents independently.
+        left_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        chat_hdr.addWidget(left_status, 0, 0)
+
+        # Center rail: this timestamp occupies the physical center of the header,
+        # not the leftover space between a left label and right-side buttons.
+        self.chips = QLabel('', chat_header_frame)
+        self.chips.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chips.setMinimumWidth(0)
+        self.chips.setFixedHeight(26)
+        self.chips.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.chips.setStyleSheet(
+            f'color:{C.TEXT_MED};font:700 6.7pt "Share Tech Mono";letter-spacing:0.2px;'
+            'background:transparent;border:none;'
+        )
+        chat_hdr.addWidget(self.chips, 0, 1)
+
+        # Right rail: voice label and history control, held to a matching fixed width
+        # so the middle timestamp remains centered as the status text changes.
+        right_status = QWidget(chat_header_frame)
+        right_status.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        right_lay = QHBoxLayout(right_status)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(8)
+        self._status_mode = QLabel('VOICE', right_status)
+        self._status_mode.setFixedHeight(26)
+        self._status_mode.setMinimumWidth(0)
+        self._status_mode.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._status_mode.setStyleSheet(
+            f'color:{C.PRI};font:800 6.5pt "Orbitron";letter-spacing:0.7px;'
+            'background:transparent;border:none;'
+        )
+        right_lay.addWidget(self._status_mode, 1)
+        self._history_btn = _AngularButton('HISTORY', right_status, compact=True)
+        self._history_btn.setMinimumWidth(76)
+        self._history_btn.setFixedHeight(26)
         self._history_btn.setToolTip('Open saved conversations inside the Chat Log')
         self._history_btn.setCheckable(False)
         self._history_btn.set_tab_visual(True)
         self._history_btn.clicked.connect(self._open_history_panel)
-        chat_hdr.addWidget(self._history_btn)
+        right_lay.addWidget(self._history_btn)
+        right_status.setMinimumWidth(0)
+        right_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        chat_hdr.addWidget(right_status, 0, 2)
         self._chat_header_title = _lbl
-        self._hide_sys_btn = QPushButton()
+
+        # Compatibility-only system-message toggle; chat output remains filtered
+        # according to the existing preferences and no extra UI clutter is shown.
+        self._hide_sys_btn = QPushButton(self)
         self._hide_sys_btn.setCheckable(True)
         self._hide_sys_btn.setFixedSize(16, 16)
         self._hide_sys_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -13818,73 +15364,20 @@ class RefinedCommandWindow(_CommandWindow):
         self._hide_sys_btn.toggled.connect(self._toggle_hide_system)
         self._hide_sys_btn.hide()
 
-        layout.insertLayout(layout.indexOf(self.chat), chat_hdr)
-
+        layout.addWidget(chat_header_frame)
         layout.addWidget(self.chat, 1)
 
         # -- Chat History: a surface of the Chat Log, not a separate window --
         # It is a child of this panel and is positioned over `self.chat` when
-        # opened, so it can never float away from the conversation it belongs
-        # to. It is created hidden and costs nothing until the user asks.
+        # opened, so it can never float away from the conversation it belongs to.
         self._history_stage = HistoryStage(host=self, parent=self, embedded=True)
         self._history_stage.hide()
 
         # The realtime microphone transcript is rendered directly into the one
         # existing command textbox (`self.input`) — no separate preview widget.
-
-        # -- Bottom status: compact live command rail ------------------
-        status_rail = QFrame(self)
-        status_rail.setObjectName('CommandStatusRail')
-        status_rail.setFixedHeight(32)
-        status_rail.setStyleSheet(
-            f'QFrame#CommandStatusRail {{'
-            f'background:rgba(2,18,29,150);'
-            f'border:1px solid rgba(88,214,245,65);'
-            f'border-radius:7px; }}'
-            f'QLabel {{ background:transparent;border:none; }}'
-        )
-        sr = QHBoxLayout(status_rail)
-        sr.setContentsMargins(9, 3, 9, 3)
-        sr.setSpacing(8)
-
-        self._status_signal = QLabel('● READY')
-        self._status_signal.setMinimumWidth(92)
-        self._status_signal.setStyleSheet(
-            f'color:{C.GREEN};font:800 7pt "Orbitron";letter-spacing:1px;'
-        )
-        sr.addWidget(self._status_signal)
-
-        sep_left = QFrame()
-        sep_left.setFixedWidth(1)
-        sep_left.setStyleSheet(f'background:{C.BORDER_B};border:none;')
-        sr.addWidget(sep_left)
-
-        # Descriptive activity no longer lives in the bottom status rail.
-        # The live readout is rendered inside ReferenceDashboard > ACTIVITY.
-
-        self.chips = QLabel('')
-        self.chips.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.chips.setStyleSheet(
-            f'color:{C.TEXT};font:700 7pt "Share Tech Mono";letter-spacing:1.1px;'
-        )
-        sr.addWidget(self.chips, 1)
-
-        self._status_mode = QLabel('SECURE')
-        self._status_mode.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._status_mode.setStyleSheet(
-            f'color:{C.PRI};font:800 6.5pt "Orbitron";letter-spacing:1px;'
-        )
-        sr.addWidget(self._status_mode)
-
-        sep_right = QFrame()
-        sep_right.setFixedWidth(1)
-        sep_right.setStyleSheet(f'background:{C.BORDER_B};border:none;')
-        sr.insertWidget(sr.indexOf(self._status_mode), sep_right)
-
-        layout.addWidget(status_rail)
-        self._status_rail = status_rail
-        # Kept only as a compatibility flag for older callers; there is no
-        # bottom activity banner anymore.
+        # Keep the compatibility attribute as a widget so History can hide and
+        # restore the entire top status row together with the log.
+        self._status_rail = chat_header_frame
         self._activity_label_text = ''
 
         # -- Pending-attachment chip --------------------------------------
@@ -14031,11 +15524,19 @@ class RefinedCommandWindow(_CommandWindow):
         if val is None:
             return
         try:
-            if val.text() != text:
-                val.setText(text)
+            full = str(text or '')
+            val.setToolTip(full)
+            try:
+                width = int(val.maximumWidth())
+                display = val.fontMetrics().elidedText(
+                    full, Qt.TextElideMode.ElideMiddle, max(36, width - 2))
+            except Exception:
+                display = full
+            if val.text() != display:
+                val.setText(display)
             if color:
                 val.setStyleSheet(
-                    f'color:{color}; font:700 7pt "Orbitron"; letter-spacing:0.4px;'
+                    f'color:{color}; font:700 6.7pt "Orbitron"; letter-spacing:0.2px; background:transparent;border:none;'
                 )
         except Exception:
             pass
@@ -14112,9 +15613,9 @@ class RefinedCommandWindow(_CommandWindow):
             pass
 
     def _refresh_status_clock(self):
-        """Bottom rail: date + live time, no background, no stroke."""
+        """Top Chat Log rail: date + live time, no background or stroke."""
         try:
-            self.chips.setText(datetime.now().strftime('%d %b %Y   ·   %I:%M %p'))
+            self.chips.setText(datetime.now().strftime('%d %b %Y  ·  %I:%M %p'))
         except Exception:
             pass
 
@@ -14261,10 +15762,10 @@ class RefinedCommandWindow(_CommandWindow):
                     host.write_log('VIS: Chat Vision — connecting camera…')
                 except Exception as exc:
                     if cam is not None:
-                        cam._loading = True
-                        cam._status = 'VISION CAMERA · START ERROR'
-                        cam._loader.hide()
-                        cam.update()
+                        cam.show_camera_error(
+                            'CAMERA START FAILED',
+                            'Check camera permissions and close any app already using the camera.'
+                        )
                     try:
                         self._host.write_log(f'ERR: Vision camera start — {exc}')
                     except Exception:
@@ -14731,12 +16232,8 @@ class RefinedCommandWindow(_CommandWindow):
             elif index == 1:
                 h._open_tools_panel()
             elif index == 2:
-                h._open_webview_panel()
-            elif index == 3:
                 h._open_memory_panel()
-            elif index == 4:
-                h._open_world_monitor()
-            elif index == 5:
+            elif index == 3:
                 h._open_full_settings()
         except Exception as exc:
             try:
@@ -14951,7 +16448,7 @@ class _HudPanel(QFrame):
 
 
 class _TaskGlassPanel(_HudPanel):
-    """Dedicated light-blue glass shell for the checklist, without HUD chrome."""
+    """Dark cyan glass shell for the task checklist, matching the JARVIS HUD."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -14982,26 +16479,26 @@ class _TaskGlassPanel(_HudPanel):
         shadow_path = QPainterPath()
         shadow_path.addRoundedRect(shadow_rect, radius + 1.0, radius + 1.0)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(48, 99, 151, 34))
+        painter.setBrush(QColor(0, 5, 12, 145))
         painter.drawPath(shadow_path)
 
-        # Opaque-enough cool-blue glass: still translucent at the edges, but
-        # intentionally not white so task cards read as a cohesive surface.
+        # Stable blue-black glass: opaque enough to prevent white compositor
+        # flashes, with the same restrained cyan edge as the other HUD panels.
         gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, QColor(229, 244, 255, 247))
-        gradient.setColorAt(0.52, QColor(207, 231, 251, 245))
-        gradient.setColorAt(1.0, QColor(187, 218, 246, 241))
+        gradient.setColorAt(0.0, QColor(3, 20, 31, 248))
+        gradient.setColorAt(0.52, QColor(2, 9, 17, 250))
+        gradient.setColorAt(1.0, QColor(3, 18, 28, 248))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(gradient)
         painter.drawPath(path)
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, 215), 1.0))
+        painter.setPen(QPen(QColor(88, 214, 245, 48), 1.0))
         inset = QRectF(rect).adjusted(1.0, 1.0, -1.0, -1.0)
         inner = QPainterPath()
         inner.addRoundedRect(inset, radius - 1.0, radius - 1.0)
         painter.drawPath(inner)
-        painter.setPen(QPen(QColor(111, 166, 215, 195), 1.0))
+        painter.setPen(QPen(QColor(88, 214, 245, 175), 1.0))
         painter.drawPath(path)
         painter.end()
         # QWidget's stylesheet background is transparent; don't call the
@@ -15152,7 +16649,9 @@ class _AnimatedStrokeFrame(QFrame):
         p.setPen(QPen(QColor(88, 214, 245, int(145 + 80 * pulse)), 1.25))
         p.drawPath(path)
         p.end()
-        super().paintEvent(event)
+        # This widget paints its entire visible chassis itself. Calling the
+        # QFrame painter afterwards can trigger a second background pass during
+        # the 55 ms glow update and produce a pale/white flash on Windows.
 
 
 class _IconOnlyButton(QPushButton):
@@ -19063,6 +20562,115 @@ class _ImageViewPanel(QWidget):
                 pass
 
 
+class _ShutdownFadeOut(QObject):
+    """Fade every visible HUD window out, then run *finished_callback*.
+
+    Pure opacity fade: no text, no dark overlay, no painted effects. Each
+    top-level window is faded from its own current opacity down to 0, so the
+    main reactor and any open panels disappear together and the app closes only
+    once nothing is visible any more.
+    """
+
+    def __init__(self, main_window, finished_callback, duration_ms: int = SHUTDOWN_FADE_MS):
+        super().__init__(main_window)
+        self._main = main_window
+        self._finished_callback = finished_callback
+        self._done = False
+        self._targets = []
+        try:
+            seen = set()
+            candidates = [main_window] + list(QApplication.topLevelWidgets())
+            for w in candidates:
+                try:
+                    if id(w) in seen or not w.isWindow() or not w.isVisible():
+                        continue
+                    if w.windowType() in (Qt.WindowType.Popup, Qt.WindowType.ToolTip,
+                                          Qt.WindowType.SplashScreen):
+                        continue
+                    seen.add(id(w))
+                    self._targets.append((w, float(w.windowOpacity())))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        self._animation = QVariantAnimation(self)
+        self._animation.setDuration(max(120, int(duration_ms)))
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(1.0)
+        self._animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._animation.valueChanged.connect(self._on_value)
+        self._animation.finished.connect(self._finish)
+
+    def start(self):
+        # Safety net: if the animation clock is stalled the app still closes.
+        QTimer.singleShot(self._animation.duration() + 900, self._finish)
+        self._animation.start()
+
+    def _on_value(self, value):
+        try:
+            k = 1.0 - max(0.0, min(1.0, float(value)))
+            for w, base in self._targets:
+                try:
+                    w.setWindowOpacity(base * k)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _finish(self):
+        if self._done:
+            return
+        self._done = True
+        for w, _base in self._targets:
+            try:
+                w.setWindowOpacity(0.0)
+            except Exception:
+                pass
+        try:
+            callback = self._finished_callback
+            if callable(callback):
+                callback()
+        except Exception:
+            pass
+
+
+class _ChatPanelWatcher(QObject):
+    """Keeps the reactor and the chat panel from sitting on top of each other.
+
+    Watches the chat panel's move / resize / show / hide events (debounced, so
+    it waits for the panel's own slide-in or a drag to finish) and asks the
+    main window to slide the logo clear, or back home once the panel closes.
+    """
+
+    def __init__(self, host, panel):
+        super().__init__(panel)
+        self._host = host
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(160)
+        self._timer.timeout.connect(self._tick)
+        panel.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() in (QEvent.Type.Move, QEvent.Type.Resize,
+                                QEvent.Type.Show, QEvent.Type.Hide):
+                self._timer.start()
+        except Exception:
+            pass
+        return False
+
+    def _tick(self):
+        try:
+            host = self._host
+            if host._chat_visible_window() is None:
+                host._chat_restore_logo()
+            else:
+                host._chat_avoid_overlap()
+        except Exception:
+            pass
+
+
 class MainWindow(QMainWindow):
     _state_sig = pyqtSignal(str)
     # One true boot state, marshalled from the backend thread. READY is not
@@ -19100,6 +20708,10 @@ class MainWindow(QMainWindow):
     # question-flow snapshot that drives the clarification card.
     _task_event_sig = pyqtSignal(dict)
     _question_flow_sig = pyqtSignal(dict)
+    #: Real coding progress from the coding actions (dev agent / code helper):
+    #: (kind, payload) → the live coding card in the chat. Marshalled onto the
+    #: GUI thread; a build runs on a worker thread and must never touch widgets.
+    _coding_preview_sig = pyqtSignal(str, dict)
 
     EXPANDED_SIZE = QSize(1380, 840)
     COLLAPSED_SIZE = QSize(136, 136)
@@ -19119,7 +20731,24 @@ class MainWindow(QMainWindow):
         self._assistant_name = (cfg.get('assistant_name') or 'JARVIS').strip() or 'JARVIS'
         self._muted = False
         self._voice_input_enabled = True
+        # Live-link truth for the resting-state reconciler: None until the
+        # first real state event says whether the session is up, then True
+        # (LISTENING/THINKING/EXECUTING/SPEAKING were seen — every one of them
+        # can only happen inside a Live turn) or False (RECONNECTING /
+        # CONNECTION ISSUE / NEEDS KEY were seen). MUTED is deliberately not a
+        # proof either way: it is a local microphone action. Never guessed.
+        self._link_live: bool | None = None
+        self._state_reconciler = None
         self._current_file = None
+        # Streamed assistant text: chunks arrive from a backend thread and are
+        # COALESCED here before touching any widget (one update per token is the
+        # classic way a stream freezes the window). ``_stream_mirror`` keeps the
+        # complete text at window level, so the legacy surfaces can be updated
+        # once even when no chat panel exists.
+        self._stream_buf: list = []
+        self._stream_mirror: list = []
+        self._stream_buf_lock = threading.Lock()
+        self._stream_flush_timer = None
         self._ready = self._check_config()
         self.get_plugins = None
         self.request_say = None
@@ -19472,6 +21101,7 @@ class MainWindow(QMainWindow):
                 on_report=self._show_task_report,
             )
             self._tasks_panel = self._build_floating_panel(self._tasks_pane, 'tasks')
+            self._tasks_pane.preferredSizeChanged.connect(self._queue_task_panel_fit)
         except Exception as _tasks_exc:
             self._tasks_pane = None
             self._tasks_panel = None
@@ -19551,6 +21181,7 @@ class MainWindow(QMainWindow):
         self._mode_status_sig.connect(self._apply_mode_status)
         self._task_event_sig.connect(self._apply_task_event)
         self._question_flow_sig.connect(self._apply_question_flow)
+        self._coding_preview_sig.connect(self._apply_coding_preview)
         QShortcut(QKeySequence('F4'), self).activated.connect(self._toggle_mute)
         QShortcut(QKeySequence('F11'), self).activated.connect(self._toggle_fullscreen)
         QShortcut(QKeySequence('Escape'), self).activated.connect(self._do_interrupt)
@@ -19696,60 +21327,43 @@ class MainWindow(QMainWindow):
         return f
 
     def _build_floating_panel(self, widget, kind):
-        # The teardown checklist is intentionally a standalone visual surface:
-        # no HUD icon, J.A.R.V.I.S. label, subtitle rail, or neon perimeter.
-        if str(kind) == 'tasks':
-            f = _TaskGlassPanel(None)
-            f.setProperty('_jarvis_panel_kind', 'tasks')
-            l = QVBoxLayout(f)
-            l.setContentsMargins(13, 8, 13, 12)
-            l.setSpacing(5)
-
-            header = QFrame(f)
-            header.setObjectName('TeardownChecklistHeader')
-            header.setFixedHeight(29)
-            header.setStyleSheet('QFrame#TeardownChecklistHeader{background:transparent;border:none;}')
-            h = QHBoxLayout(header)
-            h.setContentsMargins(1, 0, 0, 0)
-            h.setSpacing(8)
-            title = QLabel('Teardown Checklist', header)
-            title.setStyleSheet('QLabel{color:#214865;font:600 11pt "Segoe UI";background:transparent;border:none;}')
-            title.setProperty('_jarvis_panel_drag', True)
-            title.installEventFilter(self)
-            h.addWidget(title, 1, Qt.AlignmentFlag.AlignVCenter)
-
-            close_btn = QPushButton('×', header)
-            close_btn.setObjectName('closeTeardownChecklist')
-            close_btn.setFixedSize(25, 25)
-            close_btn.setToolTip('Close checklist')
-            close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            close_btn.setStyleSheet(
-                'QPushButton{color:#557893;background:rgba(255,255,255,105);'
-                'border:1px solid rgba(141,180,214,100);border-radius:8px;'
-                'font:500 15pt "Segoe UI";padding:0;} '
-                'QPushButton:hover{color:#244D70;background:rgba(255,255,255,220);'
-                'border:1px solid rgba(92,151,202,190);} '
-                'QPushButton:pressed{background:rgba(202,229,249,220);} '
-                'QPushButton:disabled{color:#AABCCB;border-color:rgba(190,210,226,100);}'
-            )
-            close_btn.clicked.connect(lambda: self._set_panel_visible(f, False))
-            h.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            header.setProperty('_jarvis_panel_drag', True)
-            header.installEventFilter(self)
-            header.setCursor(Qt.CursorShape.SizeAllCursor)
-            l.addWidget(header)
-            l.addWidget(widget, 1)
-            self._install_panel_drag_surface(f)
-            return f
-
-        f=self._panel_base(); f.setProperty('_jarvis_panel_kind', str(kind))
-        l=QVBoxLayout(f); l.setContentsMargins(7,5,7,6); l.setSpacing(4)
-        titles={'video':'VIDEO PREVIEW','model':'3D DISPLAY','web':'WEBVIEW','task':'WEB TASK','world':'SYSTEM MONITOR','memory':'MIND','window':'WINDOW','tools':'TOOLS DECK','repair':'SELF-REPAIR TELEMETRY','globe':'HOLO GLOBE'}
-        icons={'video':'▶','model':'◇','web':'🌐','task':'⌁','world':'◎','memory':'🧠','window':'▣','tools':'▣','repair':'🛠','globe':'◍'}
-        subtitles={'video':'LOCAL MEDIA','model':'HOLOGRAM','web':'WEB CONSOLE','task':'RESEARCH QUEUE','world':'LIVE TELEMETRY','memory':'MEMORIES · BELIEFS · DREAMS','window':'WORKSPACE','tools':'COMMAND DECK','repair':'AUTO-HEAL SENTRY','globe':'GEOSPATIAL CORE'}
-        self._panel_header(f, icons.get(kind,'✦'), lambda:self._set_panel_visible(f,False), titles.get(kind,'HUD WINDOW'), subtitles.get(kind,''))
-        l.addWidget(widget,1)
+        # Every floating panel uses the same angular HUD chassis. Task progress
+        # keeps its own content layout, but no longer gets a separate rounded,
+        # pale or static window treatment.
+        kind = str(kind)
+        f = self._panel_base()
+        f.setProperty('_jarvis_panel_kind', kind)
+        if kind == 'tasks':
+            # Preserve the task pane's familiar starting footprint; later fits
+            # follow the live checklist and remain clamped to the available screen.
+            f.setMinimumSize(350, 365)
+            f.resize(455, 590)
+        l = QVBoxLayout(f)
+        l.setContentsMargins(7, 5, 7, 6)
+        l.setSpacing(4)
+        titles = {
+            'video': 'VIDEO PREVIEW', 'model': '3D DISPLAY', 'web': 'WEBVIEW',
+            'task': 'WEB TASK', 'tasks': 'TASK PROGRESS', 'world': 'SYSTEM MONITOR',
+            'memory': 'MIND', 'window': 'WINDOW', 'tools': 'TOOLS DECK',
+            'repair': 'SELF-REPAIR TELEMETRY', 'globe': 'HOLO GLOBE',
+        }
+        icons = {
+            'video': '▶', 'model': '◇', 'web': '🌐', 'task': '⌁',
+            'tasks': '≋', 'world': '◎', 'memory': '🧠', 'window': '▣',
+            'tools': '▣', 'repair': '⛭', 'globe': '◍',
+        }
+        subtitles = {
+            'video': 'LOCAL MEDIA', 'model': 'HOLOGRAM', 'web': 'WEB CONSOLE',
+            'task': 'RESEARCH QUEUE', 'tasks': 'LIVE EXECUTION CHECKLIST',
+            'world': 'LIVE TELEMETRY', 'memory': 'MEMORIES · BELIEFS · DREAMS',
+            'window': 'WORKSPACE', 'tools': 'COMMAND DECK',
+            'repair': 'AUTO-HEAL SENTRY', 'globe': 'GEOSPATIAL CORE',
+        }
+        self._panel_header(
+            f, icons.get(kind, '✦'), lambda: self._set_panel_visible(f, False),
+            titles.get(kind, 'HUD WINDOW'), subtitles.get(kind, '')
+        )
+        l.addWidget(widget, 1)
         self._install_panel_drag_surface(f)
         return f
 
@@ -19761,7 +21375,7 @@ class MainWindow(QMainWindow):
         panel.installEventFilter(self)
         panel_kind = str(panel.property('_jarvis_panel_kind') or 'panel')
         if panel_kind == 'tasks':
-            panel.setObjectName('TeardownChecklistWindow')
+            panel.setObjectName('JarvisPanel_tasks')
         else:
             panel.setObjectName(f'JarvisPanel_{panel_kind}')
         # The old 4px transparent drag strip has been removed: it intercepted
@@ -21253,6 +22867,7 @@ class MainWindow(QMainWindow):
         return target
 
     def _save_window_position(self):
+        self._logo_home_pos = None
         try:
             feats = self._features if isinstance(getattr(self, '_features', None), dict) else {}
             if feats.get('remember_position', True):
@@ -21272,6 +22887,18 @@ class MainWindow(QMainWindow):
         self._toggle_command_window()
 
     def _toggle_command_window(self):
+        # Every entry point (logo click, hotkey, voice command) lands here. If
+        # the startup reactor is still big or gliding, the panel would be
+        # placed beside a window that then shrinks and moves away — leaving
+        # the logo overlapping / behind the panel. Settle first, then open.
+        try:
+            if getattr(self, '_startup_phase', None) in (_StartupPhase.STARTUP, _StartupPhase.ANIMATING):
+                self._startup_click_settle()
+                if getattr(self, '_startup_phase', None) is not _StartupPhase.SETTLED:
+                    self._pending_chat_toggle = True
+                    return
+        except Exception:
+            pass
         try:
             win = getattr(self, '_command_window', None)
             try:
@@ -21309,6 +22936,10 @@ class MainWindow(QMainWindow):
                         self._command_window = None
                         return
                 self._command_window = win
+                try:
+                    self._chat_watcher = _ChatPanelWatcher(self, win)
+                except Exception:
+                    pass
                 # Replay any tool activity that started before this window was
                 # created. This does not fabricate activity; it only renders the
                 # real state retained by set_doing()/clear_doing().
@@ -21530,7 +23161,7 @@ class MainWindow(QMainWindow):
 
         nav = QHBoxLayout(); nav.setSpacing(3)
         self._dashboard_pages = QStackedWidget(); self._dashboard_pages.setStyleSheet('background:transparent;')
-        for i, label in enumerate(('CORE', 'MEDIA', 'WEB', 'PC', 'SYSTEM')):
+        for i, label in enumerate(('CORE', 'MEDIA', 'WEB', 'PC', 'SYSTEM', 'LOGO')):
             b = QPushButton(label); b.setObjectName('DashboardNav'); b.setCheckable(True); b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda checked=False, page=i: self._switch_dashboard_page(page)); nav.addWidget(b)
             if i == 0: self._dashboard_nav_first = b
@@ -21559,6 +23190,25 @@ class MainWindow(QMainWindow):
             for title, detail, callback in entries:
                 btn = _GlowButton(title, '▸', compact=True); btn.setMinimumHeight(27); btn.setToolTip(detail); btn.clicked.connect(callback); pl.addWidget(btn)
             pl.addStretch(1); self._dashboard_pages.addWidget(page)
+
+        # LOGO page: where the reactor sits and how it behaves around the chat.
+        logo_page = QFrame(); logo_page.setObjectName('DashboardPanel')
+        lpl = QVBoxLayout(logo_page); lpl.setContentsMargins(6,6,6,6); lpl.setSpacing(4)
+        for title, detail, callback in (
+            ('SNAP TO CORNER', 'Move the logo to the next screen corner (top-left, top-right, bottom-right, bottom-left).', self._logo_snap_corner),
+            ('CENTER LOGO', 'Glide the logo to the middle of the screen.', self._logo_center_screen),
+            ('RESET POSITION', 'Put the logo back at the default bottom-right spot.', self._logo_reset_position),
+        ):
+            b = _GlowButton(title, '▸', compact=True); b.setMinimumHeight(27); b.setToolTip(detail); b.clicked.connect(callback); lpl.addWidget(b)
+        avoid_btn = _GlowButton(f"AUTO-AVOID CHAT: {'ON' if self._features.get('logo_avoid_chat', True) else 'OFF'}", '▸', compact=True)
+        avoid_btn.setMinimumHeight(27)
+        avoid_btn.setToolTip('When ON, the logo slides out of the way if the chat panel would cover it, and returns when the panel closes.')
+        avoid_btn.clicked.connect(lambda _c=False, b=avoid_btn: self._logo_toggle_avoid(b)); lpl.addWidget(avoid_btn)
+        lock_btn = _GlowButton(f"LOCK POSITION: {'OFF' if self._drag_reactor_enabled else 'ON'}", '▸', compact=True)
+        lock_btn.setMinimumHeight(27)
+        lock_btn.setToolTip('When ON, the logo cannot be dragged by accident.')
+        lock_btn.clicked.connect(lambda _c=False, b=lock_btn: self._logo_toggle_lock(b)); lpl.addWidget(lock_btn)
+        lpl.addStretch(1); self._dashboard_pages.addWidget(logo_page)
         lay.addWidget(self._dashboard_pages, 1)
 
         chat_header = QHBoxLayout(); chat_header.setSpacing(5)
@@ -21642,6 +23292,41 @@ class MainWindow(QMainWindow):
             self._quick_input.setFocus()
 
     def _close_all_ui(self):
+        """Play the shutdown outro first; do teardown only after it finishes."""
+        if bool(getattr(self, '_shutdown_finalize_started', False)):
+            return
+        self._begin_shutdown_outro()
+
+    def _begin_shutdown_outro(self):
+        """Start the one-shot fade-out for every close path (fade, then close)."""
+        if bool(getattr(self, '_shutdown_finalize_started', False)):
+            return
+        if bool(getattr(self, '_shutdown_outro_active', False)):
+            return
+        self._shutdown_outro_active = True
+        try:
+            if _sfx_enabled(self):
+                _sfx('close')
+        except Exception:
+            pass
+
+        # If the main HUD is already hidden, there is nowhere to display the
+        # effect, so finish safely rather than keeping the process alive.
+        try:
+            if not self.isVisible():
+                QTimer.singleShot(0, self._finish_close_all_ui)
+                return
+            fade = _ShutdownFadeOut(self, self._finish_close_all_ui)
+            self._shutdown_outro_overlay = fade
+            fade.start()
+        except Exception:
+            QTimer.singleShot(0, self._finish_close_all_ui)
+
+    def _finish_close_all_ui(self):
+        """Close every surface after the animation, then let closeEvent clean up."""
+        if bool(getattr(self, '_shutdown_finalize_started', False)):
+            return
+        self._shutdown_finalize_started = True
         windows = (
             '_quick_popup', '_command_window', '_full_settings_window', '_three_d_display',
             '_video_panel', '_image_panel', '_image_view_panel', '_content_panel', '_activity_panel',
@@ -21653,25 +23338,29 @@ class MainWindow(QMainWindow):
         for name in windows:
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.close()
+                try:
+                    if widget is not getattr(self, '_shutdown_outro_overlay', None):
+                        widget.close()
+                except Exception:
+                    pass
         for win in getattr(self, '_workspace_windows', []):
             try:
                 win.close()
             except Exception:
                 pass
-        self.close()
-        # The single full-close path. QApplication.quit() alone only stops the
-        # event loop: the backend thread would keep the pythonw process alive
-        # with no window at all, squatting the single-instance mutex so the
-        # next launch falsely reports "already running". stability funnels the
-        # cleanup callbacks and then guarantees the process actually dies.
         try:
-            from core import stability as _st
-            if self._ui_alive():
-                self.write_log('SYS: Closing J.A.R.V.I.S. — shutting down completely.')
-            _st.request_process_exit('close-all-ui')
+            fade = getattr(self, '_shutdown_outro_overlay', None)
+            if fade is not None:
+                fade.deleteLater()
         except Exception:
-            QApplication.quit()
+            pass
+        try:
+            self.close()
+        except Exception:
+            try:
+                QApplication.quit()
+            except Exception:
+                pass
 
     def _on_gui_thread(self) -> bool:
         try:
@@ -21843,6 +23532,10 @@ class MainWindow(QMainWindow):
             if phase is _StartupPhase.SETTLED and getattr(self, '_startup_presented_once', False):
                 return
             self._startup_presented_once = True
+            try:
+                self.setWindowOpacity(0.0)
+            except Exception:
+                pass
             # A previous presentation's fallback timer must never survive.
             self._stop_startup_fallback()
             # STARTUP owns the geometry from here on.
@@ -21870,65 +23563,70 @@ class MainWindow(QMainWindow):
 
             logo = getattr(self, '_header_logo', None)
             if logo is not None:
-                # The configured LOGO_BG_FILL is active only during this startup
-                # presentation. It is disabled automatically after settling.
                 logo._startup_bg_fill_active = True
                 logo._startup_core_fade = 0.0
-                logo.update()
+                logo._startup_glow = 0.0
 
-                # Fade the transparent black core in softly. The radial gradient
-                # still fades to zero at the edge, so it never becomes a hard disc.
-                try:
-                    core_fade = QVariantAnimation(self)
-                    core_fade.setDuration(STARTUP_CORE_FADE_IN_MS)
-                    core_fade.setStartValue(0.0)
-                    core_fade.setEndValue(1.0)
-                    core_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
-                    core_fade.valueChanged.connect(lambda v, lg=logo: (setattr(lg, '_startup_core_fade', float(v)), lg.update()))
-                    core_fade.start()
-                    self._startup_core_fade_anim = core_fade
-                except Exception:
-                    logo._startup_core_fade = 1.0
-
-                # Subtle startup scale: begin at the configured startup diameter
-                # and keep the entire visual motion smooth. The transparent hit
-                # area follows the glow and logo before JARVIS speaks.
-                startup_logo = min(big - 24, max(self._logo_settled_size() + 8, STARTUP_LOGO_SIZE))
-                logo.set_logo_size(startup_logo)
-                self._center_logo()
-
+                end_size = int(min(big - 24, max(self._logo_settled_size() + 8, STARTUP_LOGO_SIZE)))
+                begin_size = max(120, int(end_size * float(STARTUP_INTRO_START_SCALE)))
                 target_op = int(getattr(self, '_reactor_opacity', 100))
+                self._startup_intro_end = (end_size, target_op)
+
+                logo.set_logo_size(begin_size)
+                self._center_logo()
                 logo.set_graphic_opacity(0)
-                fade = QVariantAnimation(self)
-                fade.setDuration(620)
-                fade.setStartValue(0)
-                fade.setEndValue(target_op)
-                fade.setEasingCurve(QEasingCurve.Type.OutCubic)
-                fade.valueChanged.connect(lambda v, lg=logo: lg.set_graphic_opacity(int(v)))
-                fade.start()
-                self._startup_fade = fade
-                self._startup_anims = (fade,)
 
-                # Startup bloom — bright cyan halo that ramps 1.0 → 0.0
-                # over ~1.6 s as the puck settles into its compact home.
-                try:
-                    logo._startup_glow = 1.0
-                    bloom = QVariantAnimation(self)
-                    bloom.setDuration(STARTUP_GLOW_FADE_MS)
-                    bloom.setStartValue(1.0)
-                    bloom.setEndValue(0.0)
-                    bloom.setEasingCurve(QEasingCurve.Type.OutCubic)
+                def _smooth(x):
+                    x = max(0.0, min(1.0, float(x)))
+                    return x * x * (3.0 - 2.0 * x)
 
-                    def _on_bloom(v, lg=logo):
-                        lg._startup_glow = float(v)
+                # ONE clock drives the whole launch: window fade, reactor
+                # fade, reactor grow and the dark core. Everything eases in
+                # together instead of four animations drifting apart.
+                def _on_intro(v, lg=logo):
+                    try:
+                        p = max(0.0, min(1.0, float(v)))
+                        e = _smooth(p)
+                        lg.set_logo_size(int(round(begin_size + (end_size - begin_size) * e)))
+                        lg.move(max(0, (self.width() - lg.width()) // 2),
+                                max(0, (self.height() - lg.height()) // 2))
+                        lg.set_graphic_opacity(int(target_op * _smooth(p / 0.72)))
+                        lg._startup_core_fade = _smooth(p / 0.85)
+                        self.setWindowOpacity(_smooth(p / 0.55))
+                    except Exception:
+                        pass
+
+                intro = QVariantAnimation(self)
+                intro.setDuration(int(STARTUP_INTRO_MS))
+                intro.setStartValue(0.0)
+                intro.setEndValue(1.0)
+                intro.setEasingCurve(QEasingCurve.Type.Linear)
+                intro.valueChanged.connect(_on_intro)
+                intro.finished.connect(lambda: self.setWindowOpacity(1.0))
+                self._startup_fade = intro
+                self._startup_core_fade_anim = None
+
+                # Bloom: a cyan halo swells in with the fade, peaks, then
+                # relaxes to the normal glow while the reactor waits.
+                bloom = QVariantAnimation(self)
+                bloom.setDuration(int(STARTUP_GLOW_FADE_MS) + 600)
+                bloom.setStartValue(0.0)
+                bloom.setEndValue(1.0)
+                bloom.setEasingCurve(QEasingCurve.Type.Linear)
+
+                def _on_bloom(v, lg=logo):
+                    try:
+                        t = float(v)
+                        lg._startup_glow = _smooth(t / 0.20) if t < 0.20 else 1.0 - _smooth((t - 0.20) / 0.80)
                         lg.update()
+                    except Exception:
+                        pass
 
-                    bloom.valueChanged.connect(_on_bloom)
-                    bloom.start()
-                    self._startup_bloom = bloom
-                    self._startup_anims = (fade, bloom)
-                except Exception:
-                    pass
+                bloom.valueChanged.connect(_on_bloom)
+                self._startup_bloom = bloom
+                self._startup_anims = (intro, bloom)
+                intro.start()
+                bloom.start()
 
             # The transparent hit surface stays active while the startup logo
             # is waiting for the first JARVIS voice / wake-word transition.
@@ -21947,6 +23645,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         except Exception:
+            try:
+                self.setWindowOpacity(1.0)
+            except Exception:
+                pass
             self._startup_phase = _StartupPhase.STARTUP
             self._show_startup_logo_hitbox()
             try:
@@ -21970,6 +23672,7 @@ class MainWindow(QMainWindow):
 
         self._startup_phase = _StartupPhase.ANIMATING
         self._stop_startup_fallback()
+        self._startup_intro_finish()
 
         # The invisible startup hitbox is not needed while the reactor itself
         # is shrinking. Stop its timer so it cannot compete with the animation.
@@ -22083,6 +23786,7 @@ class MainWindow(QMainWindow):
                     # SETTLED is reached exactly once, through this one path.
                     self._startup_phase = _StartupPhase.SETTLED
                     self._apply_pending_startup_layout()
+                    self._run_pending_chat_toggle()
 
             self._finalize_startup_transition = _finalize
 
@@ -22146,8 +23850,193 @@ class MainWindow(QMainWindow):
             # final geometry synchronously and land in SETTLED.
             self._startup_finish_fallback()
 
+    def _startup_intro_finish(self):
+        """Land the launch fade-in on its final frame (used if settle starts early)."""
+        try:
+            intro = getattr(self, '_startup_fade', None)
+            was_running = intro is not None and intro.state() == QAbstractAnimation.State.Running
+            if was_running:
+                intro.stop()
+                logo = getattr(self, '_header_logo', None)
+                end = getattr(self, '_startup_intro_end', None)
+                if logo is not None and end:
+                    logo.set_logo_size(int(end[0]))
+                    logo.set_graphic_opacity(int(end[1]))
+                    logo._startup_core_fade = 1.0
+                    logo.move(max(0, (self.width() - logo.width()) // 2),
+                              max(0, (self.height() - logo.height()) // 2))
+        except Exception:
+            pass
+        try:
+            self.setWindowOpacity(1.0)
+        except Exception:
+            pass
+
+    def _run_pending_chat_toggle(self):
+        """Open the chat panel that was requested while the reactor was settling."""
+        try:
+            if getattr(self, '_pending_chat_toggle', False):
+                self._pending_chat_toggle = False
+                QTimer.singleShot(80, self._toggle_command_window)
+        except Exception:
+            pass
+
+    # -- logo auto-positioning around the chat panel -----------------------
+    def _chat_visible_window(self):
+        win = getattr(self, '_command_window', None)
+        try:
+            if win is not None and win.isVisible():
+                return win
+        except RuntimeError:
+            self._command_window = None
+        return None
+
+    def _logo_move_animated(self, target, ms: int = 300):
+        """Glide the reactor window to *target* (one animation at a time)."""
+        try:
+            old = getattr(self, '_logo_slide_anim', None)
+            if old is not None:
+                old.stop()
+        except Exception:
+            pass
+        try:
+            anim = QPropertyAnimation(self, b'pos', self)
+            anim.setDuration(int(ms))
+            anim.setStartValue(QPoint(self.pos()))
+            anim.setEndValue(QPoint(target))
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            self._logo_slide_anim = anim
+            anim.start()
+        except Exception:
+            self.move(target)
+
+    def _chat_avoid_overlap(self):
+        """If the chat panel covers the logo, slide the logo to the nearest free spot."""
+        try:
+            if not bool(self._features.get('logo_avoid_chat', True)):
+                return
+            if getattr(self, '_startup_phase', None) is not _StartupPhase.SETTLED:
+                return
+            win = self._chat_visible_window()
+            if win is None:
+                return
+            me = self.frameGeometry()
+            other = win.frameGeometry()
+            gap = 14
+            if not me.adjusted(-gap, -gap, gap, gap).intersects(other):
+                return
+            screen = QApplication.screenAt(other.center()) or QApplication.primaryScreen()
+            if screen is None:
+                return
+            sg = screen.availableGeometry()
+            w, h = me.width(), me.height()
+            spots = [
+                QPoint(other.right() + gap + 1, me.y()),     # right of the panel
+                QPoint(other.left() - w - gap, me.y()),      # left of the panel
+                QPoint(me.x(), other.top() - h - gap),       # above
+                QPoint(me.x(), other.bottom() + gap + 1),    # below
+            ]
+            fits = [p for p in spots if sg.contains(QRect(p, QSize(w, h)))]
+            if not fits:
+                return
+            best = min(fits, key=lambda p: (p - me.topLeft()).manhattanLength())
+            if getattr(self, '_logo_home_pos', None) is None:
+                self._logo_home_pos = QPoint(self.pos())
+            self._logo_move_animated(best)
+        except Exception:
+            pass
+
+    def _chat_restore_logo(self):
+        """Chat panel closed: glide the logo back to where the user had it."""
+        try:
+            home = getattr(self, '_logo_home_pos', None)
+            if home is None or self._chat_visible_window() is not None:
+                return
+            self._logo_home_pos = None
+            if getattr(self, '_startup_phase', None) is _StartupPhase.SETTLED:
+                self._logo_move_animated(self._clamp_position_to_screen(home))
+        except Exception:
+            pass
+
+    # -- logo quick actions (Command Deck → LOGO) ---------------------------
+    def _logo_screen_rect(self):
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 720)
+
+    def _logo_go_to(self, pos, remember: bool = True):
+        if getattr(self, '_startup_phase', None) is not _StartupPhase.SETTLED:
+            return
+        self._logo_home_pos = None
+        target = self._clamp_position_to_screen(QPoint(pos))
+        self._logo_move_animated(target)
+        if remember:
+            QTimer.singleShot(self._logo_slide_anim.duration() + 40 if getattr(self, '_logo_slide_anim', None) else 340,
+                              self._save_window_position)
+
+    def _logo_snap_corner(self):
+        """Cycle the logo through the four screen corners."""
+        sg = self._logo_screen_rect()
+        w, h, m = self.width(), self.height(), 24
+        corners = [
+            QPoint(sg.left() + m, sg.top() + m),
+            QPoint(sg.right() - w - m + 1, sg.top() + m),
+            QPoint(sg.right() - w - m + 1, sg.bottom() - h - m + 1),
+            QPoint(sg.left() + m, sg.bottom() - h - m + 1),
+        ]
+        names = ('TOP-LEFT', 'TOP-RIGHT', 'BOTTOM-RIGHT', 'BOTTOM-LEFT')
+        idx = (int(getattr(self, '_logo_corner_idx', -1)) + 1) % 4
+        self._logo_corner_idx = idx
+        self._logo_go_to(corners[idx])
+        self._logo_quick_note(f'LOGO → {names[idx]}')
+
+    def _logo_center_screen(self):
+        sg = self._logo_screen_rect()
+        self._logo_go_to(QPoint(sg.left() + (sg.width() - self.width()) // 2,
+                                sg.top() + (sg.height() - self.height()) // 2))
+        self._logo_quick_note('LOGO → CENTER')
+
+    def _logo_reset_position(self):
+        sg = self._logo_screen_rect()
+        self._logo_go_to(QPoint(sg.right() - self.width() - 40 + 1, sg.bottom() - self.height() - 60 + 1))
+        self._logo_quick_note('LOGO POSITION RESET')
+
+    def _logo_toggle_avoid(self, btn=None):
+        on = not bool(self._features.get('logo_avoid_chat', True))
+        self._features['logo_avoid_chat'] = on
+        try:
+            _ui_save(API_FILE, features={'logo_avoid_chat': on})
+        except Exception:
+            pass
+        if btn is not None:
+            btn.setText(f"▸  AUTO-AVOID CHAT: {'ON' if on else 'OFF'}")
+        if on:
+            self._chat_avoid_overlap()
+        else:
+            self._chat_restore_logo()
+        self._logo_quick_note(f"AUTO-AVOID CHAT {'ON' if on else 'OFF'}")
+
+    def _logo_toggle_lock(self, btn=None):
+        locked = bool(self._drag_reactor_enabled)      # currently draggable -> lock it
+        self._drag_reactor_enabled = not locked
+        try:
+            _ui_save(API_FILE, features={'drag_reactor': not locked})
+            self._features['drag_reactor'] = not locked
+        except Exception:
+            pass
+        if btn is not None:
+            btn.setText(f"▸  LOCK POSITION: {'ON' if locked else 'OFF'}")
+        self._logo_quick_note(f"POSITION {'LOCKED' if locked else 'UNLOCKED'}")
+
+    def _logo_quick_note(self, text: str):
+        try:
+            self._quick_status.setText(str(text))
+            QTimer.singleShot(2500, self._update_quick_clock)
+        except Exception:
+            pass
+
     def _startup_finish_fallback(self):
         """Synchronous settle used when the timeline cannot be constructed."""
+        self._startup_intro_finish()
         self._startup_phase = _StartupPhase.SETTLED
         self._stop_startup_fallback()
         try:
@@ -22186,6 +24075,7 @@ class MainWindow(QMainWindow):
             self._startup_timeline = None
             self._finalize_startup_transition = None
             self._apply_pending_startup_layout()
+            self._run_pending_chat_toggle()
 
     def _animate_window_show(self):
         self._startup_begin()
@@ -22210,42 +24100,69 @@ class MainWindow(QMainWindow):
         return out
 
     def _fit_panel_to_contents(self, panel) -> None:
-        """Fit a floating panel to content while respecting manual task sizing."""
+        """Fit panels to their live content; task panels reflow as steps change."""
         try:
+            if panel is None or panel.layout() is None:
+                return
             is_task_panel = str(panel.property('_jarvis_panel_kind') or '') == 'tasks'
-            # Once the user has dragged the bottom-right resize handle, keep
-            # that exact size across content updates and future reopenings.
-            if is_task_panel and bool(panel.property('_task_user_resized')):
-                return
-            lay = panel.layout()
-            if lay is None:
-                return
-            lay.activate()
+            layout = panel.layout()
+            layout.activate()
+            pane = getattr(self, '_tasks_pane', None) if is_task_panel else None
+            if pane is not None:
+                try:
+                    pane.updateGeometry()
+                    pane.layout().activate()
+                except Exception:
+                    pass
             panel.adjustSize()
             hint = panel.sizeHint()
             min_w = max(1, panel.minimumWidth())
             min_h = max(1, panel.minimumHeight())
-            w = panel.width()
-            if panel.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Fixed:
-                w = max(min_w, w)
-            else:
-                w = max(min_w, int(hint.width()))
+            w = max(min_w, int(hint.width()))
             h = max(min_h, int(hint.height()))
+
+            screen = panel.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                max_w = max(min_w, available.width() - 36)
+                max_h = max(min_h, int(available.height() * (0.84 if is_task_panel else 0.90)))
+                w = min(w, max_w)
+                h = min(h, max_h)
+            # The task pane is auto-sized on every live update (manual resize no
+            # longer disables fitting), while long step lists stay scrollable.
+            # Other panels retain their current width unless it is below hint.
             if is_task_panel:
-                # Fit to content on first open, but never let a long checklist
-                # or report extend beyond the usable screen area.
-                screen = panel.screen() or QApplication.primaryScreen()
-                if screen is not None:
-                    available = screen.availableGeometry()
-                    w = min(w, max(min_w, available.width() - 36))
-                    h = min(h, max(min_h, int(available.height() * 0.84)))
-            # Only shrink/fit; never unexpectedly enlarge a panel beyond a
-            # user's manually chosen width/height.
-            if panel.height() > h or panel.width() < w:
-                panel.resize(max(w, panel.width()), min(panel.height(), h) if panel.height() > h else panel.height())
+                panel.resize(w, h)
             else:
-                panel.resize(panel.width(), h)
+                panel.resize(max(panel.width(), w), min(panel.height(), h) if panel.height() > h else h)
+
+            # Reposition only if the content-driven size would push the panel off-screen.
+            if screen is not None:
+                available = screen.availableGeometry()
+                x = min(max(panel.x(), available.left()), max(available.left(), available.right() - panel.width() + 1))
+                y = min(max(panel.y(), available.top()), max(available.top(), available.bottom() - panel.height() + 1))
+                if (x, y) != (panel.x(), panel.y()):
+                    panel.move(x, y)
             panel.updateGeometry()
+        except Exception:
+            pass
+
+    def _queue_task_panel_fit(self) -> None:
+        """Debounce live task-panel auto-fit so streaming events do not jitter it."""
+        try:
+            panel = getattr(self, '_tasks_panel', None)
+            if panel is None or not panel.isVisible():
+                return
+            timer = getattr(self, '_task_panel_fit_timer', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.setInterval(85)
+                timer.timeout.connect(
+                    lambda: self._fit_panel_to_contents(getattr(self, '_tasks_panel', None))
+                )
+                self._task_panel_fit_timer = timer
+            timer.start(85)
         except Exception:
             pass
 
@@ -22350,6 +24267,7 @@ class MainWindow(QMainWindow):
             getattr(self, '_world_monitor_panel', None): (860, 560),
             getattr(self, '_memory_panel', None): (560, 520),
             getattr(self, '_tools_panel', None): (600, 540),
+            getattr(self, '_tasks_panel', None): (455, 590),
         }
         pw, ph = sizes.get(panel, (480, 360))
         pw = min(pw, sg.width() - 24); ph = min(ph, sg.height() - 24)
@@ -22363,7 +24281,7 @@ class MainWindow(QMainWindow):
         for name in ('_video_panel', '_image_panel', '_image_view_panel', '_content_panel', '_activity_panel',
                      '_model_panel',
                      '_webview_panel', '_web_task_panel', '_world_monitor_panel', '_memory_panel',
-                     '_tools_panel'):
+                     '_tools_panel', '_tasks_panel'):
             panel = getattr(self, name, None)
             if panel is not None and panel.isVisible():
                 self._position_one_panel(panel)
@@ -22532,11 +24450,54 @@ class MainWindow(QMainWindow):
         self.run_on_ui(lambda: (lambda w: bool(w) and w.begin_assistant_stream(who))(
             self._live_command_window()))
 
+    #: Streamed text is flushed at most this often (25 Hz). Fast enough to look
+    #: live, bounded enough that a token storm cannot peg the GUI thread.
+    _STREAM_FLUSH_MS = 40
+
     def stream_assistant_text(self, chunk: str):
+        """Queue streamed assistant text for the Chat Log. Thread-safe.
+
+        Chunks are COALESCED and applied on a short timer instead of one widget
+        update per token - the bounded rate is what keeps the window responsive
+        while a reply is being written. Order is preserved.
+        """
         text = str(chunk or '')
         if not text:
             return
-        self.run_on_ui(lambda: self._stream_assistant_text_ui(text))
+        try:
+            with self._stream_buf_lock:
+                self._stream_buf.append(text)
+        except Exception:
+            return
+        self._schedule_stream_flush()
+
+    def _schedule_stream_flush(self):
+        """Start (or keep) the coalescing timer for streamed text."""
+        try:
+            timer = getattr(self, '_stream_flush_timer', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._flush_stream_text)
+                self._stream_flush_timer = timer
+            if not timer.isActive():
+                timer.start(int(self._STREAM_FLUSH_MS))
+        except Exception:
+            # No timer available (shutdown, no Qt): apply immediately rather
+            # than dropping the reply.
+            self._flush_stream_text()
+
+    def _flush_stream_text(self):
+        """Apply the pending streamed text to the panel (GUI thread)."""
+        try:
+            with self._stream_buf_lock:
+                pending = "".join(self._stream_buf)
+                self._stream_buf = []
+        except Exception:
+            pending = ""
+        if pending:
+            self._stream_mirror.append(pending)
+            self.run_on_ui(lambda: self._stream_assistant_text_ui(pending))
 
     def _stream_assistant_text_ui(self, chunk: str):
         win = self._live_command_window()
@@ -22547,8 +24508,52 @@ class MainWindow(QMainWindow):
         win.append_assistant_stream(chunk)
 
     def finish_assistant_stream(self):
-        self.run_on_ui(lambda: (lambda w: bool(w) and w.finish_assistant_stream())(
-            self._live_command_window()))
+        """Close the streamed reply: flush the tail, then finish exactly once."""
+        try:
+            if self._stream_flush_timer is not None:
+                self._stream_flush_timer.stop()
+            self._flush_stream_text()
+        except Exception:
+            pass
+
+        def _apply():
+            self._finish_assistant_stream_ui(self._live_command_window())
+
+        # Resolved on the GUI thread (Qt objects never travel between threads)
+        # and gated on EXISTENCE, not visibility: a hidden panel still receives
+        # and records the turn, exactly like every other chat route.
+        self.run_on_ui(_apply)
+
+    def _finish_assistant_stream_ui(self, win=None):
+        """Apply the finished stream. With no panel the legacy surfaces get it.
+
+        A streamed reply is never less visible than a whole-reply one: the
+        activity line and the transport buffer the first-open replay renders
+        are updated here exactly as the plain ``write_log`` path would do.
+        """
+        try:
+            text = "".join(self._stream_mirror).strip()
+            self._stream_mirror = []
+        except Exception:
+            text = ""
+        if win is not None:
+            try:
+                win.finish_assistant_stream()
+            except Exception:
+                pass
+        if not text:
+            return
+        try:
+            self._activity_add(f"{self._assistant_name}: {text}")
+        except Exception:
+            pass
+        if win is None:
+            # No panel to render the stream row: keep the reply visible on the
+            # legacy transport buffer / quick log, like write_log would.
+            try:
+                self._append_chat(f"{self._assistant_name}: {text}")
+            except Exception:
+                pass
 
     def _log_from_backend(self,text):
         self._activity_add(text)
@@ -22661,9 +24666,96 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    #: States that can only happen while a Live session is genuinely up (the
+    #: microphone may be muted, but the link and the turn pipeline are real).
+    _LINK_LIVE_STATES = frozenset(
+        {'LISTENING', 'THINKING', 'EXECUTING', 'SPEAKING', 'PC_CONTROL',
+         'AUTOMATION', 'MULTIMODAL'})
+    #: States that prove the link is NOT up. Anything else (BOOTING, CLEANING,
+    #: STARTING_UI, READY) leaves the previous answer alone instead of guessing.
+    _LINK_DOWN_STATES = frozenset(
+        {'RECONNECTING', 'CONNECTING', 'CONNECTION ISSUE', 'DEGRADED', 'ERROR',
+         'NEEDS KEY', 'NEEDS API KEY', 'OFFLINE'})
+    #: The only states the reconciler may correct. Everything else — the busy
+    #: trio, the connection lifecycle, the startup phases — is owned by the
+    #: code path that set it, and is left alone.
+    _LINK_RESTING_STATES = frozenset({'LISTENING', 'MUTED', 'IDLE'})
+
+    def _note_link_state(self, state_u: str) -> None:
+        """Learn from real state events whether the Live link is up."""
+        try:
+            s = str(state_u or '').upper().strip()
+            if s in self._LINK_LIVE_STATES:
+                self._link_live = True
+            elif s in self._LINK_DOWN_STATES:
+                self._link_live = False
+        except Exception:
+            pass
+
+    def _idle_state(self) -> str:
+        """The truthful RESTING reactor state: MUTED / LISTENING / IDLE.
+
+        MUTED when the microphone is off (J.A.R.V.I.S. is not hearing
+        anything), LISTENING only when the link is genuinely up, IDLE when it
+        is not — including before the first connect. Never called while a turn
+        is in flight; the reconciler checks that first.
+        """
+        try:
+            if getattr(self, '_muted', False) or bool(getattr(self.hud, 'muted', False)):
+                return 'MUTED'
+        except Exception:
+            pass
+        return 'LISTENING' if getattr(self, '_link_live', False) else 'IDLE'
+
+    def _ensure_state_reconciler(self) -> None:
+        """Start the 500 ms resting-state truth check (once)."""
+        try:
+            timer = getattr(self, '_state_reconciler', None)
+            if timer is not None:
+                return
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(self._reconcile_state)
+            self._state_reconciler = timer
+            timer.start(500)
+        except Exception:
+            pass
+
+    def _reconcile_state(self) -> None:
+        """Every 500 ms, correct the reactor's RESTING state — and nothing else.
+
+        The Live loop already drives every state change in real time; this is
+        the safety net for the two failures a state machine cannot see from
+        inside a turn: a microphone switched off while the HUD still says
+        LISTENING, and a session that went away without a state event. It
+        NEVER touches THINKING, EXECUTING or SPEAKING — those belong to the
+        turn that set them — and it does nothing at all until a real state
+        event has proven whether the link is up.
+        """
+        try:
+            if getattr(self, '_link_live', None) is None:
+                return
+            current = str(getattr(self.hud, 'state', '') or '').upper()
+            if current not in self._LINK_RESTING_STATES:
+                return
+            cmd = getattr(self, '_command_window', None)
+            if cmd is not None:
+                try:
+                    if cmd.is_busy():
+                        return
+                except Exception:
+                    pass
+            wanted = self._idle_state()
+            if wanted != current:
+                self._apply_state(wanted)
+        except Exception:
+            pass
+
     def _apply_state(self,state):
         state_u = str(state).upper()
         previous = getattr(self.hud, 'state', '')
+        self._note_link_state(state_u)
+        self._ensure_state_reconciler()
         self.hud.state=state; self.hud.speaking=(state_u=='SPEAKING'); self.hud.update(); self._statusbar.setText(f'{state_u}  ·  F4 MUTE  ·  F11 FULLSCREEN  ·  ESC INTERRUPT'); self._status.setText(f'VOICE LINK · {state_u}')
         try:
             if getattr(self, '_header_logo', None) is not None and hasattr(self._header_logo, 'set_state'):
@@ -22734,6 +24826,28 @@ class MainWindow(QMainWindow):
         with self._doing_state_lock:
             self._doing_state.pop(category, None)
         self._clear_doing_sig.emit(category)
+
+    def coding_activity(self, kind: str, payload: dict | None = None) -> None:
+        """Thread-safe: forward one REAL coding progress event to the chat.
+
+        Called from the coding worker threads (dev agent / code helper). The
+        signal carries it onto the GUI thread where the live coding card is
+        updated; with no chat panel the event is simply dropped.
+        """
+        try:
+            self._coding_preview_sig.emit(str(kind or ''), dict(payload or {}))
+        except Exception:
+            pass
+
+    def _apply_coding_preview(self, kind: str, payload: dict) -> None:
+        """GUI-thread handler: route a coding event to the command window."""
+        try:
+            win = getattr(self, '_command_window', None)
+            handler = getattr(win, 'apply_coding_preview', None)
+            if callable(handler):
+                handler(str(kind or ''), dict(payload or {}))
+        except Exception:
+            pass
 
     def set_laya_status(self, state: str, role: str = '') -> None:
         """Thread-safe: update the Laya runtime-status line in ACTIVITY.
@@ -22831,32 +24945,50 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def show_content(self,title,text):
-        raw_title = str(title or 'CONTENT').strip() or 'CONTENT'
-        raw_text = str(text or '')
+    def show_content(self, title, text):
+        """Deliver research/Markdown output in the chat with Copy and Expand controls.
+
+        The standalone Content Surface remains available from its own panel action,
+        but a response produced for the user is kept in the conversation instead of
+        stealing focus by opening a separate Markdown window.
+        """
+        raw_title = str(title or 'RESEARCH').strip() or 'RESEARCH'
+        raw_text = str(text or '').strip()
+        if not raw_text:
+            raw_text = '(No content was returned.)'
+
+        try:
+            win = self._ensure_command_window_for_inline_view()
+        except Exception:
+            win = self._live_command_window() if hasattr(self, '_live_command_window') else None
+        if win is not None and getattr(win, 'chat', None) is not None:
+            try:
+                win.show()
+                win.raise_()
+                win.activateWindow()
+            except Exception:
+                pass
+            try:
+                win.chat.append_markdown_card(raw_title, raw_text)
+                try:
+                    win.record_message('assistant', f'# {raw_title}\n\n{raw_text}')
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                try:
+                    self.write_log(f'WARN: Chat Markdown delivery failed; using Content Surface ({exc})')
+                except Exception:
+                    pass
+
+        # Safe fallback when the live chat is not available in this build.
         self._content_title.setText(raw_title.upper()[:96])
         try:
             self._content_text.set_markdown(raw_text)
         except Exception:
             self._content_text.setPlainText(raw_text)
-
-        # Content Surface owns its media. Do not route search-result images through
-        # show_image_url()/show_image_view(), because that legacy path opens the
-        # Chat Panel. A per-request token also prevents a slow old download from
-        # appearing over a newer search result.
-        self._content_image_request_id = int(getattr(self, '_content_image_request_id', 0)) + 1
-        request_id = self._content_image_request_id
-        image = getattr(self, '_content_image', None)
-        if image is not None:
-            image.clear()
-            image.hide()
-
         self._set_panel_visible(self._content_panel, True)
         self._fit_content_panel_to_screen()
-
-        urls = self._extract_image_urls(raw_text)
-        if urls:
-            self._load_content_image(urls[0], request_id)
 
     def _fit_content_panel_to_screen(self) -> None:
         """Keep the content surface fully inside the active screen work area."""
@@ -23154,7 +25286,9 @@ class MainWindow(QMainWindow):
         if self._muted and not bool(getattr(self, '_features', {}).get('mic_access', True)):
             self.write_log('SYS: Microphone access is revoked in Settings → Permissions.')
             return
-        self._muted=not self._muted; self.hud.muted=self._muted; self._apply_state('MUTED' if self._muted else 'LISTENING'); self.write_log('SYS: Microphone muted.' if self._muted else 'SYS: Microphone active.')
+        # Unmuting restores the TRUTHFUL resting state, not a blanket
+        # 'LISTENING': with no Live link up, the reactor says IDLE.
+        self._muted=not self._muted; self.hud.muted=self._muted; self._apply_state('MUTED' if self._muted else self._idle_state()); self.write_log('SYS: Microphone muted.' if self._muted else 'SYS: Microphone active.')
 
     def _toggle_push_to_talk(self):
         self._voice_input_enabled = not self._voice_input_enabled
@@ -23163,7 +25297,8 @@ class MainWindow(QMainWindow):
             if self._voice_input_enabled
             else 'SYS: Push-to-talk microphone paused.'
         )
-        self._apply_state('LISTENING' if self._voice_input_enabled else 'MUTED')
+        self._apply_state(self._idle_state() if self._voice_input_enabled
+                          else 'MUTED')
 
     @property
     def voice_input_enabled(self):
@@ -23221,6 +25356,12 @@ class MainWindow(QMainWindow):
 
     def _do_start_camera_stream(self):
         if not bool(getattr(self, '_features', {}).get('camera_access', True)):
+            view = self._vision_view()
+            if view is not None:
+                view.show_camera_error(
+                    'CAMERA ACCESS IS DISABLED',
+                    'Enable camera access in JARVIS Settings → Permissions and Windows Privacy Settings.'
+                )
             self.write_log('SYS: Camera access is revoked in Settings → Permissions.')
             return
         thread = getattr(self, '_cam_thread', None)
@@ -23400,6 +25541,7 @@ class MainWindow(QMainWindow):
 
     def _cam_stream_direct(self, stop_evt) -> None:
         """Legacy direct capture, used only when the shared manager is off."""
+        cap = None
         try:
             import cv2
             try:
@@ -23410,14 +25552,37 @@ class MainWindow(QMainWindow):
             if not cap.isOpened() and _cfg_idx != 0:
                 cap.release()
                 cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                view = self._vision_view()
+                if view is not None:
+                    # Capture workers must never call QWidget methods directly.
+                    self.run_on_ui(lambda v=view: v.show_camera_error(
+                        'CAMERA OFF OR UNAVAILABLE',
+                        'Your camera could not be opened. Turn it on, check permissions, and close apps using it.'
+                    ))
+                self.write_log('WARN: Camera — no camera device could be opened.')
+                return
             while not stop_evt.wait(0.033) and cap.isOpened():
                 ok, frame = cap.read()
                 if ok:
                     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
                     self._deliver_cam_frame(buf.tobytes())
             cap.release()
-        except Exception as e: self.write_log(f'ERR: Camera — {e}')
-        finally: self._emit_cam_stream_state(False)
+        except Exception as e:
+            view = self._vision_view()
+            if view is not None:
+                view.show_camera_error(
+                    'CAMERA START FAILED',
+                    'Check camera permissions and make sure another app is not using it.'
+                )
+            self.write_log(f'ERR: Camera — {e}')
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            self._emit_cam_stream_state(False)
 
     def stop_camera_stream(self):
         self.run_on_ui(self._do_stop_camera_stream)
@@ -23859,7 +26024,7 @@ class MainWindow(QMainWindow):
             if pane is not None and hasattr(pane, 'show_report_details'):
                 pane.show_report_details(text or f"# Task report\n\nNo report is available for task `{task_id}` yet.")
                 panel = getattr(self, '_tasks_panel', None)
-                if panel is not None and not bool(panel.property('_task_user_resized')):
+                if panel is not None:
                     QTimer.singleShot(0, lambda p=panel: self._fit_panel_to_contents(p))
                 return
             self.write_log(f"WARN: Task report pane is unavailable for {task_id}.")
@@ -23949,14 +26114,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
+            self._queue_task_panel_fit()
+        except Exception:
+            pass
+        try:
             event = str((payload or {}).get('event') or '')
             panel = getattr(self, '_tasks_panel', None)
             if event in ('task_started', 'step_started', 'questions_waiting') \
                     and self._task_auto_open_enabled():
                 if panel is not None and not panel.isVisible():
                     self._set_panel_visible(panel, True)
-            if event in ('task_completed', 'task_failed', 'task_cancelled') \
-                    and panel is not None and not bool(panel.property('_task_user_resized')):
+            if event in ('task_completed', 'task_failed', 'task_cancelled') and panel is not None:
                 QTimer.singleShot(0, lambda p=panel: self._fit_panel_to_contents(p))
         except Exception:
             pass
@@ -23968,6 +26136,12 @@ class MainWindow(QMainWindow):
                 pane.show_question(dict(snapshot or {}))
             except Exception:
                 pass
+        # Question cards change the preferred height; fit after Qt has activated
+        # the new layout rather than resizing synchronously inside a signal.
+        try:
+            self._queue_task_panel_fit()
+        except Exception:
+            pass
         # A waiting question needs its answer surface on screen.
         try:
             if str((snapshot or {}).get('state') or '') in ('ASKING', 'SUMMARY'):
@@ -24161,6 +26335,16 @@ class MainWindow(QMainWindow):
         e.acceptProposedAction()
 
     def closeEvent(self,e):
+        # Native window close, Alt+F4 and the visible close buttons all use the
+        # same cinematic outro. Ignore the first close event until the outro is
+        # complete, then the final close runs the ordinary teardown below.
+        if not bool(getattr(self, '_shutdown_finalize_started', False)):
+            try:
+                e.ignore()
+            except Exception:
+                pass
+            self._begin_shutdown_outro()
+            return
         try:
             getattr(self, '_boot_unsubscribe', lambda: None)()
         except Exception:
@@ -24209,6 +26393,7 @@ def _panel_design_css():
     QFrame#JarvisPanel_web, QFrame#JarvisPanel_task, QFrame#JarvisPanel_world,
     QFrame#JarvisPanel_memory, QFrame#JarvisPanel_tools, QFrame#JarvisPanel_window,
     QFrame#JarvisPanel_image, QFrame#JarvisPanel_activity, QFrame#JarvisPanel_content,
+    QFrame#JarvisPanel_tasks,
     QFrame#PanelContent {{
         background: transparent;
         border: none;
@@ -24363,14 +26548,31 @@ def _new_panel_header(self, parent, icon='✦', close_cb=None, title='', subtitl
         row.addWidget(copy, 1, Qt.AlignmentFlag.AlignVCenter)
     else:
         row.addStretch(1)
+    minimize = QPushButton('−', bar)
+    minimize.setObjectName('minimizePanelButton')
+    minimize.setFixedSize(24,24)
+    minimize.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    minimize.setCursor(Qt.CursorShape.PointingHandCursor)
+    minimize.setToolTip('Minimize panel to its header')
+    minimize.setStyleSheet(
+        f'QPushButton {{ background:transparent; color:{C.TEXT_MED}; border:none; padding:0; font:700 13pt "Segoe UI Symbol"; }}'
+        f'QPushButton:hover {{ background:rgba(0,72,98,90); color:{C.PRI}; border:none; border-radius:5px; }}'
+    )
+    minimize.clicked.connect(
+        lambda _=False, p=parent, b=minimize, h=bar:
+            self._toggle_floating_panel_minimized(
+                p, b, keep_visible=(h,),
+                collapsed_height=max(38, h.height() + 18))
+    )
+    row.addWidget(minimize, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
     x = QPushButton('×', bar)
     x.setFixedSize(24,24)
     x.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     x.setCursor(Qt.CursorShape.PointingHandCursor)
-    x.setToolTip('Close')
+    x.setToolTip('Close panel')
     x.setStyleSheet(
         f'QPushButton {{ background:transparent; color:{C.TEXT_MED}; border:none; padding:0; font:700 13pt "Segoe UI Symbol"; }}'
-        f'QPushButton:hover {{ background:transparent; color:{C.RED}; border:none; }}'
+        f'QPushButton:hover {{ background:rgba(60,8,16,100); color:{C.RED}; border:none; border-radius:5px; }}'
     )
     if close_cb: x.clicked.connect(close_cb)
     row.addWidget(x, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
@@ -24422,55 +26624,37 @@ def _new_quick_panel(self):
 
 def _new_floating_panel(self, widget, kind):
     if str(kind) == 'tasks':
-        # A standalone checklist surface: no HUD WINDOW title, branding, or
-        # decorative icon. The only chrome is the close button in the corner.
-        f = _TaskGlassPanel(None)
-        f.setObjectName('TeardownChecklistWindow')
+        # Task progress uses the exact same shell, backdrop and standard panel
+        # header as Activity. Only the inner TaskProgressPane owns task layout.
+        f = self._panel_base()
+        f.setObjectName('JarvisPanel_tasks')
         f.setProperty('_jarvis_panel_kind', 'tasks')
         f.setProperty('_jarvis_panel_key', 'tasks')
-        f.setMinimumSize(350, 365)
+        f.setMinimumSize(380, 365)
         f.resize(455, 590)
-        layout = QVBoxLayout(f)
-        layout.setContentsMargins(14, 6, 14, 12)
-        layout.setSpacing(5)
 
-        rail = QFrame(f)
-        rail.setObjectName('TeardownChecklistCloseRail')
-        rail.setFixedHeight(27)
-        rail.setStyleSheet('QFrame#TeardownChecklistCloseRail{background:transparent;border:none;}')
-        rail_layout = QHBoxLayout(rail)
-        rail_layout.setContentsMargins(0, 0, 0, 0)
-        rail_layout.setSpacing(0)
-        rail_layout.addStretch(1)
-        close_btn = QPushButton('×', rail)
-        close_btn.setObjectName('closeTeardownChecklist')
-        close_btn.setFixedSize(25, 25)
-        close_btn.setToolTip('Close checklist')
-        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(
-            'QPushButton{color:#456B8B;background:rgba(199,225,247,175);'
-            'border:1px solid #A8CBEA;border-radius:8px;font:500 15pt "Segoe UI";padding:0;}'
-            'QPushButton:hover{color:#183F62;background:#EAF5FF;border:1px solid #6EA8DA;}'
-            'QPushButton:pressed{color:#143B5F;background:#BCDDF7;border:1px solid #6EA8DA;}'
-            'QPushButton:disabled{color:#9BAFC1;background:rgba(216,231,244,120);border-color:#C7DDED;}'
+        layout = QVBoxLayout(f)
+        layout.setContentsMargins(5, 4, 5, 5)
+        layout.setSpacing(4)
+        self._panel_header(
+            f, '≋', lambda: self._set_panel_visible(f, False),
+            'TASK PROGRESS', 'LIVE EXECUTION CHECKLIST'
         )
-        close_btn.clicked.connect(lambda: self._set_panel_visible(f, False))
-        rail_layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        rail.setProperty('_jarvis_panel_drag', True)
-        rail.installEventFilter(self)
-        rail.setCursor(Qt.CursorShape.SizeAllCursor)
-        layout.addWidget(rail, 0)
 
         content = QFrame(f)
-        content.setObjectName('TeardownChecklistContent')
-        content.setStyleSheet('QFrame#TeardownChecklistContent{background:transparent;border:none;}')
+        content.setObjectName('PanelContent')
+        content.setStyleSheet(
+            'QFrame#PanelContent{background:transparent;border:none;border-radius:0;}'
+        )
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
+        content_layout.setContentsMargins(2, 2, 2, 2)
+        content_layout.setSpacing(4)
         content_layout.addWidget(widget, 1)
         layout.addWidget(content, 1)
+
         self._install_panel_drag_surface(f)
+        # Let Qt calculate the true pane size after its first layout pass.
+        QTimer.singleShot(0, lambda p=f: self._fit_panel_to_contents(p))
         return f
 
     names = {
@@ -24604,6 +26788,78 @@ def _new_content_panel(self):
     return f
 
 
+def _toggle_floating_panel_minimized(self, panel, button, *, keep_visible=(), collapsed_height=42):
+    """Collapse a floating panel to its header, or restore its prior geometry.
+
+    The panel widget and its live content stay allocated, so task timers,
+    streams and registry state continue unchanged. Only visible direct-child
+    content is tucked away; restoring reuses the exact saved size and position.
+    """
+    if panel is None or button is None:
+        return
+    state = getattr(panel, '_jarvis_minimize_state', None)
+    if state is not None:
+        try:
+            panel.setMinimumSize(state['minimum_size'])
+            panel.setMaximumSize(state['maximum_size'])
+            panel.setGeometry(state['geometry'])
+            for child, was_visible in state['children']:
+                try:
+                    child.setVisible(bool(was_visible))
+                except RuntimeError:
+                    pass
+            panel._jarvis_minimize_state = None
+            button.setText('−')
+            button.setToolTip('Minimize panel to its header')
+            panel.update()
+        except Exception:
+            pass
+        return
+
+    try:
+        geometry = panel.geometry()
+        visible_children = []
+        keep = set(keep_visible or ())
+        for child in panel.children():
+            if not isinstance(child, QWidget) or child in keep or child is button:
+                continue
+            visible = bool(child.isVisible())
+            visible_children.append((child, visible))
+            if visible:
+                child.hide()
+        panel._jarvis_minimize_state = {
+            'geometry': geometry,
+            'minimum_size': panel.minimumSize(),
+            'maximum_size': panel.maximumSize(),
+            'children': visible_children,
+        }
+        layout = panel.layout()
+        required_height = 0
+        if layout is not None:
+            margins = layout.contentsMargins()
+            required_height += int(margins.top() + margins.bottom())
+            required_height += max(0, int(layout.spacing()))
+        for kept in keep:
+            try:
+                if isinstance(kept, QWidget):
+                    required_height += max(0, int(kept.height()))
+            except RuntimeError:
+                pass
+        compact = max(30, int(collapsed_height), required_height)
+        panel.setMinimumHeight(compact)
+        panel.setMaximumHeight(compact)
+        panel.resize(geometry.width(), compact)
+        button.setText('□')
+        button.setToolTip('Restore panel')
+        panel.update()
+    except Exception:
+        try:
+            self.write_log('WARN: Could not minimize this panel.')
+        except Exception:
+            pass
+
+
+MainWindow._toggle_floating_panel_minimized = _toggle_floating_panel_minimized
 MainWindow._panel_base = _new_panel_base
 MainWindow._panel_header = _new_panel_header
 MainWindow._build_quick_panel = _new_quick_panel
@@ -24916,6 +27172,9 @@ class JarvisUI:
     def write_log(self,text): self._post(self._win._log_sig.emit, text)
     def set_chat_activity(self, activity: str): self._post(self._win._chat_activity_sig.emit, str(activity or ''))
     def clear_chat_activity(self): self._post(self._win._chat_activity_sig.emit, '')
+    def coding_activity(self, kind: str, payload: dict | None = None):
+        """Live coding progress → the chat's coding card (any thread)."""
+        self._post(self._win._coding_preview_sig.emit, str(kind or ''), dict(payload or {}))
     def turn_finished(self): self._post(self._win.turn_finished)
     def set_live_transcript(self, text: str, final: bool = False): self._post(self._win._live_transcript_sig.emit, str(text or ''), bool(final))
     def submit_chat_turn(self, role: str, text: str): self._post(self._win.submit_chat_turn, str(role or ''), str(text or ''))

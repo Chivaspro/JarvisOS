@@ -78,6 +78,7 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     "system_settings": True,        # Wi-Fi, volume, brightness, theme, metrics
     "window_control": True,         # minimize/maximize/tile/snap/multi-monitor
     "clipboard_sentry": True,       # writing to and analysing the clipboard
+    "file_control": True,           # list/find/copy/move/zip and Recycle-Bin deletes
     "document_architect": True,     # writing Word/Excel/PowerPoint/PDF deliverables
     "auto_approve_coding": False,   # when on, coding tasks skip the chatlog approve/decline prompt
     "laya_ai": True,                # local Laya decision AI classifies + routes tasks (falls back safely when the model is absent)
@@ -111,6 +112,13 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     # played sentence by sentence instead of downloading the whole reply first.
     # OFF restores the previous whole-reply fetch.
     "tts_streaming": True,
+    # Realtime speech: the reply is spoken WHILE the model is still writing it.
+    # Text goes to the voice engine as it arrives (Fish Audio over its realtime
+    # WebSocket session, every other engine sentence by sentence) and the reply
+    # text streams onto the screen at the same time. OFF (with streaming TTS
+    # also off) restores the synchronized final-response behaviour: the complete
+    # reply is published together with its audio.
+    "tts_realtime": True,
     # ── Self-evolution (the Skill Crucible) ─────────────────────────────────
     # J.A.R.V.I.S. may write a brand-new tool for himself when a request has no
     # built-in answer. Every candidate is AST-checked, dependency-resolved and
@@ -120,6 +128,13 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     # needs? OFF turns that stage into a plain check, so a missing package is
     # reported instead of installed.
     "self_evolution_auto_install_deps": True,
+    # ── Reverse engineering (capture -> evidence -> clean remake) ───────────
+    # Capturing a site or app the user owns or is authorized to examine, then
+    # synthesizing a clean reproduction from that evidence (or copying an app
+    # folder's own sources into a readable tree). Every run additionally
+    # requires the tool's own authorization argument; this switch revokes the
+    # whole relationship.
+    "reverse_engineer": True,
     # ── Proactive Auto-Heal ─────────────────────────────────────────────────
     # Background sentry that turns a runtime traceback into a reviewed patch.
     "self_heal": True,
@@ -139,6 +154,23 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     # account, behind one tool. Its own switch on purpose — "connect" above is
     # the phone-pairing gateway, and one flag must not govern two relationships.
     "external_apps": True,          # external apps through the Composio connector
+    # ── Knowledge, meetings and first-party service links ───────────────────
+    # The local document library: extraction and the FTS5 index stay on this
+    # machine. It is on by default because it is inert until the user points it
+    # at a file or folder.
+    "library": True,
+    # Meeting notes records system audio and the microphone. That is a
+    # relationship with everyone in the room, not a convenience toggle, so it
+    # starts OFF and every start is confirmed on the HUD.
+    "meeting_notes": False,
+    # faster-whisper model size. "base" is the honest CPU default: usable
+    # accuracy without a half-gigabyte download.
+    "meeting_notes_model": "base",
+    # Native Home Assistant and read-only GitHub. Both are inert until their
+    # URL/token is configured, and each has its own switch so revoking one
+    # cannot silently leave the other acting.
+    "home_assistant": True,
+    "github": True,
     # ── MCP host ────────────────────────────────────────────────────────────
     # The universal Model Context Protocol server manager (Settings ▸ MCP).
     # OFF leaves every configured server unstarted and the ``mcp`` tool closed;
@@ -174,6 +206,10 @@ SECRET_FIELD_NAMES = {
     "spotify_access_token", "spotify_refresh_token", "weather_api_key",
     "radar_api_key", "instagram_password", "instagram_session",
     "smart_home_password", "smart_home_token", "connect_pairing_secret",
+    # First-party service links added with the knowledge/meeting wave. The
+    # suffix rule already catches ``*_token``; naming them here keeps the
+    # redaction boundary explicit for anyone reading the set.
+    "github_token", "home_assistant_token",
     # The connector's project key. Added the same day the connector was: a key
     # that is read but not listed here is the one that ends up in a log line.
     "composio_api_key",
@@ -223,6 +259,24 @@ def _read_api_keys() -> dict:
         _cache["mtime"] = key
         _cache["data"] = data
     return data
+
+
+def clear_cache() -> None:
+    """Drop the parsed api_keys.json cache.
+
+    :func:`set_feature` / :func:`set_value` already write through the guarded
+    path (whose atomic replace changes the file's mtime, which is what the
+    cache is keyed on), so this exists for the two cases mtime cannot cover:
+    a platform with coarse timestamp resolution writing twice inside one tick,
+    and every caller that just changed a setting and needs the very next
+    ``get_feature`` to see it. Cheap, idempotent and never raises.
+    """
+    try:
+        with _cache_lock:
+            _cache["mtime"] = None
+            _cache["data"] = None
+    except Exception:
+        pass
 
 
 def get(key: str, default: Any = None) -> Any:
@@ -310,6 +364,9 @@ def set_feature(name: str, value: Any) -> bool:
         feats[name] = value
         data["features"] = feats
         ok, _msg = _guard.guard_write(data, tag=f"feature:{name}", path=API_KEYS_FILE)
+        # The running process must see the switch it just threw, not the
+        # previous parse: every reader goes through this one cache.
+        clear_cache()
         return bool(ok)
     except Exception:
         return False
@@ -332,6 +389,7 @@ def set_value(name: str, value: Any) -> bool:
         data[name] = value
         ok, _msg = _guard.guard_write(data, tag=f"setting:{name}",
                                       path=API_KEYS_FILE)
+        clear_cache()
         return bool(ok)
     except Exception:
         return False

@@ -323,6 +323,14 @@ is dropped (and reported) if a server rejects the field.
   between Gemini native audio, cloud TTS (Fish Audio, ElevenLabs, Edge),
   bundled Piper/ONNX and OS SAPI, all configured in `config/voice_config.json`.
   `features.tts_streaming` renders cloud voices sentence by sentence.
+* **Realtime replies** — `voice/speech_stream.py` is the live speech sink: reply
+  text is fed to the voice engine AS IT ARRIVES (Fish Audio over its realtime
+  WebSocket session, every other engine sentence by sentence) while the same
+  text streams onto the screen, so J.A.R.V.I.S. starts speaking before the
+  answer is finished. `features.tts_realtime` (default on) controls it; both it
+  and `tts_streaming` off restore the synchronized whole-reply behaviour.
+  Every turn's measured timeline lands in `data/logs/turn_timeline.log`
+  (`python -m voice.turn_timeline --report`). See `docs/REALTIME_STREAMING.md`.
 * **Devices & level meter** — `voice/audio_devices.py`, `core/sys_metrics.py`
   and `core/audio_reactive.py` feed the HUD waveform and the speech-reactive
   logo from one shared energy signal. The mic-level callback is on the audio
@@ -388,13 +396,21 @@ alive across restarts, models and reconnects.
 store (`qdrant_store.py`) when `features.qdrant_knowledge` is on. Backend
 failure degrades to local search with one honest notice.
 
+`knowledge/library.py` is the **local document library** (`library` tool and
+switch): conversion with MarkItDown when installed (PDF/Office) or the standard
+library otherwise (text/Markdown/HTML/CSV/JSON/…), heading-aware chunking, an
+SQLite FTS5 index at `data/library/library.db` and cited snippets. Ingestion
+also requires the file-control switch, refuses credential-shaped paths
+(`.env`, `.ssh`, AppData, its own index, meeting audio) by name, and never
+modifies or deletes a source file.
+
 ---
 
 ## 10. Tools & the dispatch path
 
-The model's entire surface is `TOOL_DECLARATIONS` in `main.py`: 58 declarations
+The model's entire surface is `TOOL_DECLARATIONS` in `main.py`: 65 declarations
 inline plus the `mcp` and `connector` declarations appended when their modules
-import — about 60 built-ins in a full install. Multi-action work is grouped into
+import — about 70 built-ins in a full install. Multi-action work is grouped into
 single tools with an `action` enum (`pc_control`, `visual_control`,
 `browser_action`) to keep the Live schema small; `capabilities/registry.py`
 validates every action and parameter before a controller is touched.
@@ -432,17 +448,19 @@ irreversible actions keep their existing approval/confirmation-token gates. See
 `docs/tasks-and-questions.md`.
 
 Built-in groups, roughly: conversation & brain (`brain_*`, `task_plan`,
-`control_plan`), web & research (`web_search`, `web_research`, `youtube_video`,
+`control_plan`, `smart_decide`), web & research (`web_search`, `web_research`, `youtube_video`,
 `weather_report`), media generation (`generate_image`, `image_research`),
 files & deliverables (`file_controller`, `file_processor`, `documents`),
 system (`system_status`, `system_control`, `power_control`, `window_control`,
 `manage_monitor`, `clipboard_sentry`), control (`computer_control`,
-`browser_control`, `pc_control`, `browser_action`, `visual_control`), vision
+`browser_control`, `pc_control`, `browser_action`, `visual_control`,
+`reverse_engineer`), vision
 (`vision_look`, `live_vision`, `detect_objects`, `detect_gesture`,
 `recognize_faces`, `what_am_i_holding`, `close_camera`), memory & identity
 (`save_memory`, `recall_memory`, `brain_remember`, `brain_forget`,
 `identity_profile`), services (`play_music`, `smart_home`, `instagram`,
-`connector`, `mcp`, `service_hub`, `connect_devices`), self-management
+`home_assistant`, `github`, `library`, `meeting_notes`, `connector`, `mcp`,
+`service_hub`, `connect_devices`), self-management
 (`diagnostics`, `performance_scan`, `self_repair`, `skill_forge`, `skill_query`,
 `voice_settings`, `shutdown_jarvis`, `undo`).
 
@@ -458,9 +476,14 @@ capabilities/router.py
    │                                      whole-task PC + browser automation
    ├── Agent Reach                        web_research — internet research channels
    ├── browser_pw.py    Playwright        browser_action — role/label/text/CSS, no coordinates
+   ├── reverse_engineer.py  Playwright + synthesis chain
+   │                                      reverse_engineer — capture → API surface → clean remake / reconstruct
    ├── windows_ext.py   pywinauto         pc_control — apps + native window controls
    ├── uitars.py        UI-TARS prompt    visual_control — grounding on the Gemini key
    ├── desktop.py       PyAutoGUI         physical mouse/keyboard, executor of grounded clicks
+   ├── home_assistant.py  REST            home_assistant — fixed safe-domain vocabulary
+   ├── github.py          REST (GET only) github — read-only repo/issue/PR/CI intelligence
+   ├── meeting_notes.py   local audio     meeting_notes — capture + local transcription
    └── power/proc/processes/clipboard/smart_home/media/instagram/sysctl/geospatial
 ```
 
@@ -481,6 +504,16 @@ Agent TARS is the single PC/browser executor behind `computer_control` and
 `browser_control`; UI-TARS has **no API key of its own** — it runs on the same
 Gemini configuration as everything else. See `docs/pc_web_control.md` for the
 action list and switches.
+
+The native service links ride the same registry/router path with their own
+rules: `home_assistant.py` accepts only lights, switches, fans, input booleans,
+scenes and scripts (locks, alarms, cameras and covers are refused by name;
+there is no arbitrary service call; every command is read back before success
+is reported) and `github.py` has exactly one HTTP entry point that can only
+issue GETs. `meeting_notes.py` records system audio + microphone locally,
+transcribes locally with faster-whisper, and its `start`/`delete` actions are
+declared `gate="confirm"` in the registry so the router always parks them
+behind the HUD token; Home Assistant `run_script` is gated the same way.
 
 ---
 

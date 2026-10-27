@@ -477,6 +477,136 @@ class _SettingsRoot(QFrame):
             backdrop.lower()
 
 
+_RAIL_GROUPS = (
+    ("START", ("QUICK SETUP", "GENERAL")),
+    ("AI & VOICE", ("AI", "VOICE", "PERSONALITY", "API", "MEMORY", "OBSIDIAN VAULT")),
+    ("CONTROL", ("AUTOMATION", "PERMISSIONS", "MCP", "PLUGINS", "WEB", "SYSTEM")),
+    ("APPEARANCE", ("LAYOUT", "3D", "VIDEO", "IMAGE")),
+    ("HEALTH & TOOLS", ("STATUS", "PERFORMANCE", "DIAG", "J.OPTIMIZER", "EVOLUTION")),
+)
+_RAIL_GLYPHS = {
+    "QUICK SETUP": "⚡", "GENERAL": "⚙", "AI": "✦", "VOICE": "♫", "PERSONALITY": "☺",
+    "API": "⚿", "MEMORY": "◎", "OBSIDIAN VAULT": "◆", "AUTOMATION": "↻",
+    "PERMISSIONS": "⛨", "MCP": "⌘", "PLUGINS": "✚", "WEB": "◍", "SYSTEM": "▣",
+    "LAYOUT": "▦", "3D": "⬡", "VIDEO": "▶", "IMAGE": "▨", "STATUS": "●",
+    "PERFORMANCE": "▲", "DIAG": "✚", "J.OPTIMIZER": "⚡", "EVOLUTION": "∞",
+}
+
+
+class SettingsRail(QFrame):
+    """Grouped, collapsible navigation that drives the QTabWidget pages.
+
+    The tab widget keeps every page and every index (so search, jump-to and
+    every ``tabs.setCurrentIndex`` call still work); only its cramped 23-row
+    tab bar is replaced by this categorised rail.
+    """
+
+    tabSelected = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SettingsRail")
+        self.setFixedWidth(206)
+        self._buttons: dict[int, QPushButton] = {}
+        self._group_of: dict[int, int] = {}
+        self._groups: list[tuple[QPushButton, list[QPushButton], str]] = []
+        self._ids = QButtonGroup(self)
+        self._ids.setExclusive(True)
+        self._ids.idClicked.connect(self.tabSelected.emit)
+
+        self.setStyleSheet(
+            f"QFrame#SettingsRail {{ background:{_rgba(SURFACE, 150)};"
+            f" border:1px solid {BORDER_FAINT}; border-radius:{RADIUS_LG}px; }}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 6, 4, 6)
+        outer.setSpacing(0)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setStyleSheet("QScrollArea { background: transparent; border: none; }"
+                           " QScrollArea > QWidget > QWidget { background: transparent; }")
+        area.viewport().setStyleSheet("background: transparent;")
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        self._lay = QVBoxLayout(inner)
+        self._lay.setContentsMargins(4, 2, 4, 6)
+        self._lay.setSpacing(3)
+        area.setWidget(inner)
+        outer.addWidget(area, 1)
+
+    def _item_css(self) -> str:
+        return (
+            "QPushButton { text-align:left; padding:0px 12px; border:1px solid transparent;"
+            f" border-radius:{RADIUS_MD}px; background:transparent; color:{TEXT_MID};"
+            f" font:700 8.5pt {FONT_SMALL}; min-height:34px; max-height:34px; }}"
+            f"QPushButton:hover {{ background:{_rgba(ACCENT, 30)}; color:{TEXT_BRIGHT}; }}"
+            f"QPushButton:checked {{ background:{_rgba(ACCENT, 72)}; border:1px solid {ACCENT};"
+            f" color:{TEXT_BRIGHT}; }}")
+
+    def _head_css(self) -> str:
+        return (
+            "QPushButton { text-align:left; padding:0px 8px; border:none; background:transparent;"
+            f" color:{TEXT_FAINT}; font:800 7pt {FONT_SMALL}; letter-spacing:2px;"
+            " min-height:24px; max-height:24px; }"
+            f"QPushButton:hover {{ color:{ACCENT_TEXT}; }}")
+
+    def populate(self, names) -> None:
+        names = [str(n or "") for n in names]
+        first_index: dict[str, int] = {}
+        for i, n in enumerate(names):
+            first_index.setdefault(n.strip().upper(), i)
+        placed: set[int] = set()
+        groups = [(title, [first_index[m] for m in members if m in first_index])
+                  for title, members in _RAIL_GROUPS]
+        for title, idxs in groups:
+            placed.update(idxs)
+        leftovers = [i for i, n in enumerate(names) if i not in placed
+                     and first_index.get(n.strip().upper()) == i]
+        if leftovers:
+            groups.append(("MORE", leftovers))
+        item_css, head_css = self._item_css(), self._head_css()
+        for gi, (title, idxs) in enumerate(groups):
+            if not idxs:
+                continue
+            head = QPushButton(f"▾  {title}")
+            head.setCursor(Qt.CursorShape.PointingHandCursor)
+            head.setStyleSheet(head_css)
+            self._lay.addSpacing(6 if self._groups else 0)
+            self._lay.addWidget(head)
+            members: list[QPushButton] = []
+            for i in idxs:
+                label = names[i].strip()
+                btn = QPushButton(f"{_RAIL_GLYPHS.get(label.upper(), '•')}   {label}")
+                btn.setCheckable(True)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setStyleSheet(item_css)
+                self._ids.addButton(btn, i)
+                self._lay.addWidget(btn)
+                self._buttons[i] = btn
+                self._group_of[i] = len(self._groups)
+                members.append(btn)
+            self._groups.append((head, members, title))
+            head.clicked.connect(lambda _c=False, g=len(self._groups) - 1: self._toggle_group(g))
+        self._lay.addStretch(1)
+
+    def _toggle_group(self, g: int, expand: bool | None = None) -> None:
+        head, members, title = self._groups[g]
+        show = (not members[0].isVisible()) if expand is None else bool(expand)
+        for b in members:
+            b.setVisible(show)
+        head.setText(f"{'▾' if show else '▸'}  {title}")
+
+    def set_current(self, index: int) -> None:
+        btn = self._buttons.get(int(index))
+        if btn is None:
+            return
+        g = self._group_of.get(int(index))
+        if g is not None and not btn.isVisible():
+            self._toggle_group(g, True)
+        btn.setChecked(True)
+
+
 class SettingsWindow(QDialog):
     """Full-featured tabbed control center for J.A.R.V.I.S."""
 
@@ -1034,6 +1164,16 @@ class SettingsWindow(QDialog):
         self._build_mcp_tab()
         self._build_obsidian_tab()
         self._build_performance_tab()
+
+        # Categorised left rail replaces the 23-row native tab bar. The tab
+        # widget still owns every page and index, so nothing else changes.
+        self.tabs.tabBar().hide()
+        self._nav_rail = SettingsRail()
+        self._nav_rail.populate([self.tabs.tabText(i) for i in range(self.tabs.count())])
+        self._nav_rail.tabSelected.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self._nav_rail.set_current)
+        self._nav_rail.set_current(self.tabs.currentIndex())
+        tabs_row.insertWidget(0, self._nav_rail)
 
         # The hub's key timers live with the window, not with one tab: both
         # Quick Setup and the API tab feed the same rows and pills.
@@ -2071,8 +2211,11 @@ class SettingsWindow(QDialog):
             # saved values win — these three change behaviour the user can hear
             # within one reply, so they must be switchable without a restart.
             ("narrator", "Narrate actions out loud (say what is being done, as it is done)"),
-            ("realtime_low_latency", "Low-latency voice turns (end-of-speech detected locally)"),            ("tts_streaming",
+            ("realtime_low_latency", "Low-latency voice turns (end-of-speech detected locally)"),
+            ("tts_streaming",
              "Stream cloud voices sentence by sentence (Fish Audio / ElevenLabs)"),
+            ("tts_realtime",
+             "Speak and show the reply as it is written (realtime voice)"),
         ]:
             hv.addWidget(self._flag_checkbox(
                 self._voice_checks, key, label,
@@ -2108,6 +2251,15 @@ class SettingsWindow(QDialog):
              "interruption able to cut a cloud voice off mid-reply.\n"
              "If a provider rejects streaming, the previous whole-reply path is "
              "used automatically."),
+            ("tts_realtime",
+             "The reply text is sent to the voice engine AS IT IS WRITTEN and "
+             "appears on screen at the same time, so J.A.R.V.I.S. starts "
+             "speaking while the model is still producing the rest of the "
+             "answer. Fish Audio uses its realtime WebSocket session for this; "
+             "every other engine speaks sentence by sentence.\n"
+             "OFF, together with 'Stream cloud voices', restores the "
+             "synchronized behaviour: the complete reply is shown and spoken at "
+             "the same moment."),
         ):
             _cb = (self._voice_checks or {}).get(_k)
             if _cb is not None:
@@ -2253,6 +2405,14 @@ class SettingsWindow(QDialog):
             "Off = JARVIS refuses browser_action; Agent TARS web workflows are "
             "unaffected."))
         lv.addWidget(self._flag_checkbox(
+            self._perm_checks, "reverse_engineer",
+            "Allow reverse engineering (capture + clean remake)",
+            bool(feats.get("reverse_engineer", True)),
+            "Off = JARVIS refuses reverse_engineer entirely. Every capture, "
+            "remake and reconstruct additionally needs your explicit "
+            "confirmation that you own the software or are authorized to "
+            "examine it."))
+        lv.addWidget(self._flag_checkbox(
             self._perm_checks, "windows_automation",
             "Allow Windows application control (pywinauto)",
             bool(feats.get("windows_automation", True)),
@@ -2353,6 +2513,34 @@ class SettingsWindow(QDialog):
             "Allow smart home control (Kasa/Tapo devices on this network)",
             bool(feats.get("smart_home", True)),
             "Off = JARVIS will not list, switch or dim any smart device."))
+        linksv.addWidget(self._flag_checkbox(
+            self._perm_checks, "home_assistant",
+            "Allow Home Assistant (your own instance, over its REST API)",
+            bool(feats.get("home_assistant", True)),
+            "Off = JARVIS will not read or control any Home Assistant entity. "
+            "Locks, alarms, cameras and arbitrary service calls are refused "
+            "even when this is on."))
+        linksv.addWidget(self._flag_checkbox(
+            self._perm_checks, "github",
+            "Allow GitHub (read-only: notifications, issues, PRs, CI)",
+            bool(feats.get("github", True)),
+            "Off = JARVIS will not read any GitHub repository or notification. "
+            "This native link can only issue GET requests; writes stay with the "
+            "External apps connector."))
+        linksv.addWidget(self._flag_checkbox(
+            self._perm_checks, "library",
+            "Allow the knowledge library (index local documents)",
+            bool(feats.get("library", True)),
+            "Off = JARVIS will not index or search local documents. Ingesting a "
+            "file or folder also needs File control. Source files are never "
+            "deleted or modified."))
+        linksv.addWidget(self._flag_checkbox(
+            self._perm_checks, "meeting_notes",
+            "Allow meeting notes (record system audio and the microphone)",
+            bool(feats.get("meeting_notes", False)),
+            "Off by default. When on, every start still shows a confirmation on "
+            "the HUD. Audio stays on this machine; a requested summary sends the "
+            "transcript text to the active AI model."))
         linksv.addWidget(self._flag_checkbox(
             self._perm_checks, "instagram",
             "Allow Instagram (the user's own account via instagrapi)",
@@ -4682,62 +4870,225 @@ class SettingsWindow(QDialog):
     def _build_layout_tab(self):
         page, lay, scroll = self._scroll_tab()
         lay.setContentsMargins(15, 15, 15, 15)
-        lay.setSpacing(10)
+        lay.setSpacing(12)
 
-        intro = QLabel(
-            "LAYOUT STUDIO · a live visual editor for the running J.A.R.V.I.S. widget tree. "
-            "Choose a real panel, inspect its Explorer hierarchy, click widgets in the viewport, "
-            "edit Roblox-Studio-style Properties, or work directly in QSS/HTML/CSS."
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet(
-            f"background:{SURFACE_INSET};border:1px solid {BORDER_FAINT};"
-            f"border-radius:10px;padding:12px;color:{TEXT_MID};"
-        )
-        lay.addWidget(intro)
+        head = QLabel("LAYOUT  //  PANELS · BUTTONS · POSITION")
+        head.setStyleSheet(f'color:{ACCENT};font:800 9pt "Orbitron";padding:2px 2px 3px 2px;')
+        lay.addWidget(head)
 
-        studio = HudGroupBox("LAYOUT STUDIO")
+        # 1 ── panels & buttons: one click shows or hides each live surface ──
+        vis = HudGroupBox("PANELS & BUTTONS  ·  CLICK TO SHOW / HIDE")
+        vv = QVBoxLayout(vis)
+        vv.setContentsMargins(14, 20, 14, 14)
+        vv.setSpacing(8)
+        hint = QLabel("Lit = visible on screen right now. Click a chip to show or hide that panel instantly.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{TEXT_DIM};background:transparent;")
+        vv.addWidget(hint)
+        self._layout_chip_host = QWidget()
+        self._layout_chip_host.setStyleSheet("background:transparent;")
+        self._layout_chip_grid = QGridLayout(self._layout_chip_host)
+        self._layout_chip_grid.setContentsMargins(0, 0, 0, 0)
+        self._layout_chip_grid.setSpacing(8)
+        vv.addWidget(self._layout_chip_host)
+        lay.addWidget(vis)
+
+        # 2 ── position & size of any one panel / element ────────────────────
+        pos = HudGroupBox("POSITION & SIZE")
+        pv = QVBoxLayout(pos)
+        pv.setContentsMargins(14, 20, 14, 14)
+        pv.setSpacing(10)
+
+        pick = QHBoxLayout()
+        pick.setSpacing(8)
+        pick_lbl = QLabel("ELEMENT")
+        pick_lbl.setStyleSheet(f"color:{TEXT_DIM};font:700 7pt 'Exo 2';letter-spacing:1px;background:transparent;")
+        pick.addWidget(pick_lbl)
+        self.layout_element = QComboBox()
+        self.layout_element.setMinimumWidth(240)
+        self.layout_element.currentTextChanged.connect(self._on_layout_selection_changed)
+        pick.addWidget(self.layout_element, 1)
+        refresh = QPushButton("REFRESH")
+        refresh.setToolTip("Re-read the live panels and their current positions.")
+        refresh.clicked.connect(self._load_layout_values)
+        pick.addWidget(refresh)
+        pv.addLayout(pick)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        def _spin(lo, hi):
+            s = QSpinBox()
+            s.setRange(lo, hi)
+            s.setMinimumWidth(92)
+            return s
+        self.layout_x, self.layout_y = _spin(-10000, 10000), _spin(-10000, 10000)
+        self.layout_w, self.layout_h = _spin(20, 10000), _spin(20, 10000)
+        self.layout_opacity = _spin(0, 100)
+        self.layout_opacity.setSuffix(" %")
+        for col, (text, widget) in enumerate((("X", self.layout_x), ("Y", self.layout_y),
+                                              ("WIDTH", self.layout_w), ("HEIGHT", self.layout_h))):
+            cap = QLabel(text)
+            cap.setStyleSheet(f"color:{TEXT_DIM};font:700 7pt 'Exo 2';letter-spacing:1px;background:transparent;")
+            grid.addWidget(cap, 0, col)
+            grid.addWidget(widget, 1, col)
+        cap = QLabel("OPACITY")
+        cap.setStyleSheet(f"color:{TEXT_DIM};font:700 7pt 'Exo 2';letter-spacing:1px;background:transparent;")
+        grid.addWidget(cap, 0, 4)
+        grid.addWidget(self.layout_opacity, 1, 4)
+        self.layout_visible = QCheckBox("Visible")
+        grid.addWidget(self.layout_visible, 1, 5)
+        pv.addLayout(grid)
+
+        nudge = QHBoxLayout()
+        nudge.setSpacing(6)
+        nudge_lbl = QLabel("NUDGE")
+        nudge_lbl.setStyleSheet(f"color:{TEXT_DIM};font:700 7pt 'Exo 2';letter-spacing:1px;background:transparent;")
+        nudge.addWidget(nudge_lbl)
+        for glyph, dx, dy in (("◀", -1, 0), ("▲", 0, -1), ("▼", 0, 1), ("▶", 1, 0)):
+            b = QPushButton(glyph)
+            b.setFixedWidth(40)
+            b.clicked.connect(lambda _c=False, x=dx, y=dy: self._layout_nudge(x, y))
+            nudge.addWidget(b)
+        self.layout_step = _spin(1, 400)
+        self.layout_step.setValue(10)
+        self.layout_step.setSuffix(" px")
+        self.layout_step.setMinimumWidth(80)
+        nudge.addWidget(self.layout_step)
+        center = QPushButton("CENTER ON SCREEN")
+        center.clicked.connect(self._layout_center)
+        nudge.addWidget(center)
+        nudge.addStretch(1)
+        apply_btn = QPushButton("APPLY")
+        apply_btn.setStyleSheet(_primary_button_css(34))
+        apply_btn.setToolTip("Move / resize / show the selected element with the values above.")
+        apply_btn.clicked.connect(self._apply_layout_selection)
+        nudge.addWidget(apply_btn)
+        pv.addLayout(nudge)
+        lay.addWidget(pos)
+
+        # 3 ── the full visual editor ────────────────────────────────────────
+        studio = HudGroupBox("LAYOUT STUDIO  ·  ADVANCED")
         sf = QVBoxLayout(studio)
-        sf.setContentsMargins(12, 16, 12, 12)
+        sf.setContentsMargins(14, 20, 14, 14)
         sf.setSpacing(8)
-
-        title = QLabel("LIVE PANEL EDITOR")
-        title.setStyleSheet(f'color:{ACCENT_BRIGHT};font:900 13pt "Orbitron";background:transparent;letter-spacing:1.8px;')
-        sf.addWidget(title)
-
-        detail = QLabel(
-            "Explorer · live viewport · drag/resize · advanced Properties · undo/redo · "
-            "QSS/HTML/CSS editor · custom elements · Uiverse import."
-        )
+        detail = QLabel("Need more than position and size? The Studio edits the live widget tree: Explorer, "
+                        "drag / resize in the viewport, Properties, QSS / HTML / CSS, custom elements and "
+                        "Uiverse import. Its SAVE writes to config/ui_layout.json.")
         detail.setWordWrap(True)
-        detail.setStyleSheet(f"color:{TEXT_DIM};background:transparent;padding:2px 0 6px 0;")
+        detail.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
         sf.addWidget(detail)
-
         open_editor = QPushButton("OPEN LAYOUT STUDIO")
-        open_editor.setMinimumHeight(48)
-        open_editor.setStyleSheet(_primary_button_css(48))
+        open_editor.setMinimumHeight(44)
+        open_editor.setStyleSheet(_primary_button_css(44))
         open_editor.clicked.connect(self._open_external_layout_editor)
         sf.addWidget(open_editor)
-
-        targets = QLabel(
-            "Available live targets include Main Surface, Top Bar, Status Bar, Quick Panel, "
-            "Chat Panel, Chat Log, Message Input, Settings Panel, Webview, Activity Log, "
-            "World Monitor, Memory Core, Tools Deck, 3D Display, Video Preview and other runtime widgets."
-        )
-        targets.setWordWrap(True)
-        targets.setStyleSheet(f"color:{TEXT_MID};background:transparent;padding:6px 2px 2px 2px;")
-        sf.addWidget(targets)
         lay.addWidget(studio)
 
-        note = QLabel(
-            "The Studio edits the actual running widgets. SAVE writes layout overrides and custom elements to config/ui_layout.json. "
-            "Uiverse elements can be opened in the embedded browser and imported through their HTML/CSS code."
-        )
+        note = QLabel("Custom elements are saved as soon as you press APPLY. Built-in panels move live; "
+                      "use the Studio's SAVE to keep an exact arrangement.")
         note.setWordWrap(True)
-        note.setStyleSheet(f"color:{TEXT_FAINT};background:transparent;padding:5px 2px;")
+        note.setStyleSheet(f"color:{TEXT_FAINT};background:transparent;padding:2px;")
         lay.addWidget(note)
         lay.addStretch(1)
-        self.tabs.addTab(scroll, "LAYOUT")
+        self._layout_tab_index = self.tabs.addTab(scroll, "LAYOUT")
+        self.tabs.currentChanged.connect(self._on_layout_tab_shown)
+
+    def _on_layout_tab_shown(self, index: int) -> None:
+        try:
+            if index == getattr(self, "_layout_tab_index", -1):
+                self._load_layout_values()
+        except Exception:
+            pass
+
+    def _layout_live_widget(self, name: str):
+        parent = self._host_window()
+        if parent is None or not name:
+            return None
+        return (getattr(parent, "_system_layout_widgets", {}).get(name)
+                or getattr(parent, "_layout_widgets", {}).get(name))
+
+    def _refresh_layout_chips(self) -> None:
+        grid = getattr(self, "_layout_chip_grid", None)
+        if grid is None:
+            return
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        parent = self._host_window()
+        entries = []
+        if parent is not None:
+            for reg in ("_system_layout_widgets", "_layout_widgets"):
+                for name, w in (getattr(parent, reg, {}) or {}).items():
+                    if w is not None and name not in [n for n, _ in entries]:
+                        entries.append((name, w))
+        if not entries:
+            empty = QLabel("No live panels found — open this window from the main JARVIS window.")
+            empty.setStyleSheet(f"color:{TEXT_FAINT};background:transparent;")
+            grid.addWidget(empty, 0, 0)
+            return
+        css = (
+            f"QPushButton {{ color:{TEXT_MID}; background:{_rgba(SURFACE_ALT, 150)};"
+            f" border:1px solid {BORDER_FAINT}; border-radius:{RADIUS_MD}px;"
+            f" font:700 8pt {FONT_SMALL}; min-height:36px; padding:4px 12px; text-align:left; }}"
+            f"QPushButton:hover {{ border:1px solid {ACCENT}; color:{TEXT_BRIGHT}; }}"
+            f"QPushButton:checked {{ background:{_rgba(ACCENT, 80)}; border:1px solid {ACCENT};"
+            f" color:{TEXT_BRIGHT}; }}")
+        cols = 3
+        for i, (name, widget) in enumerate(entries):
+            chip = QPushButton(f"●  {name}")
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            try:
+                chip.setChecked(bool(widget.isVisible()))
+            except Exception:
+                pass
+            chip.setStyleSheet(css)
+            chip.toggled.connect(lambda on, w=widget, n=name: self._toggle_layout_panel(n, w, on))
+            grid.addWidget(chip, i // cols, i % cols)
+        for c in range(cols):
+            grid.setColumnStretch(c, 1)
+
+    def _toggle_layout_panel(self, name: str, widget, on: bool) -> None:
+        try:
+            widget.setVisible(bool(on))
+            if on:
+                widget.raise_()
+            self._status.setText(f"{name.upper()} {'SHOWN' if on else 'HIDDEN'}")
+        except Exception as exc:
+            self._status.setText(f"LAYOUT ERROR: {exc}")
+
+    def _layout_nudge(self, dx: int, dy: int) -> None:
+        if getattr(self, "layout_x", None) is None or not self._layout_selected_name:
+            return
+        step = int(self.layout_step.value())
+        self.layout_x.setValue(self.layout_x.value() + dx * step)
+        self.layout_y.setValue(self.layout_y.value() + dy * step)
+        self._apply_layout_selection()
+
+    def _layout_center(self) -> None:
+        if getattr(self, "layout_x", None) is None:
+            return
+        widget = self._layout_live_widget(self._layout_selected_name)
+        if widget is None:
+            return
+        try:
+            w, h = self.layout_w.value(), self.layout_h.value()
+            if widget.isWindow():
+                screen = widget.screen() or QApplication.primaryScreen()
+                geo = screen.availableGeometry()
+                self.layout_x.setValue(geo.x() + (geo.width() - w) // 2)
+                self.layout_y.setValue(geo.y() + (geo.height() - h) // 2)
+            else:
+                host = widget.parentWidget()
+                if host is not None:
+                    self.layout_x.setValue((host.width() - w) // 2)
+                    self.layout_y.setValue((host.height() - h) // 2)
+            self._apply_layout_selection()
+        except Exception as exc:
+            self._status.setText(f"LAYOUT ERROR: {exc}")
 
     def _build_web_tab(self):
         page, lay, scroll = self._scroll_tab()
@@ -5463,6 +5814,10 @@ class SettingsWindow(QDialog):
             self.layout_element.setCurrentIndex(0)
         self.layout_element.blockSignals(False)
         self._on_layout_selection_changed(self.layout_element.currentText())
+        try:
+            self._refresh_layout_chips()
+        except Exception:
+            pass
 
     def _on_layout_selection_changed(self, name):
         if getattr(self, "layout_x", None) is None:
@@ -5470,7 +5825,19 @@ class SettingsWindow(QDialog):
         if not name or name not in self._layout_rows:
             return
         self._layout_selected_name = name
-        e = self._layout_rows[name]
+        e = dict(self._layout_rows[name])
+        live = self._layout_live_widget(name)
+        if live is not None:
+            try:
+                g = live.geometry()
+                e.update({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
+                          "visible": live.isVisible()})
+            except Exception:
+                pass
+        try:
+            self.layout_opacity.setEnabled(name in getattr(self._host_window(), "_layout_elements", {}))
+        except Exception:
+            pass
         self.layout_x.setValue(int(e.get("x", 50)))
         self.layout_y.setValue(int(e.get("y", 50)))
         self.layout_w.setValue(int(e.get("w", 180)))
@@ -5485,13 +5852,14 @@ class SettingsWindow(QDialog):
         parent = self._host_window()
         if not name or parent is None:
             return
+        is_custom = name in getattr(parent, "_layout_elements", {})
         elem = self._layout_rows.setdefault(name, {})
         elem.update({"name": name, "x": self.layout_x.value(), "y": self.layout_y.value(), "w": self.layout_w.value(), "h": self.layout_h.value(), "opacity": self.layout_opacity.value(), "visible": self.layout_visible.isChecked()})
         widget = getattr(parent, "_system_layout_widgets", {}).get(name) or getattr(parent, "_layout_widgets", {}).get(name)
         if widget is not None:
             widget.setGeometry(self.layout_x.value(), self.layout_y.value(), self.layout_w.value(), self.layout_h.value())
             widget.setVisible(self.layout_visible.isChecked())
-        if hasattr(parent, "_layout_elements"):
+        if is_custom:
             parent._layout_elements[name] = dict(elem)
             if hasattr(parent, "_apply_layout_elements"):
                 parent._apply_layout_elements()
