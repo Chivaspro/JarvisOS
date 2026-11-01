@@ -61,7 +61,6 @@ def window(qapp, monkeypatch, camera):  # noqa: F811
         monkeypatch.setattr(ui._FeatheredCamView, "_load_geom", lambda self: None)
         monkeypatch.setattr(ui.RefinedCommandWindow, "_ensure_vision_analyzer",
                             lambda self: _NullAnalyzer())
-        monkeypatch.setattr(ui.WorldMonitorPane, "refresh_feeds", lambda self: None)
 
         win = ui.MainWindow(str(root / "face.png"))
         qapp.processEvents()
@@ -143,12 +142,35 @@ def test_cancel_button_reaches_the_backend_callback(window):
     assert calls and "TASK-2026-000001" in calls[0]
 
 
-def test_report_opens_through_the_existing_content_surface(window, monkeypatch):
-    captured: list[tuple] = []
-    monkeypatch.setattr(window, "show_content",
-                        lambda title, text: captured.append((title, text)))
+def test_report_renders_in_the_task_panel_card(window, monkeypatch):
+    """The report belongs in the checklist card, not a second content surface.
+
+    ``_show_task_report`` renders into the task pane's own card ("in the
+    existing checklist card only") so the report stays attached to the
+    checklist it explains. This test used to pin the older show_content()
+    route; the committed implementation replaced that, and the pin is updated
+    to the contract that actually ships.
+    """
+    captured: list[str] = []
+    pane = window._tasks_pane
+    monkeypatch.setattr(pane, "show_report_details",
+                        lambda text: captured.append(str(text)))
+
     window._show_task_report("TASK-2026-000001", "# Task report\n\nreal data")
-    assert captured and "TASK REPORT" in captured[0][0]
+
+    assert captured == ["# Task report\n\nreal data"]
+
+
+def test_an_empty_report_still_renders_an_honest_placeholder(window, monkeypatch):
+    captured: list[str] = []
+    pane = window._tasks_pane
+    monkeypatch.setattr(pane, "show_report_details",
+                        lambda text: captured.append(str(text)))
+
+    window._show_task_report("TASK-2026-000001", "")
+
+    assert captured and "No report is available" in captured[0]
+    assert "TASK-2026-000001" in captured[0]
 
 
 def test_question_card_renders_clickable_options(window, monkeypatch):

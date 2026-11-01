@@ -57,6 +57,51 @@ def test_the_supported_node_matrix(version, expected):
     assert rea.node_supported(version) is expected
 
 
+@pytest.mark.parametrize("version,expected", [
+    # REA's README matrix is stricter than npm's engines gate.
+    ("v22.23.3", False), ("v22.23.4", True), ("v22.24.0", True),
+    ("v24.20.0", False), ("v24.22.0", False), ("v24.22.1", True),
+    ("v26.12.0", False), ("v26.12.1", True), ("v28.0.0", True),
+    ("v23.5.0", False), ("v25.2.0", False), ("v22.23.4-rc.1", False),
+    ("", False), ("garbage", False),
+])
+def test_the_recommended_node_matrix(version, expected):
+    assert rea.node_recommended(version) is expected
+
+
+def test_a_supported_but_below_recommended_node_is_a_warning_not_a_failure(monkeypatch):
+    monkeypatch.setattr(rea, "shutil", types.SimpleNamespace(
+        which=lambda name: f"C:/tools/{name}.exe"))
+    monkeypatch.setattr(rea, "_run_command",
+                        lambda command, timeout=0: (0, "v24.20.0", ""))
+    facts = rea.node_readiness(refresh=True)
+    assert facts["ok"] is True
+    assert facts["recommended"] is False
+    assert "tested matrix" in facts["warning"]
+    text = rea.readiness_text()
+    assert "ready to start" in text.lower()
+    assert "tested matrix" in text
+
+
+def test_the_npx_cache_is_read_without_starting_node(monkeypatch, tmp_path):
+    entry = tmp_path / "abc123" / "node_modules" / "rea-agents"
+    entry.mkdir(parents=True)
+    (entry / "package.json").write_text(
+        json.dumps({"name": "rea-agents", "version": "6.7.0"}), encoding="utf-8")
+    other = tmp_path / "def456" / "node_modules" / "rea-agents"
+    other.mkdir(parents=True)
+    (other / "package.json").write_text(
+        json.dumps({"name": "rea-agents", "version": "6.5.0"}), encoding="utf-8")
+    monkeypatch.setattr(rea, "_npx_cache_root", lambda: tmp_path)
+
+    assert rea.rea_cached("6.7.0") is True
+    assert rea.rea_cached("6.6.0") is False
+    assert rea.rea_cached() is True               # pinned version is present
+    assert rea.rea_cached_versions() == ["6.5.0", "6.7.0"]
+    dirs = rea.rea_npx_cache_dirs("6.7.0")
+    assert dirs == [tmp_path / "abc123"]
+
+
 def test_a_missing_node_is_reported_actionably(monkeypatch):
     monkeypatch.setattr(rea, "shutil",
                         types.SimpleNamespace(which=lambda name: None))

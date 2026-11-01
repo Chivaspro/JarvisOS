@@ -310,6 +310,58 @@ def test_arrange_all_tiles_every_visible_window(monkeypatch):
     assert sorted(moved) == ["1", "2", "3"]
 
 
+def test_list_windows_names_every_visible_window(monkeypatch):
+    """The action the registry has always declared, with a real handler now."""
+    windows = [{"title": "A", "handle": 1}, {"title": "B", "handle": 2}]
+    from capabilities import desktop as _desktop
+    monkeypatch.setattr(_desktop, "list_windows",
+                        lambda visible_only=True: windows)
+
+    result = windows_ext.run("list_windows", {})
+
+    assert result["ok"]
+    assert "A" in result["detail"] and "B" in result["detail"]
+    assert result["evidence"]["windows"] == windows
+
+
+def test_list_windows_reports_an_honest_empty_desktop(monkeypatch):
+    from capabilities import desktop as _desktop
+    monkeypatch.setattr(_desktop, "list_windows", lambda visible_only=True: [])
+
+    result = windows_ext.run("list_windows", {})
+
+    assert result["ok"]
+    assert "No visible" in result["detail"]
+
+
+def test_minimize_all_minimises_every_window_with_a_handle(monkeypatch):
+    minimised: list[int] = []
+    windows = [{"title": "A", "handle": 1}, {"title": "B", "handle": 2},
+               {"title": "ghost", "handle": 0}]
+    monkeypatch.setattr(windows_ext, "_show",
+                        lambda hwnd, cmd: minimised.append(int(hwnd)) or True)
+    from capabilities import desktop as _desktop
+    monkeypatch.setattr(_desktop, "list_windows",
+                        lambda visible_only=True: windows)
+
+    result = windows_ext.run("minimize_all", {})
+
+    assert result["ok"]
+    assert sorted(minimised) == [1, 2]
+    assert result["evidence"]["minimised"] == 2
+    assert "ghost" in result["detail"]      # the handleless window is named
+
+
+def test_minimize_all_with_no_windows_is_refused(monkeypatch):
+    from capabilities import desktop as _desktop
+    monkeypatch.setattr(_desktop, "list_windows", lambda visible_only=True: [])
+
+    result = windows_ext.run("minimize_all", {})
+
+    assert not result["ok"]
+    assert result["reason"] == "not_found"
+
+
 # ── clipboard sentry ─────────────────────────────────────────────────────────
 
 def test_reading_an_empty_clipboard_says_so(monkeypatch):

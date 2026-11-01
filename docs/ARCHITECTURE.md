@@ -715,7 +715,7 @@ plus **Custom** (activates the moment a control is moved off a preset). Each
 profile is a deterministic bundle over switches that already exist: HUD
 animations (`smooth_animations`), panel sound effects (`enable_sfx`),
 audio-reactive paint (`audio_reactive`), the Mind panel's live-refresh cadence,
-the vault watcher and index-freshness windows, World Monitor's refresh, and the
+the vault watcher and index-freshness windows, and the
 Neural Map's node budget, glow work and simulation tick. Every change persists
 through `config/settings.py:set_value`/`set_feature` (the guarded writer) and is
 pushed into the running app — no restart. No profile ever touches memory

@@ -122,7 +122,7 @@ settings module itself). Result:
 | Setting | Consumer | Status |
 |---|---|---|
 | `ai_provider`, `ai_model`, custom provider fields | ai_providers / forge / laya_decision / main | verified wired |
-| `camera_index`, `world_monitor_refresh`, `web_homepage` | camera / ui_perfomance / diagnostics / ui | verified wired |
+| `camera_index`, `web_homepage` | camera / diagnostics / ui | verified wired |
 | `features` map (`smooth_animations`, `realtime_stt`, `autostart`, `mic_access`, `drag_reactor`, `multi_window`, …) | brain_bridge / main / ui / config | verified wired; `smooth_animations` now also gates the chat glide |
 | `chat_font_scale`, `hide_chat_lines`, `chat_filter_categories` | ui | verified wired |
 | **`chat_filter`** | — (none) | **was dead — fixed** (now drives the category filters) |

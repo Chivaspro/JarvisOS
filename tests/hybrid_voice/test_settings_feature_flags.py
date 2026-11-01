@@ -148,7 +148,8 @@ def test_narration_and_latency_controls_exist_and_save(window_with_flags):
     for key, needle in (("narrator", "Narrate"),
                         ("realtime_low_latency", "Low-latency"),
                         ("tts_streaming", "Stream"),
-                        ("tts_realtime", "as it is written")):
+                        ("tts_realtime", "as it is written"),
+                        ("speech_markdown_filter", "Speak prose only")):
         cb = _flags_box(window_with_flags, key)
         assert cb is not None, f"no Settings control for {key}"
         assert needle in cb.text()

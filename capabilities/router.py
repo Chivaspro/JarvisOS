@@ -55,7 +55,13 @@ ENGINE_OF = {"computer_control": "agent_tars",
              "documents": "documents",
              "smart_home": "kasa",
              "instagram": "instagrapi",
-             "globe": "globe"}
+             "globe": "globe",
+             "file_control": "filesystem",
+             "library": "library",
+             "meeting_notes": "meeting_notes",
+             "home_assistant": "home_assistant",
+             "github": "github",
+             "reverse_engineer": "reverse-engineer"}
 #: Every registry tool must appear here: ``_locked_run`` reads the domain, so a
 #: missing entry would surface as a crash rather than as a refusal. The lock is
 #: what guarantees one controller owns the target at a time.
@@ -77,7 +83,23 @@ LOCK_OF = {"computer_control": "desktop",
            # not wait behind a window being tiled, nor block one.
            "smart_home": "smart_home",
            "instagram": "instagram",
-           "globe": "desktop"}
+           "globe": "desktop",
+           # File work only touches the disk, so a long copy never blocks a
+           # click and a click never waits behind a copy.
+           "file_control": "files",
+           # The library only touches its own SQLite file, a meeting only its
+           # own recorder, and the two service links only their own APIs, so
+           # none of them can block PC control or each other.
+           "library": "library",
+           "meeting_notes": "meeting_notes",
+           "home_assistant": "home_assistant",
+           "github": "github",
+           # Reverse engineering owns its own domain for the whole action (a
+           # remake can run for minutes) and takes the browser lock only
+           # around the capture step itself, inside capabilities/
+           # reverse_engineer.py — so evidence work never blocks browsing, and
+           # a capture never interleaves with a browser workflow.
+           "reverse_engineer": "reverse_engineer"}
 LABEL_OF = {"computer_control": "Agent TARS",
             "browser_control": "Agent TARS",
             "web_research": "Agent Reach",
@@ -91,7 +113,13 @@ LABEL_OF = {"computer_control": "Agent TARS",
             "documents": "Document architect",
             "smart_home": "Smart home",
             "instagram": "Instagram",
-            "globe": "HoloGlobe"}
+            "globe": "HoloGlobe",
+            "file_control": "File control",
+            "library": "Knowledge library",
+            "meeting_notes": "Meeting notes",
+            "home_assistant": "Home Assistant",
+            "github": "GitHub",
+            "reverse_engineer": "Reverse engineering"}
 
 #: How long a local action waits for the domain lock before refusing. Agent TARS
 #: may legitimately be mid-task; a short wait is friendlier than an instant
@@ -103,7 +131,18 @@ LOCAL_LOCK_WAIT = {"pc_control": 10.0, "visual_control": 15.0,
                    "smart_home": 20.0, "instagram": 45.0,
                    # A geocoding lookup can be slow; the globe never holds the
                    # desktop lock for long because it only shares it on write.
-                   "globe": 8.0}
+                   "globe": 8.0,
+                   # A copy or a zip can legitimately take a while, and the
+                   # filesystem lock is its own domain, so waiting costs nothing
+                   # that desktop control needs.
+                   "file_control": 30.0,
+                   # Indexing can take minutes; the library owns its own
+                   # database, so waiting for it never stalls the desktop.
+                   "library": 30.0, "meeting_notes": 5.0,
+                   "home_assistant": 20.0, "github": 20.0,
+                   # Its own domain, so this wait only ever covers a second
+                   # evidence job starting behind another one.
+                   "reverse_engineer": 5.0}
 
 #: Reasons where the engine could not act at all — nothing may be presented as
 #: done and the request must not be handed to a different engine.
@@ -202,15 +241,16 @@ def _approval_gate(capability: str, task: str, params: dict,
             "decision": decision}
 
 
-def _park_behind_token(capability: str, task: str, run: Callable[[], str]) -> str:
+def _park_behind_token(capability: str, task: str, run: Callable[[], str],
+                       detail: str = "") -> str:
     """Send an irreversible action through the existing on-screen confirmation."""
     try:
         from security import confirm
         return confirm.request(
             key=f"capability:{capability}",
             title=f"{LABEL_OF.get(capability, capability)}: {task[:70]}",
-            detail=("This will change something outside this machine. Confirm on "
-                    "the HUD to let it run, or cancel."),
+            detail=(detail or "This will change something outside this machine. "
+                             "Confirm on the HUD to let it run, or cancel."),
             run=run)
     except Exception as exc:
         _log("WARNING", capability, f"confirmation gate failed: {exc}")
@@ -268,6 +308,25 @@ def _locked_run(capability: str, backend: str, runner: Callable[[], dict],
     proc.register_shutdown_hook()
     _log("INFO", capability, f"{backend} task started")
     try:
+        return _direct_run(capability, backend, runner, started)
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
+def _direct_run(capability: str, backend: str, runner: Callable[[], dict],
+                started: float) -> CapabilityResult:
+    """Run one runner without taking a domain lock.
+
+    Only a composite action uses this: ``run_sequence`` holds no lock while its
+    steps run, so each step can take its own domain lock exactly as a standalone
+    call would. Everything else goes through :func:`_locked_run`.
+    """
+    from capabilities import proc
+    proc.register_shutdown_hook()
+    try:
         raw = runner() or {}
     except Exception as exc:
         _log("ERROR", capability, f"{backend} raised {type(exc).__name__}: {exc}")
@@ -275,11 +334,6 @@ def _locked_run(capability: str, backend: str, runner: Callable[[], dict],
                                 f"{LABEL_OF[capability]} failed unexpectedly: {exc}",
                                 reason="crashed",
                                 elapsed_s=round(time.monotonic() - started, 2))
-    finally:
-        try:
-            lock.release()
-        except Exception:
-            pass
 
     ok = bool(raw.get("ok"))
     verification = raw.get("verification") or {
@@ -351,12 +405,17 @@ def route_web_research(query: str = "", platform: str = "", url: str = "",
 
 def route_local(tool: str, action, args: dict, runner: Callable[[], dict],
                 enabled: Callable[[str], bool] | None = None,
-                wait_for_lock_s: float | None = None) -> CapabilityResult:
+                wait_for_lock_s: float | None = None,
+                lock: bool = True) -> CapabilityResult:
     """One structured local action through the same policy path as the engines.
 
     Order: permission switch (the exact feature named by the action) → approval
     policy (the request's own words decide the risk tier) → domain lock → run →
     unlock. The result carries the controller that actually ran.
+
+    ``lock=False`` is reserved for a composite action (``run_sequence``): the
+    outer call must not hold the desktop lock while its steps each take their
+    own. Permission and approval still run here, and every step runs them again.
     """
     backend = ENGINE_OF.get(tool, tool)
     started = time.monotonic()
@@ -382,7 +441,24 @@ def route_local(tool: str, action, args: dict, runner: Callable[[], dict],
         def _confirmed() -> str:
             res = _locked_run(tool, backend, runner, wait_for_lock_s or 0.0, started)
             return res.output
-        message = _park_behind_token(tool, scan, _confirmed)
+        confirm_detail = ""
+        if tool == "meeting_notes" and action.name == "start":
+            confirm_detail = (
+                "Start recording system audio and the microphone? Both tracks "
+                "are written only to this machine under data/meetings. Every "
+                "person in the room should know. A requested summary later sends "
+                "the transcript text to the active AI model; the audio never "
+                "leaves this machine. Confirm to start, or cancel.")
+        elif tool == "meeting_notes" and action.name == "delete":
+            confirm_detail = (
+                "Delete this meeting's local audio, transcript and notes? This "
+                "cannot be undone. Nothing outside the meeting folder is touched.")
+        elif tool == "home_assistant" and action.name == "run_script":
+            confirm_detail = (
+                "Run this Home Assistant script? A script can change several "
+                "devices at once, so confirm on the HUD to let it run, or cancel.")
+        message = _park_behind_token(tool, scan, _confirmed,
+                                     detail=confirm_detail)
         return CapabilityResult(False, tool, backend, message,
                                 reason="awaiting_confirmation",
                                 approval="pending_ui_token")
@@ -403,6 +479,8 @@ def route_local(tool: str, action, args: dict, runner: Callable[[], dict],
 
     wait = LOCAL_LOCK_WAIT.get(tool, 0.0) if wait_for_lock_s is None \
         else float(wait_for_lock_s)
+    if not lock:
+        return _direct_run(tool, backend, runner, started)
     return _locked_run(tool, backend, runner, wait, started)
 
 
@@ -415,7 +493,8 @@ def _scan_text(action, params: dict) -> str:
     """
     parts = [str(getattr(action, "name", action) or "")]
     for key in ("target", "selector", "instruction", "text", "url", "app",
-                "title", "keys", "key", "tab", "path"):
+                "title", "keys", "key", "tab", "path", "query", "destination",
+                "control", "automation_id"):
         value = params.get(key)
         if value not in (None, ""):
             parts.append(str(value))

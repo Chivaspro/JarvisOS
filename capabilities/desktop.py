@@ -146,6 +146,37 @@ def _done(controller: str, detail: str, **evidence) -> dict:
             "evidence": dict(evidence)}
 
 
+def _foreground_title() -> str:
+    """The title of the window that will receive physical input.
+
+    Read through the Win32 API (a few microseconds, no pywinauto dependency) so
+    typing and key presses can report the concrete window they acted on instead
+    of a bare "sent". On other platforms the title is simply unavailable.
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(max(1, length + 1))
+        user32.GetWindowTextW(hwnd, buf, len(buf))
+        return buf.value.strip()
+    except Exception:
+        return ""
+
+
+def _clipboard_holds(text: str) -> bool:
+    try:
+        import pyperclip
+        return str(pyperclip.paste()) == str(text)
+    except Exception:
+        return False
+
+
 # ── screen capture and coordinates ────────────────────────────────────────────
 
 def screen_info(capture: bool = True) -> dict:
@@ -514,9 +545,10 @@ def _paste_text(text: str) -> str:
     try:
         import pyperclip
         pyperclip.copy(text)
-        pyat = _pyautogui()
-        pyat.hotkey("ctrl", "v")
-        return "clipboard"
+        if _clipboard_holds(text):
+            pyat = _pyautogui()
+            pyat.hotkey("ctrl", "v")
+            return "clipboard"
     except Exception:
         pass
     pyat = _pyautogui()
@@ -528,12 +560,22 @@ def _h_keyboard_type(args: dict) -> dict:
     text = str(args.get("text") or "")
     if not text:
         return _fail("pyautogui", "keyboard_type needs text to type.")
+    window = _foreground_title()
+    if not window:
+        return _fail("pyautogui",
+                     "No window has keyboard focus, so there is nothing to type "
+                     "into. Click the target field first.",
+                     chars=len(text))
     try:
         method = _paste_text(text)
     except Exception as exc:
         return _fail("pyautogui", f"The text could not be typed: {exc}")
+    verified = method == "clipboard" and _clipboard_holds(text)
     shown = text if len(text) <= 60 else text[:59] + "…"
-    return _done("pyautogui", f"Typed: {shown}", chars=len(text), method=method)
+    return _done(
+        "pyautogui",
+        f"Typed: {shown} into '{window}' via {method}",
+        chars=len(text), method=method, window=window, verified=verified)
 
 
 def _normalise_key(key: str) -> str:
@@ -554,7 +596,8 @@ def _h_keyboard_press(args: dict) -> dict:
             pyat.press(key)
     except Exception as exc:
         return _fail("pyautogui", f"The key press was refused: {exc}", key=key)
-    return _done("pyautogui", f"Pressed {key}", key=key, repeat=repeat)
+    return _done("pyautogui", f"Pressed {key}", key=key, repeat=repeat,
+                 window=_foreground_title())
 
 
 def _h_keyboard_hotkey(args: dict) -> dict:
@@ -573,7 +616,8 @@ def _h_keyboard_hotkey(args: dict) -> dict:
     except Exception as exc:
         return _fail("pyautogui", f"The hotkey was refused: {exc}",
                      keys=normalised)
-    return _done("pyautogui", "Pressed " + "+".join(normalised), keys=normalised)
+    return _done("pyautogui", "Pressed " + "+".join(normalised), keys=normalised,
+                 window=_foreground_title())
 
 
 def _h_screenshot(args: dict) -> dict:

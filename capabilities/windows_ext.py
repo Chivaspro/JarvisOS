@@ -304,6 +304,55 @@ def _h_arrange_all(args: dict) -> dict:
                windows=moved)
 
 
+def _h_list_windows(args: dict) -> dict:
+    """Every visible top-level window, by title (real enumeration)."""
+    try:
+        from capabilities import desktop
+        windows = [w for w in desktop.list_windows(visible_only=True)
+                   if str(w.get("title") or "").strip()]
+    except Exception as exc:
+        return _fail(f"I could not enumerate the windows: {exc}", "unavailable")
+    if not windows:
+        return _ok("No visible top-level windows are open.", windows=[])
+    lines = [f"{index + 1}. {w['title']}" for index, w in enumerate(windows[:60])]
+    detail = f"{len(windows)} visible window(s): " + "; ".join(lines)
+    if len(windows) > 60:
+        detail += f"; … {len(windows) - 60} more"
+    return _ok(detail, windows=windows[:60])
+
+
+def _h_minimize_all(args: dict) -> dict:
+    """Minimize every visible top-level window (the HUD included, honestly)."""
+    try:
+        from capabilities import desktop
+        windows = [w for w in desktop.list_windows(visible_only=True)
+                   if str(w.get("title") or "").strip()]
+    except Exception as exc:
+        return _fail(f"I could not enumerate the windows: {exc}", "unavailable")
+    if not windows:
+        return _fail("There are no visible windows to minimise.", "not_found")
+    done: list[str] = []
+    failed: list[str] = []
+    for window in windows:
+        handle = int(window.get("handle") or 0)
+        title = str(window.get("title") or "")
+        if not handle:
+            failed.append(title)
+            continue
+        if _show(handle, SW_MINIMIZE):
+            done.append(title)
+        else:
+            failed.append(title)
+    if not done:
+        return _fail("Windows refused to minimise any of the open windows.")
+    detail = f"Minimised {len(done)} window(s): " + "; ".join(done[:8])
+    if len(done) > 8:
+        detail += f"; … {len(done) - 8} more"
+    if failed:
+        detail += f". {len(failed)} could not be minimised: " + "; ".join(failed[:5])
+    return _ok(detail, minimised=len(done), failed=failed)
+
+
 def _h_list_monitors(args: dict) -> dict:
     areas = monitors()
     if not areas:
@@ -316,6 +365,8 @@ def _h_list_monitors(args: dict) -> dict:
 
 
 _HANDLERS = {
+    "list_windows": _h_list_windows,
+    "minimize_all": _h_minimize_all,
     "minimize": _h_minimize,
     "maximize": _h_maximize,
     "restore": _h_restore,

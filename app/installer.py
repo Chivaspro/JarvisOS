@@ -10,6 +10,7 @@ import importlib.util
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,13 @@ _FEATURE_EXTRAS: list[tuple[str, str, str, str]] = [
      "clipboard read/write (tkinter is the fallback and needs nothing)"),
     ("smart_home", "kasa",    "python-kasa", "local Kasa/Tapo plugs and bulbs"),
     ("instagram", "instagrapi", "instagrapi", "the user's own Instagram account"),
+    # Laya is the local decision AI: advisory, CPU-only, and optional. Its two
+    # packages are separate rows so a partial install (laya present, model
+    # runtime missing) is reported honestly and repaired by install_feature.
+    ("laya", "laya", "laya==0.4.14",
+     "local decision AI — task classification and routing"),
+    ("laya", "transformers", "transformers>=4.48.0",
+     "the model runtime Laya loads its checkpoint with"),
     # The connector is deliberately on-demand rather than in requirements.txt:
     # composio is heavy, and a machine without it must still start J.A.R.V.I.S.
     # The feature name is the SAME string as the Settings permission switch and
@@ -86,6 +94,18 @@ _FEATURE_EXTRAS: list[tuple[str, str, str, str]] = [
     # does not keep.
     ("external_apps", "composio", "composio",
      "the connector: Gmail, GitHub and every other external app"),
+    # The local document library converts PDF/Word/Excel/PowerPoint locally.
+    # The extras are named explicitly instead of ``[all]`` so Azure, YouTube
+    # and audio transcription converters are not pulled in for no reason.
+    ("library", "markitdown", "markitdown[pdf,docx,xlsx,pptx]",
+     "PDF, Word, Excel, PowerPoint and HTML conversion for the library"),
+    # Meeting notes: PyAudioWPatch supplies WASAPI loopback (system audio) and
+    # the microphone through one PortAudio instance; faster-whisper does the
+    # transcription on this machine. Neither is needed to start J.A.R.V.I.S.
+    ("meeting_notes", "pyaudiowpatch", "PyAudioWPatch",
+     "system-audio and microphone capture on Windows"),
+    ("meeting_notes", "faster_whisper", "faster-whisper",
+     "local speech-to-text for meeting transcripts"),
 ]
 
 #: MCP servers run as child processes over stdio, so every server the user adds
@@ -94,6 +114,12 @@ _FEATURE_EXTRAS: list[tuple[str, str, str, str]] = [
 #: (>=22.15.0), so the probe cannot certify a runtime npm itself would refuse.
 NODE_MIN = (22, 15, 0)
 NODE_MIN_TEXT = "22.15.0"
+
+#: REA is an npm MCP server, not a Python package. The pin and the cache probe
+#: live in :mod:`mcp_host.rea`; the installer only names the command that makes
+#: it ready. Nothing here enables the server — REA stays opt-in.
+REA_PACKAGE = "rea-agents"
+REA_VERSION = "6.7.0"
 
 
 def _parse_node_version(text: str) -> tuple[int, int, int]:
@@ -125,6 +151,66 @@ def node_status() -> tuple[bool, str]:
     return (True, f"node {text}")
 
 
+def rea_status() -> tuple[bool, str]:
+    """(ready, detail) for the pinned REA release in the npx cache.
+
+    Readiness has two honest parts: a Node runtime REA supports and the pinned
+    package actually extracted into the npx cache. A package that is merely
+    listed in npm's content-addressable cache is not enough — npx has to
+    extract it before it can launch. Never raises.
+    """
+    try:
+        from mcp_host import rea
+    except Exception as exc:
+        return (False, f"REA integration unavailable ({type(exc).__name__}: {exc})")
+    try:
+        facts = rea.node_readiness()
+        if not facts.get("ok"):
+            return (False, facts.get("error") or "REA's Node runtime is not ready")
+        if not rea.rea_cached():
+            return (False, f"REA {rea.REA_VERSION} is not cached "
+                           f"(npx fetches it on first start)")
+        detail = f"REA {rea.REA_VERSION} cached"
+        if facts.get("warning"):
+            detail += f" · {facts['warning']}"
+        return (True, detail)
+    except Exception as exc:
+        return (False, f"REA probe failed ({type(exc).__name__}: {exc})")
+
+
+def _install_rea(log: Callable | None = None) -> tuple[bool, str]:
+    """Extract the pinned REA release into the npx cache and verify it.
+
+    ``npm cache add`` only fills npm's download cache; one ``npx … --version``
+    run performs the extraction the MCP server actually launches from. The
+    command is idempotent and fast once warm.
+    """
+    node_ready, node_detail = node_status()
+    if not node_ready:
+        return (False, f"REA needs a usable Node runtime first — {node_detail}.")
+    npx = shutil.which("npx")
+    if not npx:
+        return (False, "npx is not on PATH (it ships with npm/Node.js).")
+    if log:
+        log(f"SYS: npx -y {REA_PACKAGE}@{REA_VERSION} --version …")
+    try:
+        result = subprocess.run(
+            [npx, "-y", f"{REA_PACKAGE}@{REA_VERSION}", "--version"],
+            capture_output=True, timeout=900,
+            **process_launch.hidden_kwargs(),
+        )
+    except Exception as exc:
+        return (False, f"REA could not be downloaded ({type(exc).__name__}: {exc}).")
+    ready, detail = rea_status()
+    if ready:
+        return (True, f"REA {REA_VERSION} is ready ({detail}).")
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode(errors="replace").strip()
+        tail = stderr.splitlines()[-1][:180] if stderr else f"exit {result.returncode}"
+        return (False, f"REA's npx command failed — {tail}")
+    return (False, f"REA did not appear in the npx cache — {detail}.")
+
+
 def feature_status() -> list[dict]:
     """One row per on-demand package, from a real import probe.
 
@@ -146,6 +232,13 @@ def feature_status() -> list[dict]:
                  "ready": node_ready, "detail": node_detail,
                  "fix": "" if node_ready else
                         f"Install Node.js {NODE_MIN_TEXT}+ (nodejs.org) and reopen J.A.R.V.I.S."})
+    rea_ready, rea_detail = rea_status()
+    rows.append({"feature": "rea", "module": "rea",
+                 "package": f"{REA_PACKAGE}@{REA_VERSION}",
+                 "purpose": "REA reverse-engineering MCP server (opt-in)",
+                 "ready": rea_ready, "detail": rea_detail,
+                 "fix": "" if rea_ready else
+                        "Install & update ▸ REA in setup, or let npx fetch it on first start"})
     return rows
 
 
@@ -161,9 +254,11 @@ def install_feature(feature: str, log: Callable | None = None) -> tuple[bool, st
     card repeats to the user, so it never claims an install that did not stick.
     """
     name = str(feature or "").strip().lower()
+    if name == "rea":
+        return _install_rea(log)
     wanted = [row for row in _FEATURE_EXTRAS if row[0] == name]
     if not wanted:
-        known = ", ".join(sorted({row[0] for row in _FEATURE_EXTRAS}))
+        known = ", ".join(sorted({row[0] for row in _FEATURE_EXTRAS} | {"rea"}))
         return (False, f"'{feature}' has no installable packages. Known features: {known}.")
     missing = [row for row in wanted if not _available(row[1])]
     if not missing:

@@ -71,8 +71,16 @@ def test_the_status_rail_can_never_print_a_sleepy_word():
 
 
 def test_the_mute_toggle_still_reports_a_real_state():
-    """Muting sets MUTED (a live state now), and unmuting returns to LISTENING."""
-    assert "_apply_state('MUTED' if self._muted else 'LISTENING')" in UI
+    """Muting sets MUTED (a live state now); unmuting returns the TRUTH.
+
+    Unmuting used to hardcode 'LISTENING' even with no Live link up. It now
+    asks _idle_state(), which answers MUTED / LISTENING / IDLE from the real
+    microphone switch and the learned link state — and the 500 ms reconciler
+    (tests/ui/test_state_reconciler.py) corrects a stale resting state.
+    """
+    assert "_apply_state('MUTED' if self._muted else self._idle_state())" in UI
+    assert "def _idle_state(self) -> str:" in UI
+    assert "def _reconcile_state(self) -> None:" in UI
 
 
 def test_the_sleeping_of_the_machine_is_untouched():

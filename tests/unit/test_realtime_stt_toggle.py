@@ -116,7 +116,7 @@ def test_mic_watchdog_replacement_actually_starts():
         "the stream must not be bound to a with-block the watchdog cannot replace"
     assert "_mic_stream.start()" in block
     assert "candidate.start()" in block, "a reopened stream must actually start"
-    assert "stale.stop()" in block and "stale.close()" in block
+    assert "stream.stop()" in block and "stream.close()" in block
     assert "_failed_reopens >= 3" in block, "a failing reopen must back off, not storm"
 
 
@@ -132,8 +132,12 @@ def test_a_failed_reopen_candidate_is_closed_not_leaked():
     assert "candidate = None" in block, (
         "the candidate must be reset per attempt so a constructor failure "
         "does not close an older stream")
-    reopen = block.index("_mic_stream = candidate")
-    handler = block[reopen:reopen + 900]
+    # The open+start+close-on-failure logic now lives in the shared
+    # ``_attempt_open`` helper (used by both the stall watchdog and the
+    # microphone-device switch); the guarantee is unchanged.
+    helper = block.index("def _attempt_open")
+    handler = block[helper:helper + 1400]
+    assert "candidate.start()" in handler
     assert "candidate.close()" in handler, (
         "a candidate whose start() failed must be closed, not leaked")
 

@@ -41,6 +41,10 @@ TOOL_WINDOW = "window_control"
 #: The clipboard sentry is a registry tool too, so its actions are validated and
 #: permission-gated through exactly the same path as every other local action.
 TOOL_CLIPBOARD = "clipboard_sentry"
+#: The file controller works on the disk, not the desktop: listing, finding,
+#: copying, zipping and (through the Recycle Bin) deleting. It carries its own
+#: switch and its own lock so a long copy never blocks a click.
+TOOL_FILES = "file_control"
 #: The document architect writes REAL files (Word, Excel, PowerPoint, PDF) from
 #: a declarative spec, so it carries its own switch: a user may happily let
 #: J.A.R.V.I.S. type in Word without letting him write files anywhere.
@@ -55,10 +59,26 @@ TOOL_INSTAGRAM = "instagram"
 #: because that is exactly what it is — a surface on this machine — so revoking
 #: desktop control takes the globe with it.
 TOOL_GLOBE = "globe"
+#: The local document library, the meeting recorder, and the two first-party
+#: service links. Each is its own relationship with its own switch; none of
+#: them is a replacement for an existing tool (the library is not the Obsidian
+#: retriever, Home Assistant is not Kasa/Tapo, and native GitHub is read-only
+#: where the Composio connector is the write-capable path).
+TOOL_LIBRARY = "library"
+TOOL_MEETING_NOTES = "meeting_notes"
+TOOL_HOME_ASSISTANT = "home_assistant"
+TOOL_GITHUB = "github"
+#: Reverse engineering: capture a site/app the user owns or is authorized to
+#: examine, read its API surface, synthesise a clean remake from the evidence,
+#: or copy an app folder's own sources into a readable tree. It drives the
+#: Playwright session for captures, so it carries its own switch and its own
+#: lock and never substitutes another controller for the browser it needs.
+TOOL_REVERSE = "reverse_engineer"
 
 TOOLS = (TOOL_PC, TOOL_VISUAL, TOOL_BROWSER, TOOL_POWER, TOOL_SYSTEM,
-         TOOL_WINDOW, TOOL_CLIPBOARD, TOOL_DOCUMENTS, TOOL_SMART_HOME,
-         TOOL_INSTAGRAM, TOOL_GLOBE)
+         TOOL_WINDOW, TOOL_CLIPBOARD, TOOL_FILES, TOOL_DOCUMENTS,
+         TOOL_SMART_HOME, TOOL_INSTAGRAM, TOOL_GLOBE, TOOL_LIBRARY,
+         TOOL_MEETING_NOTES, TOOL_HOME_ASSISTANT, TOOL_GITHUB, TOOL_REVERSE)
 
 #: The shared parameter superset. Gemini sees one flat object per tool (a
 #: union schema is not expressible in the Live function-declaration dialect),
@@ -124,6 +144,66 @@ PARAM_HELP: dict[str, tuple[str, str]] = {
                           "route between them."),
     "focus": ("STRING", "A place already on the globe that should face the "
                          "camera. Omit it to leave the view where it is."),
+    # ── library / meetings ───────────────────────────────────────────────────
+    "query": ("STRING", "A question or search phrase, or the text/name to look "
+                         "for on screen or in a folder."),
+    "doc_id": ("STRING", "The library id of one indexed document, as returned "
+                          "by ingest, list or search."),
+    "recursive": ("BOOLEAN", "For a folder, index its subfolders too (default true)."),
+    "offset": ("INTEGER", "How many chunks or characters to skip (default 0)."),
+    "count": ("INTEGER", "How many chunks or characters to return (default 20)."),
+    "meeting_id": ("STRING", "A meeting id as returned by start or list. Omit it "
+                              "for the current or most recent meeting."),
+    "meeting_title": ("STRING", "A short title for the meeting note. Omit it and "
+                                 "the date and time are used."),
+    "summary": ("STRING", "The meeting summary, written by the assistant from the "
+                           "real transcript. Markdown is allowed."),
+    "action_items": ("STRING", "Action items for the meeting, one per line. Omit "
+                                "them when the transcript contains none."),
+    "force": ("BOOLEAN", "Redo a transcription that already produced a summary."),
+    # ── Home Assistant ───────────────────────────────────────────────────────
+    "entity": ("STRING", "A Home Assistant entity id (light.office) or an exact "
+                          "friendly name. Ambiguous names are refused, never guessed."),
+    "domain": ("STRING", "A Home Assistant domain to filter by, e.g. light, "
+                          "switch, scene or script."),
+    "search": ("STRING", "Text to match against entity ids or friendly names."),
+    "brightness_pct": ("INTEGER", "Brightness percentage, 1-100."),
+    # ── GitHub (read-only) ───────────────────────────────────────────────────
+    "repo": ("STRING", "Repository as 'owner/name' (a github.com URL is also "
+                        "accepted)."),
+    "number": ("INTEGER", "Issue or pull-request number."),
+    "state": ("STRING", "Filter: open, closed or all (where the API supports it)."),
+    "labels": ("STRING", "Comma-separated label names to filter by."),
+    "assignee": ("STRING", "Login name to filter by."),
+    "include_pulls": ("BOOLEAN", "Include pull requests in an issue listing "
+                                  "(GitHub returns both by default)."),
+    "ref": ("STRING", "A branch name, tag or commit SHA."),
+    "page": ("INTEGER", "Page number for a paginated GitHub listing (default 1)."),
+    "search_type": ("STRING", "What to search: issues, code or repos."),
+    # ── advanced PC control: screen reading, UI Automation, files, sequences ──
+    "destination": ("STRING", "Where the result should go: a folder, or the new "
+                              "path/name for a move or rename."),
+    "control": ("STRING", "A Windows control's visible label or name, e.g. "
+                          "'Save as' or 'Search'."),
+    "automation_id": ("STRING", "A control's Windows automation id, when it is "
+                                "known (ui_tree reports them)."),
+    "control_type": ("STRING", "A UI Automation control type, e.g. Edit, Button, "
+                               "Text or MenuItem."),
+    "depth": ("INTEGER", "How deep to walk the control tree (default 3)."),
+    "overwrite": ("BOOLEAN", "Allow replacing an existing destination (default "
+                             "false, which refuses instead of overwriting)."),
+    "steps": ("STRING", "A JSON array of steps. Each step is an object with "
+                        "'tool' and 'action', plus that action's own arguments. "
+                        "At most 15 steps; only safe desktop, window, system, "
+                        "clipboard and file actions are allowed."),
+    # ── reverse engineering ──────────────────────────────────────────────────
+    "authorized": ("BOOLEAN", "The user's explicit statement that they own the "
+                              "target or are authorized to examine it. Never "
+                              "set it yourself: ask first, and pass true only "
+                              "after they confirm."),
+    "feature": ("STRING", "A specific feature or behaviour to focus the remake "
+                          "on, e.g. 'the search modal' or 'the sign-in flow'. "
+                          "Omit it to remake the whole page."),
 }
 
 
@@ -203,6 +283,97 @@ ACTIONS: tuple[Action, ...] = (
        "Capture the screen and show it.",
        optional=("path",), chain=("pyautogui",), verb="Capturing the screen"),
 
+    # ── PC control: read the screen (Windows OCR, no model) ──────────────────
+    # These answer "what does the dialog say?" and "click the word Settings" from
+    # real recognised text and real word rectangles, not from a visual guess.
+    _A("read_screen", TOOL_PC, "windows-ocr", "screen_understanding",
+       "Read the text that is really on the screen, line by line.",
+       optional=("x", "y", "to_x", "to_y"),
+       chain=("windows-ocr", "tesseract"), verb="Reading the screen"),
+    _A("find_text", TOOL_PC, "windows-ocr", "screen_understanding",
+       "Find text on screen and return the exact point to click.",
+       required=("query",), optional=("x", "y", "to_x", "to_y"),
+       chain=("windows-ocr", "tesseract"), verb="Finding"),
+    _A("click_text", TOOL_PC, "windows-ocr+pyautogui", "screen_understanding",
+       "Find text on screen and click it (the point is reported).",
+       required=("query",), optional=("x", "y", "to_x", "to_y"),
+       chain=("windows-ocr", "pyautogui"), verb="Clicking"),
+    _A("wait_for_text", TOOL_PC, "windows-ocr", "screen_understanding",
+       "Wait until text appears on screen, or report the timeout honestly.",
+       required=("query",),
+       optional=("timeout_s", "x", "y", "to_x", "to_y"),
+       chain=("windows-ocr", "tesseract"), verb="Waiting for"),
+
+    # ── PC control: Windows UI Automation (the control tree, not pixels) ─────
+    # A named control is deterministic: Windows says what it is and where it is,
+    # so these need neither a model nor a coordinate.
+    _A("ui_tree", TOOL_PC, "uia", "windows_automation",
+       "List a window's real controls, their types and automation ids.",
+       optional=("title", "app", "depth", "limit"), chain=("uia",),
+       verb="Reading the controls of"),
+    _A("ui_read", TOOL_PC, "uia", "windows_automation",
+       "Read one control's text or value (or a window's readable controls).",
+       optional=("title", "app", "control", "automation_id", "control_type"),
+       chain=("uia",), verb="Reading"),
+    _A("ui_click", TOOL_PC, "uia", "windows_automation",
+       "Click a named Windows control (Invoke pattern first, real click second).",
+       optional=("title", "app", "control", "automation_id", "control_type"),
+       chain=("uia",), verb="Clicking"),
+    _A("ui_set_text", TOOL_PC, "uia", "windows_automation",
+       "Set a named edit field's value and read it back to verify.",
+       required=("text",),
+       optional=("title", "app", "control", "automation_id", "control_type"),
+       chain=("uia",), verb="Filling in"),
+
+    # ── PC control: declared multi-step sequences ────────────────────────────
+    _A("run_sequence", TOOL_PC, "sequence", "desktop_control",
+       "Run a short declared sequence of safe desktop actions, in order.",
+       required=("steps",), chain=("sequence",), verb="Running"),
+
+    # ── File control (standard library; deletes go to the Recycle Bin) ───────
+    # Read-only actions answer even when the switch is off; anything that writes,
+    # moves or removes needs the file permission.
+    _A("list", TOOL_FILES, "filesystem", "file_control",
+       "List a folder's contents with sizes and dates.",
+       optional=("path", "limit"), chain=("filesystem",), verb="Listing"),
+    _A("find", TOOL_FILES, "filesystem", "file_control",
+       "Find files or folders by name under a folder.",
+       required=("query",), optional=("path", "limit"),
+       chain=("filesystem",), verb="Searching for"),
+    _A("info", TOOL_FILES, "filesystem", "file_control",
+       "Report a file or folder's size, type and timestamps.",
+       required=("path",), chain=("filesystem",), verb="Inspecting"),
+    _A("open", TOOL_FILES, "filesystem", "file_control",
+       "Open a document or folder with its default application.",
+       required=("path",), chain=("filesystem",), verb="Opening"),
+    _A("mkdir", TOOL_FILES, "filesystem", "file_control",
+       "Create a folder, including any missing parents.",
+       required=("path",), chain=("filesystem",), verb="Creating"),
+    _A("copy", TOOL_FILES, "filesystem", "file_control",
+       "Copy a file or folder (never silently overwrites).",
+       required=("path", "destination"), optional=("overwrite",),
+       chain=("filesystem",), verb="Copying"),
+    _A("move", TOOL_FILES, "filesystem", "file_control",
+       "Move a file or folder (never silently overwrites).",
+       required=("path", "destination"), optional=("overwrite",),
+       chain=("filesystem",), verb="Moving"),
+    _A("rename", TOOL_FILES, "filesystem", "file_control",
+       "Rename a file or folder in place.",
+       required=("path", "destination"), chain=("filesystem",),
+       verb="Renaming"),
+    _A("delete", TOOL_FILES, "filesystem", "file_control",
+       "Move a file or folder to the Recycle Bin (always confirms).",
+       required=("path",), gate="confirm", chain=("filesystem",),
+       verb="Deleting"),
+    _A("zip", TOOL_FILES, "filesystem", "file_control",
+       "Create a zip archive from files or folders.",
+       required=("paths",), optional=("save_as", "overwrite"),
+       chain=("filesystem",), verb="Zipping"),
+    _A("unzip", TOOL_FILES, "filesystem", "file_control",
+       "Extract a zip archive into a folder (zip-slip entries are refused).",
+       required=("path",), optional=("destination",), chain=("filesystem",),
+       verb="Extracting"),
+
     # ── Visual computer use (UI-TARS prompt + Gemini vision → pyautogui) ──────
     _A("visual_find", TOOL_VISUAL, "uitars", "uitars_visual",
        "Locate an element on the current screen visually, without clicking.",
@@ -222,7 +393,7 @@ ACTIONS: tuple[Action, ...] = (
        chain=("uitars", "pyautogui"), verb="Scrolling"),
     _A("visual_keypress", TOOL_VISUAL, "uitars", "uitars_visual",
        "Press a key after confirming the screen state visually.",
-       required=("key",), optional=("instruction"), chain=("uitars", "pyautogui"),
+       required=("key",), optional=("instruction",), chain=("uitars", "pyautogui"),
        verb="Pressing"),
 
     # ── Browser automation (Playwright, semantic selectors only) ──────────────
@@ -375,6 +546,9 @@ ACTIONS: tuple[Action, ...] = (
     _A("list_windows", TOOL_WINDOW, "win32", "window_control",
        "List the visible top-level windows.",
        chain=("pywinauto",), verb="Listing windows"),
+    _A("minimize_all", TOOL_WINDOW, "win32", "window_control",
+       "Minimize every visible top-level window at once.",
+       chain=("win32",), verb="Minimising every window"),
     _A("minimize", TOOL_WINDOW, "win32", "window_control",
        "Minimize a window.", optional=("app", "title"),
        chain=("win32",), verb="Minimising"),
@@ -535,6 +709,153 @@ ACTIONS: tuple[Action, ...] = (
     _A("status", TOOL_GLOBE, "gazetteer", "desktop_control",
        "Report how a place would be resolved and what the globe can do now.",
        chain=("gazetteer",), verb="Checking the globe"),
+
+    # ── local document library (MarkItDown → SQLite FTS5) ────────────────────
+    _A("status", TOOL_LIBRARY, "sqlite-fts5", "library",
+       "Report how many documents and chunks are indexed and whether the "
+       "conversion engine is installed.", chain=("sqlite-fts5",),
+       verb="Checking the library"),
+    _A("ingest", TOOL_LIBRARY, "markitdown", "library",
+       "Index one file or a folder into the local library.",
+       required=("path",), optional=("recursive",),
+       chain=("markitdown", "stdlib-text"), verb="Indexing"),
+    _A("search", TOOL_LIBRARY, "sqlite-fts5", "library",
+       "Search the library and return ranked snippets with citations.",
+       required=("query",), optional=("limit", "doc_id"),
+       chain=("sqlite-fts5",), verb="Searching"),
+    _A("read", TOOL_LIBRARY, "sqlite-fts5", "library",
+       "Read indexed chunks from one document.",
+       required=("doc_id",), optional=("offset", "count"),
+       chain=("sqlite-fts5",), verb="Reading"),
+    _A("list", TOOL_LIBRARY, "sqlite-fts5", "library",
+       "List the documents currently indexed.", optional=("limit",),
+       chain=("sqlite-fts5",), verb="Listing"),
+    _A("remove", TOOL_LIBRARY, "sqlite-fts5", "library",
+       "Remove one document from the index (the source file is untouched).",
+       required=("doc_id",), chain=("sqlite-fts5",), verb="Removing"),
+
+    # ── meeting notes (local audio → local transcript → Markdown) ────────────
+    _A("start", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Start recording system audio and the microphone after the on-screen "
+       "confirmation.", optional=("meeting_title",), gate="confirm",
+       chain=("meeting-notes",), verb="Recording"),
+    _A("stop", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Stop recording, finalise the WAV files and begin transcription.",
+       chain=("meeting-notes",), verb="Stopping"),
+    _A("status", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Report the current recording or transcription state.",
+       optional=("meeting_id",), chain=("meeting-notes",), verb="Checking"),
+    _A("list", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "List recent meeting recordings.", optional=("limit",),
+       chain=("meeting-notes",), verb="Listing meetings"),
+    _A("transcript", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Read a meeting transcript, optionally in pages.",
+       optional=("meeting_id", "offset", "count"),
+       chain=("meeting-notes",), verb="Reading the transcript"),
+    _A("save_summary", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Write the assistant's summary and action items into the meeting note.",
+       required=("summary",), optional=("action_items", "meeting_id"),
+       chain=("meeting-notes",), verb="Saving the summary"),
+    _A("transcribe", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Retry local transcription for a recorded meeting.",
+       optional=("meeting_id", "force"), chain=("faster-whisper",),
+       verb="Transcribing"),
+    _A("delete", TOOL_MEETING_NOTES, "meeting-notes", "meeting_notes",
+       "Delete one meeting's local audio and notes after confirmation.",
+       required=("meeting_id",), gate="confirm", chain=("meeting-notes",),
+       verb="Deleting the meeting"),
+
+    # ── Home Assistant (REST; local instance, token in Settings) ─────────────
+    _A("status", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Test the configured Home Assistant URL and token.",
+       chain=("home-assistant",), verb="Checking Home Assistant"),
+    _A("entities", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "List Home Assistant entities, filtered by domain or name.",
+       optional=("domain", "search", "limit"),
+       chain=("home-assistant",), verb="Listing entities"),
+    _A("state", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Read one entity's state and a safe subset of its attributes.",
+       required=("entity",), chain=("home-assistant",), verb="Reading"),
+    _A("turn_on", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Switch a light, switch, fan or input boolean on, then read it back.",
+       required=("entity",), chain=("home-assistant",), verb="Switching on"),
+    _A("turn_off", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Switch a light, switch, fan or input boolean off, then read it back.",
+       required=("entity",), chain=("home-assistant",), verb="Switching off"),
+    _A("toggle", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Toggle a light, switch, fan or input boolean, then read it back.",
+       required=("entity",), chain=("home-assistant",), verb="Toggling"),
+    _A("set_brightness", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Set a light's brightness percentage, then read it back.",
+       required=("entity", "brightness_pct"), chain=("home-assistant",),
+       verb="Dimming"),
+    _A("activate_scene", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Activate a Home Assistant scene.", required=("entity",),
+       chain=("home-assistant",), verb="Activating the scene"),
+    _A("run_script", TOOL_HOME_ASSISTANT, "home-assistant", "home_assistant",
+       "Run a Home Assistant script after confirmation.",
+       required=("entity",), gate="confirm", chain=("home-assistant",),
+       verb="Running the script"),
+
+    # ── GitHub (read-only REST; no write method exists) ──────────────────────
+    _A("status", TOOL_GITHUB, "github", "github",
+       "Report the authenticated GitHub user and rate-limit state.",
+       chain=("github-rest",), verb="Checking GitHub"),
+    _A("repos", TOOL_GITHUB, "github", "github",
+       "List repositories visible to the token.", optional=("limit", "page"),
+       chain=("github-rest",), verb="Listing repositories"),
+    _A("notifications", TOOL_GITHUB, "github", "github",
+       "List GitHub notifications.", optional=("limit", "page"),
+       chain=("github-rest",), verb="Reading notifications"),
+    _A("issues", TOOL_GITHUB, "github", "github",
+       "List issues in a repository.", required=("repo",),
+       optional=("state", "labels", "assignee", "limit", "page",
+                 "include_pulls"),
+       chain=("github-rest",), verb="Listing issues"),
+    _A("issue", TOOL_GITHUB, "github", "github",
+       "Read one issue and its comments.", required=("repo", "number"),
+       chain=("github-rest",), verb="Reading the issue"),
+    _A("pulls", TOOL_GITHUB, "github", "github",
+       "List pull requests in a repository.", required=("repo",),
+       optional=("state", "limit", "page"), chain=("github-rest",),
+       verb="Listing pull requests"),
+    _A("pull", TOOL_GITHUB, "github", "github",
+       "Read one pull request with changed files and checks.",
+       required=("repo", "number"), chain=("github-rest",),
+       verb="Reading the pull request"),
+    _A("checks", TOOL_GITHUB, "github", "github",
+       "Read check runs and combined status for a ref.",
+       required=("repo", "ref"), chain=("github-rest",), verb="Checking CI"),
+    _A("workflow_runs", TOOL_GITHUB, "github", "github",
+       "List recent GitHub Actions workflow runs.", required=("repo",),
+       optional=("limit", "page"), chain=("github-rest",),
+       verb="Listing workflow runs"),
+    _A("search", TOOL_GITHUB, "github", "github",
+       "Search GitHub issues/PRs, code or repositories.",
+       required=("query",), optional=("search_type", "limit", "page"),
+       chain=("github-rest",), verb="Searching GitHub"),
+
+    # ── reverse engineering (capture -> evidence -> clean remake) ────────────
+    # Every action that touches a live target or copies an app requires the
+    # caller's explicit authorization; the module itself refuses without it,
+    # and each run is audited beside its artifacts.
+    _A("capture", TOOL_REVERSE, "playwright+workspace", "reverse_engineer",
+       "Record a page (DOM, screenshot, styles, network traffic) as evidence.",
+       required=("url", "authorized"), optional=("destination",),
+       chain=("playwright", "workspace"), verb="Capturing"),
+    _A("api_surface", TOOL_REVERSE, "workspace", "reverse_engineer",
+       "List the API endpoints a capture revealed (fresh from a URL, or from "
+       "an existing capture folder).",
+       optional=("url", "path", "destination", "authorized"),
+       chain=("workspace",), verb="Reading the API surface"),
+    _A("remake", TOOL_REVERSE, "model+workspace", "reverse_engineer",
+       "Write a clean, verified reproduction of a captured page.",
+       optional=("url", "path", "destination", "feature", "authorized"),
+       chain=("synthesis", "workspace"), verb="Remaking"),
+    _A("reconstruct", TOOL_REVERSE, "workspace+rea", "reverse_engineer",
+       "Copy an app folder's own sources into a readable project tree.",
+       required=("path", "authorized"), optional=("destination",),
+       chain=("workspace", "rea"), verb="Reconstructing"),
 )
 
 _BY_KEY: dict[tuple[str, str], Action] = {(a.tool, a.name): a for a in ACTIONS}
@@ -648,7 +969,8 @@ def activity_detail(tool: str, args: dict) -> str:
         return ""
     target = _first(args, "app", "title", "target", "selector", "url", "path",
                     "save_as", "instruction", "text", "key", "keys", "tab",
-                    "direction")
+                    "direction", "query", "repo", "entity", "doc_id",
+                    "meeting_id", "meeting_title", "search")
     head = action.verb or action.summary.split(" ", 1)[0].rstrip(".")
     if not target:
         return head
@@ -688,8 +1010,8 @@ def report() -> str:
 
 
 __all__ = [    "Action", "ACTIONS", "PARAM_HELP", "TOOLS", "TOOL_BROWSER", "TOOL_CLIPBOARD",
-    "TOOL_DOCUMENTS", "TOOL_GLOBE", "TOOL_INSTAGRAM", "TOOL_PC", "TOOL_POWER",
-    "TOOL_SMART_HOME", 
+    "TOOL_DOCUMENTS", "TOOL_FILES", "TOOL_GLOBE", "TOOL_INSTAGRAM", "TOOL_PC", "TOOL_POWER",
+    "TOOL_REVERSE", "TOOL_SMART_HOME",
     "TOOL_SYSTEM", "TOOL_VISUAL", "TOOL_WINDOW", "activity_detail", "find",
     "for_tool", "get", "names", "parameters", "report", "summary", "validate",
 ]

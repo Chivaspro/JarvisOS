@@ -37,7 +37,7 @@ _lock = threading.RLock()
 _RANGES = {
     "ui_opacity": (0, 100), "reactor_opacity": (0, 100),
     "reactor_stroke_opacity": (0, 100), "compact_size": (80, 900),
-    "chat_font_scale": (50, 400), "world_monitor_refresh": (5, 3600),
+    "chat_font_scale": (50, 400),
     "camera_index": (0, 32),
 }
 _FLOAT_RANGES = {
@@ -176,6 +176,11 @@ def validate(data: dict) -> list[str]:
         for key, (lo, hi) in {**_RANGES, **_FLOAT_RANGES}.items():
             if data.get(key) is None:
                 continue
+            # "camera_index": "auto" is a documented sentinel (vision/config.py),
+            # not a corrupted number; mirror observability.diagnostics here.
+            if (key == "camera_index" and isinstance(data[key], str)
+                    and data[key].strip().lower() in ("auto", "")):
+                continue
             try:
                 val = float(data[key])
             except Exception:
@@ -202,6 +207,11 @@ def repair(data: dict | None = None, apply: bool = True) -> dict:
 
         for key, (lo, hi) in _RANGES.items():
             if cfg.get(key) is None:
+                continue
+            # A documented sentinel is left exactly as it is: repair clamps
+            # broken numbers, it never guesses which device "auto" means.
+            if (key == "camera_index" and isinstance(cfg[key], str)
+                    and cfg[key].strip().lower() in ("auto", "")):
                 continue
             try:
                 val = int(float(cfg[key]))
@@ -366,7 +376,7 @@ _AFFECTS = {
     "memory": "memory", "brain": "memory",
     "reactor": "interface", "ui_": "interface", "chat": "interface",
     "font": "interface", "color": "interface", "compact": "interface",
-    "world_monitor": "world monitor", "wake": "wake word",
+    "wake": "wake word",
     "mic": "microphone", "audio": "audio", "tts_engine": "voice",
     "terminal": "terminal", "file_control": "file control",
 }

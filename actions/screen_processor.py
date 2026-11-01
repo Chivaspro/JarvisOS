@@ -145,6 +145,144 @@ def _capture_screen() -> tuple[bytes, str]:
     return _compress(png, "PNG")
 
 
+def capture_desktop() -> list[dict]:
+    """Capture every physical monitor.
+
+    Returns one entry per monitor, in Windows' own order::
+
+        {"index": 1, "label": "Monitor 1", "width": 1920, "height": 1080,
+         "left": 0, "top": 0, "image": b"...jpeg...", "mime": "image/jpeg"}
+
+    ``monitors[0]`` is the virtual desktop spanning every screen; it is used
+    only as a fallback when the platform reports no individual monitors. Each
+    image is compressed exactly as the single-screen path compresses it, so the
+    vision model sees readable text without an unbounded payload.
+    """
+    if not _MSS:
+        raise RuntimeError(
+            "Screen capture is unavailable because the 'mss' package is not "
+            "installed. Run: pip install mss")
+    with mss.mss() as sct:
+        monitors = list(sct.monitors or [])
+        targets = monitors[1:] if len(monitors) > 1 else monitors[:1]
+        if not targets:
+            raise RuntimeError("Screen capture found no monitor to grab.")
+        shots = []
+        for idx, target in enumerate(targets, start=1):
+            shot = sct.grab(target)
+            png = mss.tools.to_png(shot.rgb, shot.size)
+            image, mime = _compress(png, "PNG")
+            shots.append({
+                "index": idx,
+                "label": f"Monitor {idx}",
+                "width": int(target.get("width", shot.size[0])),
+                "height": int(target.get("height", shot.size[1])),
+                "left": int(target.get("left", 0)),
+                "top": int(target.get("top", 0)),
+                "image": image,
+                "mime": mime,
+            })
+    return shots
+
+
+def _image_to_bgr(image_bytes: bytes):
+    """Decode captured JPEG/PNG bytes into the BGR array vision providers use."""
+    if not _PIL:
+        raise RuntimeError(
+            "Pillow is required to analyse a screenshot. Run: pip install pillow")
+    img = PIL.Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.asarray(img)[:, :, ::-1].copy()
+
+
+_DESKTOP_QUESTION = (
+    "You are looking at a screenshot of the user's real desktop. Describe what "
+    "is actually visible: which applications and windows are open, the focused "
+    "window, any readable text (titles, menus, messages, code, errors), and "
+    "what the user appears to be doing. Be specific and factual. Do not invent "
+    "anything that is not visible."
+)
+
+
+def analyze_desktop(question: str = "") -> str:
+    """Capture every monitor and analyse them with the configured vision model.
+
+    Returns the model's real description. Raises ``RuntimeError`` with an
+    actionable message when capture or the vision provider is unavailable — the
+    caller must surface that instead of claiming it looked at the screen.
+    """
+    from vision.config import load_vision_config
+    from vision.multimodal import get_vision_provider
+
+    cfg = load_vision_config()
+    if getattr(cfg, "local_only", False):
+        raise RuntimeError(
+            "Privacy mode (vision.local_only) is enabled, so screenshots are "
+            "never sent to a vision API. Turn it off in Settings ▸ Vision to "
+            "let me look at the screen.")
+    provider = get_vision_provider(cfg)
+    if provider is None or not provider.is_available():
+        raise RuntimeError(
+            "No vision model is connected. Add a Gemini/OpenAI/Anthropic key "
+            "and pick a model in Settings ▸ Vision.")
+
+    shots = capture_desktop()
+
+    prompt = _DESKTOP_QUESTION
+    user_q = str(question or "").strip()
+    if user_q:
+        prompt += f"\n\nAlso answer this question about the screen: {user_q}"
+
+    answers = []
+    for shot in shots:
+        frame = _image_to_bgr(shot["image"])
+        try:
+            text = provider.analyze_image(frame, prompt)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Vision analysis failed on {shot['label']}: {exc}") from exc
+        text = str(text or "").strip()
+        if not text:
+            raise RuntimeError(
+                f"The vision model returned no description for {shot['label']}.")
+        answers.append((shot, text))
+
+    if len(answers) == 1:
+        return answers[0][1]
+    parts = []
+    for shot, text in answers:
+        parts.append(
+            f"{shot['label']} ({shot['width']}x{shot['height']}):\n{text}")
+    return "\n\n".join(parts)
+
+
+def analyze_image_bytes(image_bytes: bytes, question: str = "",
+                        angle: str = "camera") -> str:
+    """Analyse one captured frame with the configured vision model."""
+    from vision.config import load_vision_config
+    from vision.multimodal import get_vision_provider
+
+    cfg = load_vision_config()
+    if getattr(cfg, "local_only", False):
+        raise RuntimeError(
+            "Privacy mode (vision.local_only) is enabled, so the frame was not "
+            "sent to a vision API.")
+    provider = get_vision_provider(cfg)
+    if provider is None or not provider.is_available():
+        raise RuntimeError(
+            "No vision model is connected. Add a provider key in "
+            "Settings ▸ Vision.")
+    prompt = str(question or "").strip()
+    if not prompt:
+        prompt = ("Describe what is visible in this webcam frame: people, what "
+                  "they are doing, what they are holding or wearing, and the "
+                  "notable objects.")
+    text = provider.analyze_image(_image_to_bgr(image_bytes), prompt)
+    text = str(text or "").strip()
+    if not text:
+        raise RuntimeError("The vision model returned no description.")
+    return text
+
+
 def _cv2_backend() -> int:
     """Return the best OpenCV camera backend for the current OS.
 

@@ -55,7 +55,7 @@ def test_tab_surface(window):
     assert labels == ["Balanced", "Performance", "Ultra Performance", "Custom"]
     assert {"animations", "sound_effects", "audio_reactive", "neural_effects",
             "mind_reload_s", "vault_watch_s", "index_fresh_s",
-            "world_monitor_refresh", "neural_max_nodes",
+            "neural_max_nodes",
             "neural_tick_ms"} <= set(tab._controls)
     assert tab._scan_btn.isEnabled()
     assert not tab._progress.isVisible()
@@ -77,7 +77,7 @@ def test_ultra_profile_loads_deterministically_into_the_widgets(window):
     collected = tab._collect_controls()
     for key in ("animations", "sound_effects", "audio_reactive", "neural_effects",
                 "neural_max_nodes", "neural_tick_ms", "mind_reload_s",
-                "vault_watch_s", "index_fresh_s", "world_monitor_refresh"):
+                "vault_watch_s", "index_fresh_s"):
         assert collected[key] == ultra[key]
 
 

@@ -10,6 +10,7 @@ never runs code, and every result states which controller actually ran.
 | Layer | Controller | Serves | Package |
 | --- | --- | --- | --- |
 | Structured web | **Playwright** | `browser_action` — elements found by role, label, placeholder, test id, text or CSS | `playwright` |
+| Reverse engineering | **Playwright + the synthesis chain** | `reverse_engineer` — capture a site the user owns (DOM, styles, screenshot, HAR), list its API surface, synthesise a clean verified remake; copy an app folder's sources | `capabilities/reverse_engineer.py` |
 | Windows apps | **pywinauto** | `pc_control` — open/close/focus applications, native windows and controls | `pywinauto` |
 | Visual computer use | **UI-TARS + Gemini** | `visual_control` — act on what is only recognisable by sight | vendored `UI-TARS/codes/ui_tars` |
 | Physical input | **PyAutoGUI** | `pc_control` mouse/keyboard/screen, and the executor for visual clicks | `pyautogui` |
@@ -21,6 +22,7 @@ Selection is deterministic, not a guess:
 
 ```
 browser element that the page can describe   -> Playwright        (browser_action)
+site/app you own that you want copied        -> reverse_engineer  (capture → remake)
 Windows window or native control             -> pywinauto         (pc_control)
 target only recognisable by sight            -> UI-TARS + Gemini  (visual_control)
 raw pointer/keyboard input                   -> PyAutoGUI         (pc_control)
@@ -38,14 +40,33 @@ separate tool the model has to choose deliberately.
 
 ## How the model asks
 
-Three grouped tools carry an `action` enum; the enum and the parameter help are
+Grouped tools each carry an `action` enum; the enum and the parameter help are
 generated from `capabilities/registry.py`, so the vocabulary the model sees can
 never drift from what the router validates.
 
 * `pc_control` — `open_application`, `close_application`, `focus_window`,
   `mouse_move`, `mouse_click`, `mouse_double_click`, `mouse_right_click`,
   `mouse_drag`, `mouse_scroll`, `keyboard_type`, `keyboard_press`,
-  `keyboard_hotkey`, `screen_screenshot`
+  `keyboard_hotkey`, `screen_screenshot`, plus the advanced actions:
+  * screen reading through the **Windows OCR engine** (no extra package) —
+    `read_screen`, `find_text` (returns the exact point to click),
+    `click_text`, `wait_for_text`;
+  * **Windows UI Automation** through pywinauto's UIA backend — `ui_tree`,
+    `ui_read`, `ui_click`, `ui_set_text` (a named control is deterministic:
+    Windows says what it is and where it is, and `ui_set_text` verifies the
+    value it reads back);
+  * `run_sequence` — a declared JSON array of up to 15 safe steps
+    (`pc_control`, `window_control`, `system_control`, `clipboard_sentry`,
+    `file_control`). No confirm-gated action, no nesting; a failed step stops
+    the run and the result names what ran and what was skipped.
+* `file_control` — `list`, `find`, `info`, `open`, `mkdir`, `copy`, `move`,
+  `rename`, `delete`, `zip`, `unzip`. Read-only actions answer even with the
+  switch off; `delete` is `gate="confirm"` and moves to the **Recycle Bin**
+  (send2trash) instead of erasing; nothing overwrites silently and executables
+  are never opened.
+* `window_control` — `list_windows`, `minimize_all`, `minimize`, `maximize`,
+  `restore`, `tile_left`, `tile_right`, `snap_grid`, `move_to_monitor`,
+  `arrange_all`, `list_monitors`.
 * `visual_control` — `visual_find`, `visual_click`, `visual_type`,
   `visual_scroll`, `visual_keypress`
 * `browser_action` — `browser_open`, `browser_back`, `browser_forward`,
@@ -53,6 +74,18 @@ never drift from what the router validates.
   `browser_fill`, `browser_press`, `browser_select`, `browser_scroll`,
   `browser_read`, `browser_wait`, `browser_upload`, `browser_download`,
   `browser_screenshot`
+* `reverse_engineer` — `capture` (record a URL into
+  `data/workspaces/rea/<domain>/<run>/`), `api_surface` (the endpoints the
+  traffic revealed), `remake` (a clean, verified project synthesised from a
+  capture) and `reconstruct` (copy an app folder's own sources into a readable
+  tree; REA's recovery tools add compiled bundles when that server is on).
+  The capture drives the same Playwright session through `browser_pw`'s own
+  `browser_capture` recorder (DOM, screenshot, computed styles and a
+  credential-free HAR) — deliberately **not** an action of `browser_action`,
+  because the authorization gate lives on `reverse_engineer`. Every live
+  target or copy requires the user's explicit `authorized=true` statement —
+  the tool refuses without it — and each run appends one line to
+  `data/workspaces/rea/audit.log`
 * `power_control` — `lock`, `sleep`, `hibernate`, `shutdown`, `restart`,
   `sign_out`, `cancel_shutdown`, `empty_recycle_bin`, `restart_explorer`,
   `volume_up`, `volume_down`, `mute`, `set_volume`, `set_brightness`
@@ -111,12 +144,48 @@ python -c "from capabilities import decide; print(decide.report('play daft punk'
 ```
 
 It executes nothing. It probes what is really installed and ready
-(`media.status()`, `router.local_status()`, the Agent TARS/Reach adapters, the
-Settings switches), classifies the request (media / app / web / screen /
-research / chat) and returns an ordered plan where every candidate carries its
-reason — including the ones that are NOT ready, so "I cannot do that" is always
+(`media.status()`, `router.local_status()`, the OCR/UIA/files probes, the Agent
+TARS/Reach adapters, the Settings switches), classifies the request (media /
+app / web / screen / research / window / system / file / clipboard / document /
+chat) and returns an ordered plan where every candidate carries its reason —
+including the ones that are NOT ready, so "I cannot do that" is always
 specific. `tests/unit/test_control_decision.py` pins the policy offline with
 injected facts.
+
+### Smart Decision
+
+The same module is also the **Smart Decision** layer, exposed as the
+`smart_decide` tool (and as `control_plan` with `mode=smart`). It decides in
+three layers and always says which one decided:
+
+```
+python -c "from capabilities import decide; print(decide.render(decide.smart('minimize all windows')))"
+```
+
+1. **Deterministic rules** (`quick()`) — commands with exactly one mechanical
+   meaning are matched by a fixed pattern to one exact tool and action:
+   `minimize all windows` → `window_control.minimize_all`,
+   `set chrome priority high` → `system_control.set_process_priority`,
+   `take a screenshot` → `pc_control.screen_screenshot`,
+   `find the invoice from March` → `file_control.find`. A rule **always**
+   overrides the classifier — the live probes recorded Laya (the local 322M
+   decision model) answering CODE for "set chrome priority high" and "minimize
+   all windows", and a spoken command with one obvious meaning must not be at
+   the mercy of a guess. Guards keep conversation out: "find information about
+   laptops" is research, not a file search; "stop the music" is playback, not a
+   process kill; "copy this text to the clipboard" is the clipboard, not a file
+   copy.
+2. **Laya** — for everything the rules do not cover, the local classifier's
+   category is mapped onto an intent (SEARCH → research, VIEW → screen, FIND →
+   file, AUTOMATE → the vocabulary again, CHAT → conversation). A loading or
+   busy model is skipped instead of making the turn wait.
+3. **The built-in vocabulary** — the conservative fallback that has always been
+   there.
+
+The result carries `source` (`rule` / `laya` / `classifier`) and `confidence`,
+so no surface can present a guess as a certainty.
+`tests/unit/test_smart_decision.py` pins the rule table, the guards and the
+fusion order.
 
 ## UI-TARS runs on Gemini — there is no UI-TARS key
 
@@ -149,6 +218,7 @@ scale and the pointer position are reported in the evidence line).
 | Switch | Turns on |
 | --- | --- |
 | `playwright_browser` | `browser_action` (Playwright) |
+| `reverse_engineer` | `reverse_engineer` (capture, remake, reconstruct) — each run additionally needs the user's own authorization statement |
 | `windows_automation` | `pc_control` application/window actions (pywinauto) |
 | `uitars_visual` | `visual_control` (UI-TARS on Gemini) |
 | `physical_input` | mouse/keyboard actions and the visual layer's click executor |

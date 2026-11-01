@@ -157,11 +157,6 @@ def window(qapp, monkeypatch, camera):  # noqa: F811
         monkeypatch.setattr(ui._FeatheredCamView, "_load_geom", lambda self: None)
         monkeypatch.setattr(ui.RefinedCommandWindow, '_ensure_vision_analyzer',
                             lambda self: _NullAnalyzer())
-        # The world monitor fetches a live RSS feed 400 ms after it is built.
-        # A HUD test must not open a socket, so the fetch entry point is stubbed
-        # entirely; the fetch itself now runs on Qt's event loop, which also
-        # means no worker thread can outlive its window.
-        monkeypatch.setattr(ui.WorldMonitorPane, "refresh_feeds", lambda self: None)
 
         win = ui.MainWindow(str(root / "face.png"))
         qapp.processEvents()

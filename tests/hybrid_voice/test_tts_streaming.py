@@ -54,7 +54,7 @@ def test_next_sentence_is_synthesised_while_the_current_one_plays(monkeypatch):
     events: list = []
     playing = threading.Event()
 
-    def fake_play(frames, cancel=None, on_audio=None):
+    def fake_play(frames, cancel=None, on_audio=None, preopen_rate=None):
         gen = iter(frames)
         first = next(gen)
         events.append(("play", first[0].decode()))
@@ -82,7 +82,7 @@ def test_next_sentence_is_synthesised_while_the_current_one_plays(monkeypatch):
 def test_each_sentence_is_requested_separately(monkeypatch):
     asked: list = []
 
-    def fake_play(frames, cancel=None, on_audio=None):
+    def fake_play(frames, cancel=None, on_audio=None, preopen_rate=None):
         list(frames)
         return True
 
@@ -106,7 +106,7 @@ def test_cancel_stops_a_streamed_reply(monkeypatch):
     cancel = threading.Event()
     played: list = []
 
-    def fake_play(frames, cancel=None, on_audio=None):
+    def fake_play(frames, cancel=None, on_audio=None, preopen_rate=None):
         for chunk, _rate in frames:
             if cancel is not None and cancel.is_set():
                 break
@@ -127,7 +127,8 @@ def test_cancel_stops_a_streamed_reply(monkeypatch):
 def test_on_audio_fires_when_audio_really_starts(monkeypatch):
     calls: list = []
     monkeypatch.setattr(tts, "_play_pcm_frames",
-                        lambda frames, cancel=None, on_audio=None: (
+                        lambda frames, cancel=None, on_audio=None,
+                        preopen_rate=None: (
                             [next(iter(frames))],
                             on_audio() if on_audio else None,
                             True)[-1])
@@ -139,8 +140,8 @@ def test_on_audio_fires_when_audio_really_starts(monkeypatch):
 
 def test_stream_error_with_no_audio_is_raised_for_the_fallback(monkeypatch):
     monkeypatch.setattr(tts, "_play_pcm_frames",
-                        lambda frames, cancel=None, on_audio=None: (
-                            list(frames) and True))
+                        lambda frames, cancel=None, on_audio=None,
+                        preopen_rate=None: (list(frames) and True))
 
     def make_frames(sentence):
         raise RuntimeError("HTTP 500")
@@ -152,7 +153,7 @@ def test_stream_error_with_no_audio_is_raised_for_the_fallback(monkeypatch):
 
 def test_partial_audio_then_error_does_not_raise(monkeypatch):
     """Half a reply already reached the speaker: report, do not restart it."""
-    def fake_play(frames, cancel=None, on_audio=None):
+    def fake_play(frames, cancel=None, on_audio=None, preopen_rate=None):
         list(frames)
         return True
 
@@ -271,3 +272,76 @@ def test_empty_text_is_a_no_op_for_both_cloud_engines(monkeypatch):
                         lambda b: pytest.fail("nothing to speak"))
     tts.ElevenLabsTTSEngine(api_key="k", voice_id="v" * 20).speak("   ")
     tts.FishAudioTTSEngine(api_key="k", voice_id="v").speak("")
+
+
+# -- continuous local playback (Piper / Kokoro) -----------------------------
+
+class _FakeOutputStream:
+    """Stands in for sounddevice.RawOutputStream (no real device)."""
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self.latency = 0.05
+        self.writes: list[bytes] = []
+        self.closed = False
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_local_chunks_share_one_output_stream(monkeypatch):
+    """Per-chunk sd.play()/wait() seams are gone: ONE stream, back-to-back."""
+    import numpy as np
+
+    opened: list[_FakeOutputStream] = []
+
+    def _open(rate):
+        stream = _FakeOutputStream(int(rate))
+        opened.append(stream)
+        return stream
+
+    monkeypatch.setattr(tts, "_open_pcm_stream", _open)
+    frames = [(np.zeros(240, dtype=np.float32), 24000) for _ in range(3)]
+    assert tts._play_np_frames(frames, preopen_rate=24000) is True
+    assert len(opened) == 1, "the device must not be reopened between chunks"
+    assert len(opened[0].writes) == 3
+    assert all(len(w) == 480 for w in opened[0].writes)   # 240 samples x 2 bytes
+    assert opened[0].closed
+
+
+def test_local_interrupt_fades_out_instead_of_clicking(monkeypatch):
+    import numpy as np
+
+    stream = _FakeOutputStream(24000)
+    monkeypatch.setattr(tts, "_open_pcm_stream", lambda rate: stream)
+    cancel = threading.Event()
+
+    def _frames():
+        yield np.ones(240, dtype=np.float32), 24000
+        cancel.set()
+        yield np.ones(240, dtype=np.float32), 24000
+
+    assert tts._play_np_frames(_frames(), cancel=cancel,
+                               preopen_rate=24000) is True
+    # one real chunk, then the 20 ms ramp to silence (480 samples = 960 bytes)
+    assert len(stream.writes) == 2
+    assert len(stream.writes[1]) == int(0.02 * 24000) * 2
+    assert len(stream.writes[0]) == 480
+
+
+def test_local_frames_survive_a_speaker_error(monkeypatch):
+    import numpy as np
+
+    class _Broken(_FakeOutputStream):
+        def write(self, data):
+            raise RuntimeError("device lost")
+
+    monkeypatch.setattr(tts, "_open_pcm_stream", lambda rate: _Broken(rate))
+    assert tts._play_np_frames(
+        [(np.zeros(240, dtype=np.float32), 24000)]) is False

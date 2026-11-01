@@ -9,6 +9,15 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+try:
+    from actions.coding_events import emit_coding, unified_diff_text
+except Exception:  # pragma: no cover - the progress bridge must never block a build
+    def emit_coding(player, kind, **payload):
+        pass
+
+    def unified_diff_text(old, new, *, path='', max_lines=160):
+        return ''
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -699,6 +708,7 @@ def _fix_files(
     language: str,
     project_dir: Path,
     entry_point: str,
+    player=None,
 ) -> dict[str, str]:
 
     model = _get_model(MODEL_PLANNER)
@@ -780,6 +790,10 @@ Fixed code for {fix_path}:"""
 
             updated_codes[fix_path] = fixed
             print(f"[DevAgent] 🔧 Fixed: {fix_path}")
+            # The card shows the REAL change the autofix applied.
+            emit_coding(player, 'diff', path=fix_path,
+                        diff=unified_diff_text(current_code, fixed,
+                                               path=fix_path))
 
         except Exception as e:
             if _is_rate_limit(e):
@@ -935,6 +949,8 @@ def _build_project(
         print(f"[DevAgent] {msg}")
         if player:
             player.write_log(f"[DevAgent] {msg}")
+        # The chat's live coding card shows the same REAL stage.
+        emit_coding(player, 'stage', stage=msg)
 
     log("Planning project structure...")
     try:
@@ -942,10 +958,12 @@ def _build_project(
     except RateLimitError:
         msg = "Rate limit reached, sir. Please try again in a moment."
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg
     except ValueError as e:
         msg = f"Planning failed: {e}"
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg
 
     proj_name    = project_name or plan.get("project_name", "jarvis_project")
@@ -960,6 +978,7 @@ def _build_project(
         msg = (f"I stopped before creating anything, sir — the project plan was "
                f"not usable: {plan_error}.")
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg
 
     files        = plan["files"]
@@ -979,7 +998,7 @@ def _build_project(
 
     file_codes: dict[str, str] = {}
 
-    for file_info in sorted_files:
+    for file_index, file_info in enumerate(sorted_files, start=1):
         file_path = file_info.get("path", "")
         if not file_path:
             continue
@@ -996,6 +1015,11 @@ def _build_project(
                     already_written=file_codes,
                 )
                 file_codes[file_path] = code
+                # The chat's coding card streams the REAL file that was just
+                # written (the full text is kept there for EXPAND/COPY).
+                emit_coding(player, 'file', path=file_path, code=code,
+                            language=language, project=proj_name,
+                            index=file_index, total=len(sorted_files))
                 time.sleep(0.4)
                 break
             except RateLimitError:
@@ -1011,6 +1035,7 @@ def _build_project(
     if not file_codes:
         msg = "I could not write any project files, sir."
         if speak: speak(msg)
+        emit_coding(player, 'failed', project=proj_name, summary=msg)
         return msg
 
     # Its own environment first — and for EVERY Python project, not only those
@@ -1040,6 +1065,9 @@ def _build_project(
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
         outcome = _run_project(run_command, project_dir, timeout, python_exe=project_python)
         log(f"Output preview: {outcome.output[:150]}")
+        # The card shows the REAL run's output preview, not a spinner.
+        emit_coding(player, 'run', attempt=attempt, total=MAX_FIX_ATTEMPTS,
+                    output=(outcome.output or '')[:400])
 
         if not _has_error(outcome):
             if outcome.timed_out:
@@ -1057,6 +1085,9 @@ def _build_project(
                     f"Saved to: {project_dir}"
                 )
             if speak: speak(msg)
+            emit_coding(player, 'done', project=proj_name,
+                        path=str(project_dir), files=list(file_codes.keys()),
+                        success=True, summary=msg)
             body = f"\n\nOutput:\n{outcome.output}" if outcome.output.strip() else ""
             return f"{msg}{body}"
 
@@ -1092,12 +1123,15 @@ def _build_project(
                 language=language,
                 project_dir=project_dir,
                 entry_point=entry_point,
+                player=player,
             )
             file_codes.update(updated)
             time.sleep(1)
         except RateLimitError:
             msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
             if speak: speak(msg)
+            emit_coding(player, 'failed', project=proj_name, success=False,
+                        summary=msg)
             return msg
         except Exception as e:
             log(f"Fix step failed: {e}")
@@ -1107,6 +1141,7 @@ def _build_project(
         f"Project is saved at {project_dir} — open it in VSCode and check manually."
     )
     if speak: speak(msg)
+    emit_coding(player, 'failed', project=proj_name, success=False, summary=msg)
     exit_note = (f"exit {outcome.exit_code}" if outcome.exit_code is not None
                  else "no exit status")
     return f"{msg}\n\nLast error ({exit_note}):\n{outcome.output[:600]}"
@@ -1195,6 +1230,11 @@ def dev_agent(
         # what this gate exists to prevent.
         return f"The coding approval gate is unavailable ({exc}); I have not started that build."
 
+    # The approval gate passed and the build really starts: the chat opens the
+    # live coding card for it from this point.
+    emit_coding(player, 'start', description=description, language=language,
+                project=project_name or '')
+
     try:
         return _build_project(
             description  = description,
@@ -1207,10 +1247,12 @@ def dev_agent(
     except RateLimitError:
         msg = "Gemini is rate-limiting me, sir. Nothing was built — try again in a moment."
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg
     except Exception as e:
         # A build that dies before finishing (bad key, no network, an SDK change)
         # becomes an actionable sentence instead of a raw exception string.
         msg = _describe_model_failure(e)
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg

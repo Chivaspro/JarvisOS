@@ -80,7 +80,14 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     "clipboard_sentry": True,       # writing to and analysing the clipboard
     "file_control": True,           # list/find/copy/move/zip and Recycle-Bin deletes
     "document_architect": True,     # writing Word/Excel/PowerPoint/PDF deliverables
-    "auto_approve_coding": False,   # when on, coding tasks skip the chatlog approve/decline prompt
+    # Per-kind approval bypasses. Each defaults OFF: with every flag off the
+    # central approval service posts a card and blocks until the user decides.
+    # The card's Auto-Approve control writes exactly one of these flags.
+    "auto_approve_coding": False,
+    "auto_approve_file_change": False,
+    "auto_approve_desktop": False,
+    "auto_approve_plugin": False,
+    "auto_approve_automation": False,
     "laya_ai": True,                # local Laya decision AI classifies + routes tasks (falls back safely when the model is absent)
     # ── Automatic task teardown & interactive questions ─────────────────────
     # One task record per (non-greeting) request: lifecycle, live checklist,
@@ -119,6 +126,12 @@ FEATURE_DEFAULTS: dict[str, bool | str] = {
     # also off) restores the synchronized final-response behaviour: the complete
     # reply is published together with its audio.
     "tts_realtime": True,
+    # Markdown-aware speech: the VOICE reads prose only — headings, bold
+    # markers, inline-code backticks, table pipes and fenced code blocks are
+    # shown in the chat but never spoken ("Certainly, sir. Here is an example
+    # of Markdown formatting for your review:"). Code blocks are skipped
+    # silently. OFF restores reading the raw text aloud, symbols and all.
+    "speech_markdown_filter": True,
     # ── Self-evolution (the Skill Crucible) ─────────────────────────────────
     # J.A.R.V.I.S. may write a brand-new tool for himself when a request has no
     # built-in answer. Every candidate is AST-checked, dependency-resolved and

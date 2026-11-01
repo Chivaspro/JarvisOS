@@ -45,6 +45,7 @@ _TOOL_TIERS: dict[str, RiskTier] = {
     "pc_control": RiskTier.MEDIUM,         # local desktop/window/input control
     "visual_control": RiskTier.MEDIUM,     # UI-TARS visual control of the screen
     "browser_action": RiskTier.MEDIUM,     # Playwright acting on a page element
+    "reverse_engineer": RiskTier.MEDIUM,   # captures evidence / writes a remake
     # HIGH: outward-facing or destructive
     "coding_agent": RiskTier.HIGH,
 }

@@ -214,6 +214,11 @@ def get_plugin_enabled(plugin_name: str) -> bool:
 
 
 def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
+    _patch_section("plugins_enabled", plugin_name, bool(enabled))
+
+
+def _patch_section(section: str, key: str, values) -> None:
+    """Merge *values* into ``<section>.<key>`` in api_keys.json."""
     ensure_config_dir()
     data: dict = {}
     if CONFIG_FILE.exists():
@@ -221,9 +226,38 @@ def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-    plugins_cfg = data.get("plugins_enabled")
-    if not isinstance(plugins_cfg, dict):
-        plugins_cfg = {}
-    plugins_cfg[plugin_name] = enabled
-    data["plugins_enabled"] = plugins_cfg
+    block = data.get(section)
+    if not isinstance(block, dict):
+        block = {}
+    block[key] = values
+    data[section] = block
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_plugin_settings(plugin_id: str) -> dict:
+    """Per-plugin values (credentials, model choice, options), never raising."""
+    block = load_api_keys().get("plugin_settings")
+    if not isinstance(block, dict):
+        return {}
+    stored = block.get(str(plugin_id))
+    return dict(stored) if isinstance(stored, dict) else {}
+
+
+def save_plugin_settings(plugin_id: str, values: dict) -> None:
+    """Merge *values* into one plugin's settings block."""
+    current = get_plugin_settings(plugin_id)
+    current.update(dict(values or {}))
+    _patch_section("plugin_settings", str(plugin_id), current)
+
+
+def get_plugin_limits(plugin_id: str) -> dict:
+    """Saved execution-limit overrides for one plugin (empty when untouched)."""
+    block = load_api_keys().get("plugin_limits")
+    if not isinstance(block, dict):
+        return {}
+    stored = block.get(str(plugin_id))
+    return dict(stored) if isinstance(stored, dict) else {}
+
+
+def save_plugin_limits(plugin_id: str, values: dict) -> None:
+    _patch_section("plugin_limits", str(plugin_id), dict(values or {}))

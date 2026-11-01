@@ -65,6 +65,76 @@ def test_a_modern_node_is_ready_and_its_version_is_quoted(monkeypatch):
     assert detail == "node v22.16.0"
 
 
+# ── REA (npm MCP server, opt-in) ─────────────────────────────────────────────
+
+def test_rea_needs_both_a_supported_node_and_the_extracted_package(monkeypatch):
+    from mcp_host import rea
+
+    monkeypatch.setattr(rea, "node_readiness",
+                        lambda refresh=False: {"ok": False,
+                                               "error": "Node.js 20 is not supported"})
+    ready, detail = installer.rea_status()
+    assert ready is False and "not supported" in detail
+
+    monkeypatch.setattr(rea, "node_readiness",
+                        lambda refresh=False: {"ok": True, "warning": ""})
+    monkeypatch.setattr(rea, "rea_cached", lambda version=None: False)
+    ready, detail = installer.rea_status()
+    assert ready is False and "not cached" in detail
+
+    monkeypatch.setattr(rea, "rea_cached", lambda version=None: True)
+    ready, detail = installer.rea_status()
+    assert ready is True and rea.REA_VERSION in detail
+
+
+def test_installing_rea_runs_the_npx_extraction_and_verifies_it(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(installer, "node_status", lambda: (True, "node v24.20.0"))
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"C:/node/{name}.CMD")
+    monkeypatch.setattr(installer.subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or _Result(b"6.7.0"))
+    monkeypatch.setattr(installer, "rea_status",
+                        lambda: (True, f"REA {installer.REA_VERSION} cached"))
+
+    ok, message = installer.install_feature("rea")
+
+    assert ok is True and "ready" in message
+    assert calls and calls[0][-1] == "--version"
+    assert f"rea-agents@{installer.REA_VERSION}" in calls[0]
+
+
+def test_rea_install_does_not_claim_success_before_the_cache_has_it(monkeypatch):
+    monkeypatch.setattr(installer, "node_status", lambda: (True, "node v24.20.0"))
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"C:/node/{name}.CMD")
+    monkeypatch.setattr(installer.subprocess, "run",
+                        lambda *a, **k: _Result(b"", returncode=1))
+    monkeypatch.setattr(installer, "rea_status",
+                        lambda: (False, "REA is not cached"))
+
+    ok, message = installer.install_feature("rea")
+
+    assert ok is False and "failed" in message
+
+
+def test_rea_is_listed_as_an_opt_in_feature_with_its_pin():
+    rows = installer.feature_status()
+    row = next(r for r in rows if r["feature"] == "rea")
+    assert "opt-in" in row["purpose"]
+    assert row["package"] == f"{installer.REA_PACKAGE}@{installer.REA_VERSION}"
+
+
+def test_laya_is_listed_with_both_runtime_packages():
+    rows = installer.feature_status()
+    laya_rows = [r for r in rows if r["feature"] == "laya"]
+    packages = {r["package"] for r in laya_rows}
+    assert "laya==0.4.14" in packages
+    assert any(p.startswith("transformers") for p in packages)
+    for row in laya_rows:
+        assert row["purpose"]
+        if not row["ready"]:
+            assert row["fix"].startswith("pip install")
+
+
 # ── the feature table ────────────────────────────────────────────────────────
 
 def test_every_row_names_the_feature_that_needs_it_and_how_to_add_it():

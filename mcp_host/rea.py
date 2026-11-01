@@ -12,9 +12,12 @@ Three rules live in this module and nowhere else:
   pins a single release. :data:`REA_VERSION` is that pin and the one place to
   change on upgrade. Nothing here installs anything.
 * **Readiness is measured, never assumed.** :func:`node_readiness` runs the real
-  ``node --version`` / ``npm --version`` and applies REA's supported matrix
-  (22.19+, 24.11+, or 26+; 23/25 and prereleases are unsupported). A missing or
-  too-old runtime is reported with the exact requirement, never masked.
+  ``node --version`` / ``npm --version`` and applies two matrices: the hard gate
+  npm itself enforces (22.19+, 24.11+, or 26+; 23/25 and prereleases are
+  unsupported) and REA's own tested recommendation (22.23.4+, 24.22.1+, or
+  26.12.1+). A missing or too-old runtime is reported with the exact
+  requirement, never masked; a runtime that installs but is below the tested
+  matrix is reported as a warning, not a false failure.
 * **The server is opt-in.** The spec ships ``enabled=False``: REA is listed in
   Settings ▸ MCP and ``mcp status``, but no Node process is spawned until the
   user (or the model, on request) enables it. Enabling is per-session state the
@@ -32,8 +35,10 @@ import time
 from pathlib import Path
 
 __all__ = [
+    "NODE_RECOMMENDED_REQUIREMENT",
     "NODE_REQUIREMENT",
     "REA_NAMESPACE",
+    "REA_PACKAGE",
     "REA_SERVER_NAME",
     "REA_SWITCH",
     "REA_TIMEOUT_S",
@@ -43,16 +48,23 @@ __all__ = [
     "describe_readiness",
     "guidance_text",
     "node_readiness",
+    "node_recommended",
     "node_supported",
     "readiness_text",
+    "rea_cached",
+    "rea_cached_versions",
     "rea_command",
+    "rea_npx_cache_dirs",
     "rea_server_spec",
     "with_untrusted_banner",
 ]
 
-#: The pinned REA release (resolved from ``npm view rea-agents dist-tags.latest``
-#: on 2026-10-16). Bump this one constant to upgrade, then refresh the server.
-REA_VERSION = "6.5.0"
+#: The npm package and the pinned release. REA's own guidance is that a
+#: persistent registration pins one exact version. Bump this one constant to
+#: upgrade, then refresh the server (setup ▸ Install & update ▸ REA does the
+#: cache pre-warm and the real handshake for you).
+REA_PACKAGE = "rea-agents"
+REA_VERSION = "6.7.0"
 
 #: The MCP server's name and the ``<prefix>__<tool>`` namespace its tools use.
 REA_SERVER_NAME = "rea"
@@ -71,8 +83,12 @@ REA_SWITCH = "rea_servers"
 REA_TIMEOUT_S = 300.0
 REA_START_TIMEOUT_S = 240.0
 
-#: What REA's host runtime check enforces.
+#: What npm's own ``engines`` field enforces — the hard gate.
 NODE_REQUIREMENT = "Node.js 22.19+, 24.11+, or 26+"
+
+#: What REA's README says it is tested against — a warning, never a hard gate.
+NODE_RECOMMENDED_REQUIREMENT = ("Node.js 22.23.4+, 24.22.1+, or 26.12.1+ "
+                                "(REA's tested matrix)")
 
 #: The tools published to the model by default. REA advertises 200+ tools (its
 #: full catalog measured ~148k characters of declarations — far too much for a
@@ -279,10 +295,11 @@ def _parse_version(text: str) -> tuple[int, int, int] | None:
 
 
 def node_supported(version: str) -> bool:
-    """Is this Node version one REA actually supports?
+    """Is this Node version one npm will install REA on?
 
-    22.x from 22.19, 24.x from 24.11, and even-numbered 26 and later. Odd
-    majors (23, 25, …) and prereleases are unsupported, exactly as REA documents.
+    This is the hard gate from ``rea-agents``' own ``engines`` field:
+    ``^22.19.0 || ^24.11.0 || >=26.0.0``. Odd majors (23, 25, …) and
+    prereleases are unsupported, exactly as npm enforces.
     """
     text = str(version or "").strip()
     if not text:
@@ -302,10 +319,38 @@ def node_supported(version: str) -> bool:
     return False
 
 
+def node_recommended(version: str) -> bool:
+    """Is this Node version inside REA's own tested matrix?
+
+    The README asks for 22.23.4+, 24.22.1+, or 26.12.1+. A runtime can satisfy
+    npm's hard gate and still be below this line; that is a warning the user can
+    act on, never a reason to claim REA is broken.
+    """
+    text = str(version or "").strip()
+    if not text:
+        return False
+    if "-" in text.split("+", 1)[0]:
+        return False
+    parsed = _parse_version(text)
+    if parsed is None:
+        return False
+    major, minor, patch = parsed
+    if major == 22:
+        return (minor, patch) >= (23, 4)
+    if major == 24:
+        return (minor, patch) >= (22, 1)
+    if major == 26:
+        return (minor, patch) >= (12, 1)
+    return major > 26 and major % 2 == 0
+
+
 def _measure_readiness() -> dict:
     """The real facts on this machine. Nothing is started but ``node``/``npm``."""
     out = {"ok": False, "node": "", "npm": "", "npx": "", "error": "",
-           "requirement": NODE_REQUIREMENT}
+           "requirement": NODE_REQUIREMENT,
+           "recommended": False,
+           "recommendation": NODE_RECOMMENDED_REQUIREMENT,
+           "warning": ""}
 
     node_exe = shutil.which("node")
     if not node_exe:
@@ -338,6 +383,12 @@ def _measure_readiness() -> dict:
         out["error"] = "npx was not found on PATH (npx ships with npm)."
         return out
 
+    out["recommended"] = node_recommended(version)
+    if not out["recommended"]:
+        clean = version.lstrip("vV")
+        out["warning"] = (f"Node.js {clean} satisfies npm's install gate but is "
+                          f"below REA's tested matrix; update to "
+                          f"{NODE_RECOMMENDED_REQUIREMENT} when convenient.")
     out["ok"] = True
     return out
 
@@ -362,9 +413,73 @@ def readiness_text() -> str:
     """One honest sentence for the model, the Settings panel or a log line."""
     facts = node_readiness()
     if facts["ok"]:
-        return (f"REA is ready to start — Node {facts['node']} detected "
+        text = (f"REA is ready to start — Node {facts['node']} detected "
                 f"(needs {NODE_REQUIREMENT}).")
+        if facts.get("warning"):
+            text += " Note: " + facts["warning"]
+        return text
     return "REA cannot start: " + (facts["error"] or "the runtime was not usable")
+
+
+# ── npx cache (what "installed" actually means for an npx-pinned server) ──────
+
+def _npx_cache_root() -> Path:
+    """The npm cache's ``_npx`` directory on this platform."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "npm-cache" / "_npx"
+    return Path.home() / ".npm" / "_npx"
+
+
+def rea_npx_cache_dirs(version: str | None = None) -> list[Path]:
+    """Every ``_npx`` entry that contains a ``rea-agents`` package.
+
+    With *version*, only entries whose ``package.json`` declares exactly that
+    version are returned. This is the one honest way to answer "is the pinned
+    release already on this machine?" without starting Node.
+    """
+    root = _npx_cache_root()
+    wanted = str(version or "").strip().lstrip("vV")
+    found: list[Path] = []
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return found
+    for entry in candidates:
+        package_json = entry / "node_modules" / REA_PACKAGE / "package.json"
+        try:
+            if not package_json.is_file():
+                continue
+            import json
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+            installed = str(data.get("version") or "").strip().lstrip("vV")
+        except Exception:
+            continue
+        if wanted and installed != wanted:
+            continue
+        found.append(entry)
+    return found
+
+
+def rea_cached_versions() -> list[str]:
+    """Versions of ``rea-agents`` already extracted into the npx cache."""
+    versions: list[str] = []
+    for entry in rea_npx_cache_dirs():
+        package_json = entry / "node_modules" / REA_PACKAGE / "package.json"
+        try:
+            import json
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+            value = str(data.get("version") or "").strip().lstrip("vV")
+        except Exception:
+            continue
+        if value and value not in versions:
+            versions.append(value)
+    return sorted(versions)
+
+
+def rea_cached(version: str | None = None) -> bool:
+    """True when the pinned (or given) REA release is already in the npx cache."""
+    return bool(rea_npx_cache_dirs(version or REA_VERSION))
 
 
 def describe_readiness(server: str) -> str:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re as _re
 import subprocess
 import sys
 import threading
@@ -288,12 +289,22 @@ def test_agent_tars_cli_override_wins(monkeypatch, tmp_path):
 
 
 def test_no_secret_is_hardcoded_anywhere_in_the_layer():
+    """Key MATERIAL, not the authorization scheme word.
+
+    ``Authorization: f"Bearer {token}"`` builds the header from a token read at
+    runtime — the word "Bearer" there is an OAuth scheme name, not a secret. A
+    hardcoded credential looks like ``Bearer eyJhbGci…``: the scheme followed by
+    literal key material. Both shapes are checked here so the layer can never
+    ship a real key, while legitimate header construction stays legal.
+    """
     offenders = []
     for path in sorted((ROOT / "capabilities").rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
-        for needle in ("AIza", "sk-", "Bearer "):
+        for needle in ("AIza", "sk-"):
             if needle in text:
                 offenders.append(f"{path.name}: {needle}")
+        if _re.search(r"Bearer\s+(?!\{)[A-Za-z0-9._\-]{12,}", text):
+            offenders.append(f"{path.name}: Bearer <literal credential>")
     assert offenders == []
 
 
@@ -471,15 +482,18 @@ def test_no_forbidden_framework_was_added():
 
 
 def test_physical_input_is_imported_in_exactly_one_place():
-    """The local controllers live behind capabilities/desktop.py only.
+    """The local controllers live behind two audited modules only.
 
-    pyautogui and pywinauto touch the user's real machine, so exactly one
-    audited module may import them: every PC/visual action goes through it, and
-    there is one place to read (and one place to review) for that behaviour.
-    The retired adapters stay unimportable too.
+    PyAutoGUI touches the user's real pointer and keyboard, so exactly one
+    audited module may import it: every physical action goes through
+    ``capabilities/desktop.py``. Windows UI Automation is a separate controller
+    (``capabilities/uia.py``) that drives named controls through pywinauto's
+    UIA backend — it does not move the pointer unless Invoke is unavailable, and
+    it reports which path ran. The retired adapters stay unimportable too.
     """
     offenders = []
-    allowed = "capabilities/desktop.py"
+    pyautogui_allowed = {"capabilities/desktop.py"}
+    pywinauto_allowed = {"capabilities/desktop.py", "capabilities/uia.py"}
     for path in ROOT.rglob("*.py"):
         parts = set(path.parts)
         if {"AgentReach", "node_modules", ".venv", "venv", "UI-TARS",
@@ -489,11 +503,15 @@ def test_physical_input_is_imported_in_exactly_one_place():
         if rel.as_posix().startswith("tests/") or rel.as_posix().startswith("docs/"):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        for needle in ("import pyautogui", "import pywinauto",
-                       "from pyautogui", "from pywinauto",
-                       "from capabilities import agent_s",
+        for needle in ("import pyautogui", "from pyautogui"):
+            if needle in text and rel.as_posix() not in pyautogui_allowed:
+                offenders.append(f"{rel}: {needle}")
+        for needle in ("import pywinauto", "from pywinauto"):
+            if needle in text and rel.as_posix() not in pywinauto_allowed:
+                offenders.append(f"{rel}: {needle}")
+        for needle in ("from capabilities import agent_s",
                        "from capabilities import browser_use"):
-            if needle in text and rel.as_posix() != allowed:
+            if needle in text:
                 offenders.append(f"{rel}: {needle}")
     assert offenders == []
 

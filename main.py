@@ -533,14 +533,24 @@ _LEVEL_FULL  = 2600.0
 
 def _pcm_level(samples) -> float:
     """Map a block of int16 PCM samples to a 0.0–1.0 loudness level for the HUD
-    waveform. Returns 0.0 on empty/invalid input so it can never raise."""
+    waveform. Returns 0.0 on empty/invalid input so it can never raise.
+
+    The RMS is one bulk pass — Rust (``core.native``) when the native backend
+    is built, the identical numpy formula otherwise. Runs per 64 ms mic block
+    on the PortAudio callback thread, so a single pass and zero temporaries
+    matter here.
+    """
     if np is None:  # numpy missing — no meter, but the mic itself still works
         return 0.0
     try:
         x = np.asarray(samples, dtype=np.float32)
         if x.size == 0:
             return 0.0
-        rms = float(np.sqrt(np.mean(x * x)))
+        try:
+            from core import native as _native
+            rms = float(_native.rms_f32(x))
+        except Exception:
+            rms = float(np.sqrt(np.mean(x * x)))
     except Exception:
         return 0.0
     if rms <= _LEVEL_FLOOR:
@@ -599,10 +609,16 @@ class _MicVoiceGate:
     @staticmethod
     def _rms(indata) -> float:
         try:
-            x = np.asarray(indata, dtype=np.float32)
-            if x.size == 0:
-                return 0.0
-            return float(np.sqrt(np.mean(x * x)))
+            try:
+                # Native single pass over the int16 block (no float copy);
+                # falls back to the identical numpy formula when absent.
+                from core import native as _native
+                return float(_native.rms_auto(indata))
+            except Exception:
+                x = np.asarray(indata, dtype=np.float32)
+                if x.size == 0:
+                    return 0.0
+                return float(np.sqrt(np.mean(x * x)))
         except Exception:
             return 0.0   # any sampling hiccup → treat as silence-safe (open? see below)
 
@@ -1008,26 +1024,25 @@ TOOL_DECLARATIONS = [
         "description": (
             "Controls JARVIS's OWN built-in HUD panels and windows. Use this tool whenever "
             "the user asks to open, show, close, refresh, or search inside any JARVIS panel: "
-            "WebView, Image Preview, World Monitor (the System panel), Video Preview, Web Task, "
+            "WebView, Image Preview, Video Preview, Web Task, "
             "the Mind panel (memories, beliefs, dreams, neural map), Activity Log, "
             "Content Surface, 3D Display, the live Vision panel, or "
             "JARVIS's own Settings / Control Center window. "
             "IMPORTANT: 'open JARVIS settings', 'open the UI Jarvis settings', 'open UI settings', "
             "'open control center' means THIS window (window='settings') — never the OS/Windows "
             "settings app. 'open vision panel' / 'open the vision view' means window='vision'. "
-            "'open system panel' / 'open the system monitor' means window='world_monitor'. "
             "For web/search requests, keep the result inside the JARVIS UI and do not open the "
             "external system browser when WebView is enabled. "
-            "Examples: 'open webview', 'search cats in webview', 'open world monitor', "
+            "Examples: 'open webview', 'search cats in webview', "
             "'show image panel', 'open video preview', 'open memory core', "
-            "'open JARVIS settings', 'open vision panel', 'open system panel'."
+            "'open JARVIS settings', 'open vision panel'."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "window": {
                     "type": "STRING",
-                    "description": "webview | image | world_monitor | video | web_task | memory | activity | content | 3d | settings | vision"
+                    "description": "webview | image | video | web_task | memory | activity | content | 3d | settings | vision"
                 },
                 "action": {
                     "type": "STRING",
@@ -2575,6 +2590,55 @@ TOOL_DECLARATIONS += [
 # count in the status is a real one.
 TOOL_DECLARATIONS += [
     {
+        "name": "request_approval",
+        "description": (
+            "Ask the user for explicit permission before changing files, the "
+            "desktop, a plugin, an automation, or running code. ALWAYS call "
+            "this when you would otherwise say 'I can make that change for "
+            "you': describing a proposal is not approval. The call blocks "
+            "until the user presses Approve or Decline (Auto-Approve is off "
+            "by default). Proceed only when the result says APPROVED; when it "
+            "says DECLINED, do not perform the action and tell the user it "
+            "was declined. Never simulate approval."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "kind": {
+                    "type": "STRING",
+                    "description": "coding | file_change | desktop | plugin | automation | action",
+                    "enum": ["coding", "file_change", "desktop", "plugin",
+                             "automation", "action"],
+                },
+                "title": {
+                    "type": "STRING",
+                    "description": "One-line summary, e.g. 'Rewrite the login handler'.",
+                },
+                "question": {
+                    "type": "STRING",
+                    "description": "The exact question the user is answering.",
+                },
+                "description": {
+                    "type": "STRING",
+                    "description": ("What will happen, why, and anything "
+                                    "irreversible. Shown in the approval card."),
+                },
+                "targets": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Files, folders, apps or systems affected.",
+                },
+                "changes": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": ("Concrete changes as 'path — summary' "
+                                    "strings, one per entry."),
+                },
+            },
+            "required": ["kind", "title", "question", "description"],
+        },
+    },
+    {
         "name": "live_vision",
         "description": (
             "See through this machine's camera while the user talks. Use "
@@ -2871,25 +2935,68 @@ def _wait_for_mcp_settle(server: str, timeout: float = 20.0) -> str:
         return ""
 
 
-def _tool_result_status(result: object, permission_blocked: bool = False) -> str:
+#: The diagnostics engine ends every report with a machine-readable verdict
+#: line. A report is a DOCUMENT *about* the system, so its own success must
+#: never be sniffed from prose: "aider not installed" is a finding, not a
+#: failed diagnostic. Only the exact three verdict words count — the
+#: performance report uses the same "VERDICT:" prefix with different wording.
+_DIAG_VERDICT_RE = re.compile(r"^\s*verdict:\s*(ok|attention|failed)\s*$",
+                              re.IGNORECASE | re.MULTILINE)
+
+
+def _diagnostics_verdict(text: str) -> str:
+    """The last ``VERDICT: ok|attention|failed`` line, or "" when absent."""
+    try:
+        found = ""
+        for match in _DIAG_VERDICT_RE.finditer(str(text or "")):
+            found = match.group(1).strip().lower()
+        return found
+    except Exception:
+        return ""
+
+
+def _tool_result_status(result: object, permission_blocked: bool = False,
+                        tool: str = "") -> str:
     """Classify a text result for learning and observability.
 
     Older tool implementations return natural-language text rather than a
     shared result object. Keep this conservative and preserve a distinct
     verification-failure state so the assistant cannot learn or report an
     unchecked action as a success.
+
+    ``tool`` names the tool that produced the result. The ``diagnostics`` tool
+    is the one case where the result is a report *about* the machine: an
+    OFFLINE or DEGRADED capability is a truthful finding, so the call is
+    classified from the report's own verdict line instead of its wording.
+    FAILED then means exactly "a check could not be executed" and nothing else.
     """
     if permission_blocked:
         return "REQUIRES_PERMISSION"
-    text = str(result or "").strip().lower()
+    raw = str(result or "")
+    text = raw.strip().lower()
     # Capability-router outcomes carry their own explicit status and verification
-    # markers, so classification never depends on phrasing in the engine's prose.
+    # markers. They are machine outcomes, so they outrank EVERYTHING — including
+    # the diagnostics verdict below: a call that reported status=not_done (or
+    # verified=false) did not succeed, whatever prose or verdict accompanies it.
     if "status=not_done" in text:
         return "FAILED"
     if "verified=false" in text:
         return "VERIFICATION_FAILED"
     if "[unverified]" in text or "verification failed" in text:
         return "VERIFICATION_FAILED"
+    if str(tool or "").strip().lower() == "diagnostics":
+        # A report is a DOCUMENT *about* the machine: an OFFLINE or DEGRADED
+        # capability is a truthful finding, not a failed diagnostic, so the
+        # call is classified from the report's own verdict line rather than its
+        # wording. Only after the explicit markers above, so a real router
+        # failure is never masked by an "ok"/"attention" verdict.
+        _verdict = _diagnostics_verdict(raw)
+        if _verdict in ("ok", "attention"):
+            return "SUCCESS"
+        if _verdict == "failed":
+            return "FAILED"
+        # No verdict line (older/other diagnostics output): fall through to the
+        # conservative keyword scan rather than guessing an outcome.
     padded = f" {text} "
     if (
         text.startswith(("failed", "error", "unknown tool", "fail:"))
@@ -2995,6 +3102,81 @@ def _task_artifacts_from_result(tool_name: str, args: dict,
     return seen[:6]
 
 
+# ── speech firewall ──────────────────────────────────────────────────────────
+# Kinds whose text is DISPLAY content — a preview, an execution report, code, an
+# operation card, a web result, a tool result. They belong in the Chat Log and
+# may NEVER be voiced, even when they contain complete sentences. The denylist is
+# explicit on purpose: a kind nobody thought about keeps today's behaviour, so no
+# existing speaker is silenced by accident.
+_PREVIEW_KINDS = frozenset({"preview", "report", "code", "operation", "web",
+                            "tool_result"})
+
+# The per-result half of the same firewall. A preview is displayed in the Chat
+# Log, but the tool result itself still travels back to the Live model as plain
+# text and the model's own audio is what gets spoken — so the general prompt rule
+# needs to ride on the result, where it applies. This marker follows the file's
+# existing in-band convention ([USER_DECISIONS], [CLARIFICATION_CANCELLED],
+# [BRIEFING]): one short acknowledgement is allowed, the contents never are.
+# It is added ONLY where a card was really created (``_preview_result`` below).
+_PREVIEW_SHOWN_TAG = (
+    "[PREVIEW_SHOWN] This content is already displayed in the Chat Log. "
+    "Acknowledge it in one short conversational sentence. "
+    "Never read, list or speak its contents."
+)
+
+
+def _preview_result(ui, title, text, result=None):
+    """Show ``text`` in the Chat Log and return the result the model should get.
+
+    The display call is made first and is never allowed to cost the tool its
+    result: if the Chat Log surface raises, the raw result is returned unchanged
+    (exactly today's behaviour). A successful card means the content is visible,
+    so the returned text is prefixed with ``_PREVIEW_SHOWN_TAG`` — the
+    machine-readable, per-result instruction that keeps the preview silent while
+    the conversational acknowledgement around it is still spoken.
+    """
+    try:
+        ui.show_content(title, text)
+    except Exception:
+        return result
+    return f"{_PREVIEW_SHOWN_TAG}\n\n{result}"
+
+
+# ``code_helper`` answers with ``"<status>\n\nPreview:\n<first lines of code>"``
+# (actions/code_helper.py:389, 437, 558). That is a code preview, but only the
+# LIVE coding card (start/file/diff/stage/done progress) was ever painted — the
+# returned snippet itself never reached a card, so the model was free to read it
+# out. This helper puts the snippet on the SAME existing Markdown card (fenced,
+# so it keeps syntax highlighting) and tags the model-visible result only when
+# that card was really created.
+_PREVIEW_SECTION = "Preview:"
+
+
+def _code_preview_result(ui, title, result, language=""):
+    """Show a ``code_helper`` code preview as a formatted Chat Log card.
+
+    Returns the result tagged for the model when the card was created, the raw
+    result otherwise: a preview nobody can see must still be describable.
+    """
+    text = str(result or "")
+    marker = f"\n\n{_PREVIEW_SECTION}\n"
+    if marker not in text:
+        return result
+    status_text, _, preview = text.partition(marker)
+    if not preview.strip():
+        return result
+    tag = ".".join(part for part in (str(language or "").strip(),
+                                     (str(title or "").rsplit(".", 1)[-1]
+                                      if "." in str(title or "") else "")
+                                     .strip()) if part and part.isalpha())
+    fenced = f"{status_text.strip()}\n\n```{tag}\n{preview.strip()}\n```\n"
+    try:
+        ui.show_content(str(title or "CODE"), fenced)
+    except Exception:
+        return result
+    return f"{_PREVIEW_SHOWN_TAG}\n\n{text}"
+
+
 class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
@@ -3023,11 +3205,8 @@ class JarvisLive:
         self._stream_buffer       = ""
         self._live_out_fed        = ""
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
-        self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
-        self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
-        self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
-        self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        self._vision_busy          = False   # True while a vision capture/analysis cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
         # Realtime STT (Settings ▸ Automation): cached live view of the flag,
         # refreshed at most once per second — the interim transcript path runs
@@ -3174,6 +3353,10 @@ class JarvisLive:
             plugins_dir=Path(__file__).resolve().parent / "plugins",
             core_tool_names=_core_names,
             logger=lambda msg: (print(f"[Plugins] {msg}"), self.ui.write_log(f"SYS: {msg}")),
+            # The shipped built-ins go through the exact same manifest,
+            # validation, enable/disable and dispatch path as anything the user
+            # drops into plugins/ — they are not a parallel mechanism.
+            extra_dirs=[Path(__file__).resolve().parent / "plugins_builtin"],
         )
         _markup("PLUGIN_DISCOVERY_DONE")
         self.ui.get_plugins = self._plugin_registry.list_for_ui
@@ -3427,6 +3610,75 @@ class JarvisLive:
         except Exception:
             return True
 
+    # ── speech firewall: display content can NEVER be voiced ───────────────
+    def _speech_allowed(self, kind: str) -> bool:
+        """May text of this KIND be spoken out loud?
+
+        False only for the explicit preview kinds (``_PREVIEW_KINDS``): a
+        preview, an execution report, code, an operation or web result is
+        display content — it belongs in the Chat Log, never in the voice, even
+        when it contains complete sentences. Every other kind (a reply, a
+        narration line, the greeting) keeps today's behaviour, so no existing
+        speaker is silenced by accident.
+        """
+        return str(kind).strip().lower() not in _PREVIEW_KINDS
+
+    def _speak_stream(self, text: str, *, kind: str = "reply") -> None:
+        """Feed one streamed fragment to the live voice sink — through the firewall.
+
+        The sink is the live VOICE; the screen is streamed separately by the UI,
+        so blocking a kind here never changes what the user can read.
+        """
+        if not self._speech_allowed(kind):
+            return
+        sink = self._speech_sink()
+        if sink is None:
+            return
+        sink.feed(text)
+
+    def _speak_line(self, text: str, *, kind: str = "system",
+                    force: bool = False, mark_timeline: bool = True) -> None:
+        """Speak ONE complete line through the firewall. Never raises.
+
+        Display content (``_PREVIEW_KINDS``) is dropped silently; everything
+        else behaves exactly as before — the shared Piper worker keeps one
+        consistent voice in gemini_piper mode, otherwise the local engine
+        (``speak_local``) is used.
+        """
+        if not self._speech_allowed(kind):
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        _piper = getattr(self, "_piper", None)
+        if _piper is not None:
+            _piper.speak(text)          # keeps one consistent voice
+            return
+        self.speak_local(text, force=force, mark_timeline=mark_timeline)
+
+    def _agent_progress_sink(self, line: str) -> None:
+        """Show one agent execution report; NEVER speak it.
+
+        ``code_helper``/``dev_agent`` used to receive ``speak=self.speak``,
+        which opened a NEW model turn for every progress line — the model's
+        answer to a report was then voiced. An execution report is display
+        content, so it reaches only the non-spoken surfaces: the live coding
+        card and the activity log. Returns ``None`` (every agent caller uses
+        ``speak(...)`` as a statement and ignores the return value).
+        """
+        text = str(line or "").strip()
+        if not text:
+            return None
+        try:
+            self.ui.coding_activity("stage", {"stage": text})
+        except Exception:
+            pass
+        try:
+            self.ui.write_log(f"CODING: {text}")
+        except Exception:
+            pass
+        return None
+
     def _lead_text_before_voice(self, timeout: float = 0.35) -> None:
         """Wait (briefly, once per turn) until the first reply text is ON SCREEN.
 
@@ -3460,6 +3712,7 @@ class JarvisLive:
             return
         try:
             threading.Thread(target=self.speak_local, args=(full_out,),
+                             kwargs={"kind": "reply"},
                              daemon=True).start()
         except Exception as exc:
             print(f"[SPEECH] local reply unavailable: {exc}")
@@ -3552,7 +3805,9 @@ class JarvisLive:
                 # nothing is on screen yet"). Bounded and once per turn; with no
                 # chat panel there is nothing to wait for, so it does not wait.
                 self._lead_text_before_voice()
-            sink.feed(new)
+            # The reply text is what may be voiced; the fragment goes through the
+            # speech firewall so a display kind can never reach the sink.
+            self._speak_stream(new, kind="reply")
         except Exception as exc:
             print(f"[SPEECH] streamed reply unavailable: {exc}")
 
@@ -4732,6 +4987,9 @@ class JarvisLive:
             self.ui.set_brain_activity("speaking" if value else "idle")
         except Exception:
             pass
+        # The chat reveal is deliberately independent of speech state: no
+        # TTS/audio callback touches it, so a stalled or muted voice can never
+        # freeze, skip or duplicate the text.
 
     def interrupt(self, source: str = "manual") -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately.
@@ -4755,6 +5013,12 @@ class JarvisLive:
             print("[JARVIS] ✋ Voice interrupt ignored — startup greeting in flight")
             return
         self._interrupted = True
+        # Barge-in: show the rest of the reply at once instead of typing on
+        # after the voice has been cut off.
+        try:
+            self.ui.typewriter_flush()
+        except Exception:
+            pass
         # An interrupted turn is a real outcome, not a slow one: close its
         # latency record now, labelled, so it can never be read as success.
         try:
@@ -4834,7 +5098,7 @@ class JarvisLive:
         )
 
     def speak_local(self, text: str, force: bool = False,
-                    mark_timeline: bool = True) -> None:
+                    mark_timeline: bool = True, *, kind: str = "system") -> None:
         """Speak one line through the configured local TTS engine (blocking;
         call from a worker thread). Never raises.
 
@@ -4846,11 +5110,16 @@ class JarvisLive:
         (narration, the startup greeting): its speech must not be mistaken for
         the reply's first audio in the latency record.
 
+        ``kind`` is the speech firewall tag (see ``_speech_allowed``); keyword-only
+        and defaulting to "system", so positional callers are unchanged.
+
         Serialised: two replies used to start their own playback thread and
         talked over each other. Playback also owns the HUD speaking state for
         its whole duration — in local voice mode nothing else knows when sound
         is coming out, so the reactor showed LISTENING while JARVIS spoke.
         """
+        if not self._speech_allowed(kind):
+            return
         text = (text or "").strip()
         if not text:
             return
@@ -5255,13 +5524,12 @@ class JarvisLive:
         """
         def _run():
             try:
-                _piper = getattr(self, "_piper", None)
-                if _piper is not None:
-                    _piper.speak(text)          # keeps one consistent voice
-                    return
                 # Narration is not the reply: its audio must not be recorded as
-                # the turn's first audio in the latency timeline.
-                self.speak_local(text, force=forced, mark_timeline=False)
+                # the turn's first audio in the latency timeline. One consistent
+                # voice — the shared Piper worker when it owns playback,
+                # otherwise the local engine — all behind the speech firewall.
+                self._speak_line(text, kind="narration", force=forced,
+                                 mark_timeline=False)
             except Exception as exc:
                 print(f"[NARRATOR] {exc}")
         try:
@@ -5544,7 +5812,7 @@ class JarvisLive:
             else:
                 return {"ok": False, "verified": False,
                         "error": f"tool '{tool}' is not runnable by the orchestrator"}
-            status = _tool_result_status(out)
+            status = _tool_result_status(out, tool=tool)
             return {"ok": status not in ("FAILED", "VERIFICATION_FAILED"),
                     "result": out, "verified": status == "SUCCESS",
                     "error": "" if status == "SUCCESS" else str(out)[:200]}
@@ -5702,6 +5970,68 @@ class JarvisLive:
             return types.FunctionResponse(
                 id=fc.id, name=name,
                 response={"result": _greeting_refusal}
+            )
+
+        # ── Explicit execution approval ─────────────────────────────────────
+        # The only path by which the model may turn "I can make that change"
+        # into an action. The wait happens in an executor so the Live audio
+        # loop keeps running while the card is on screen.
+        if name == "request_approval":
+            try:
+                from security.approval import ApprovalRequest, get_approval_service
+                _changes: dict[str, str] = {}
+                _raw_changes = args.get("changes") or []
+                if isinstance(_raw_changes, str):
+                    _raw_changes = [_raw_changes]
+                for _item in _raw_changes:
+                    _text = str(_item or "").strip()
+                    if not _text:
+                        continue
+                    for _sep in (" — ", " – ", " - ", ": "):
+                        if _sep in _text:
+                            _path, _summary = _text.split(_sep, 1)
+                            _changes[_path.strip()[:240]] = _summary.strip()[:800]
+                            break
+                    else:
+                        _changes[_text[:240]] = ""
+                _request = ApprovalRequest(
+                    kind=str(args.get("kind") or "action"),
+                    title=str(args.get("title") or "Approval required"),
+                    question=str(args.get("question") or args.get("title") or ""),
+                    description=str(args.get("description") or ""),
+                    targets=[str(t) for t in (args.get("targets") or [])],
+                    changes=_changes,
+                    source="model:request_approval",
+                )
+                _loop = asyncio.get_running_loop()
+                _decision = await _loop.run_in_executor(
+                    None, lambda r=_request: get_approval_service().request(r))
+                _result = (
+                    f"{_decision.status.upper()} ({_decision.kind}). "
+                    + ("Proceed with the approved action now." if _decision.approved
+                       else "Do NOT perform the action; tell the user it was declined.")
+                )
+                if _decision.reason:
+                    _result += f" Reason: {_decision.reason}."
+            except Exception as _exc:
+                _decision = None
+                _result = (f"Approval could not be requested ({_exc}). "
+                           "Do NOT perform the action.")
+            try:
+                if _doing_category:
+                    self.ui.clear_doing(_doing_category)
+                self.ui.clear_chat_activity()
+            except Exception:
+                pass
+            self.ui.set_state(self._idle_state())
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={
+                    "result": _result,
+                    "status": getattr(_decision, "status", "error"),
+                    "approved": bool(getattr(_decision, "approved", False)),
+                    "request_id": getattr(_decision, "request_id", ""),
+                },
             )
 
         # ── Clarification gate ──────────────────────────────────────────────
@@ -6230,14 +6560,10 @@ class JarvisLive:
                 import time as _t_mod
                 _now = _t_mod.monotonic()
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
-                # TASK 3: _vision_busy is only cleared by the realtime
-                # completion handler when the captured image is injected into
-                # the next turn. If that turn never arrives (a session drop or
-                # an exception between capture and completion) the flag would
-                # stay True forever and block EVERY later vision request — the
-                # "stale processing flag wedges the next request" bug. Expire a
-                # flag that has been busy far longer than any real cycle can run
-                # so a previous failed look can never permanently block J.A.R.V.I.S.
+                # _vision_busy is released by this branch itself now that the
+                # analysis happens in the same turn. Expire a flag left behind
+                # by a crash so a previous failed look cannot block every later
+                # request forever.
                 if getattr(self, "_vision_busy", False) and (_now - getattr(self, "_vision_last_time", 0.0)) > 30.0:
                     print("[Vision] ⏰ Stale busy flag expired — releasing so new requests run")
                     self._vision_busy = False
@@ -6251,56 +6577,80 @@ class JarvisLive:
                     angle     = args.get("angle", "screen").lower()
                     user_text = args.get("text", "What do you see?")
                     if angle == "camera" and not self.ui.feature_enabled("camera_access"):
-                        self._vision_busy = False
                         result = "Camera access is revoked in Settings → Permissions, so I cannot open the webcam."
+                        self._vision_busy = False
                     else:
-                        if angle == "camera":
-                            # Arm the embedded Chat Vision stage BEFORE the camera
-                            # stream starts, preventing the legacy floating webcam
-                            # overlay from receiving the stream state first.
-                            try:
+                        try:
+                            if angle == "camera":
+                                # Arm the embedded Chat Vision stage BEFORE the
+                                # camera stream starts, so the frame is shown
+                                # where the user is already looking.
                                 _inline_ok = await loop.run_in_executor(
                                     None, lambda: self.ui.call_on_ui(self.ui.open_inline_vision_camera)
                                 )
-                            except Exception:
-                                _inline_ok = False
-                            if not _inline_ok:
-                                self._vision_busy = False
-                                result = "I could not open the embedded Vision Panel in the JARVIS Chat Panel."
+                                if not _inline_ok:
+                                    result = ("I could not open the embedded Vision Panel "
+                                              "in the JARVIS Chat Panel.")
+                                else:
+                                    img_b, _mime_t = await loop.run_in_executor(None, _capture_camera)
+                                    print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                                    result = await loop.run_in_executor(
+                                        None,
+                                        lambda: analyze_image_bytes(img_b, user_text, "camera"))
+                                    try:
+                                        self.ui.run_on_ui(lambda: self.ui.scan_pulse())
+                                    except Exception:
+                                        pass
+
+                                    async def _cam_close():
+                                        await asyncio.sleep(2.0)
+                                        try:
+                                            self.ui.stop_camera_stream()
+                                        except Exception:
+                                            pass
+
+                                    asyncio.create_task(_cam_close())
                             else:
-                                img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
-                                self._vision_cam_active = True
-                                print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
-                                _stall = "camera"
-                        else:
-                            img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                            print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                            _stall = "screen"
-                        if angle != "camera" or _inline_ok:
-                            self._pending_vision = (img_b, mime_t, user_text, angle)
-                            try:
-                                self.ui.run_on_ui(lambda: self.ui.scan_pulse())
-                            except Exception:
-                                pass
-                            result = (
-                                f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
-                                f"Immediately say ONE short natural sentence in English, "
-                                f"telling them you are looking at their {_stall} right now. "
-                                f"Do NOT describe or guess content — the actual image arrives in the NEXT message. "
-                                f"When it arrives: if a person is visible, say how many people, what each is doing, "
-                                f"what they are holding or wearing, and where they are in the frame. "
-                                f"If it is a desk/room view, list the notable objects you see."
-                            )
+                                # Capture every monitor and analyse the real
+                                # pixels with the configured vision model in
+                                # this same turn. No deferred image injection.
+                                result = await loop.run_in_executor(
+                                    None, lambda: analyze_desktop(user_text))
+                                print(f"[Vision] 🖥️  analysed desktop: {len(result)} chars")
+                                try:
+                                    self.ui.run_on_ui(lambda: self.ui.scan_pulse())
+                                except Exception:
+                                    pass
+                        except Exception as exc:
+                            print(f"[Vision] ❌ {angle} analysis failed: {exc}")
+                            result = (f"I tried to look at your {angle}, but I could not: "
+                                      f"{exc}")
+                        finally:
+                            self._vision_busy = False
 
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
                 result = "Camera closed."
             elif name == "code_helper":
-                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self.speak))
+                # Execution reports are display content: they go to the coding
+                # card and the activity log, never to the voice (a progress line
+                # spoken through self.speak opened a NEW model turn whose answer
+                # was then read aloud).
+                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self._agent_progress_sink))
                 result = r or "Done."
+                # The returned snippet is a code preview: show it on the chat's
+                # Markdown card (fenced, so it keeps its COPY affordance and
+                # formatting) and tag the model-visible result so the report is
+                # acknowledged, never read out. A result without a "Preview:"
+                # section passes through untouched.
+                _code_title = str(args.get("output_path") or args.get("file_path")
+                                  or args.get("path") or "CODE")
+                result = _code_preview_result(
+                    self.ui, _code_title, result,
+                    str(args.get("language") or ""))
 
             elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
+                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self._agent_progress_sink))
                 result = r or "Done."
 
             elif name == "voice_settings":
@@ -6340,7 +6690,7 @@ class JarvisLive:
                 # Mirror what the browser actually saw into the research panel.
                 if r and "status=NOT_DONE" not in str(r):
                     _label = f"AGENT TARS - {str(args.get('url') or args.get('task') or '')[:60]}"
-                    self.ui.show_content(_label, r)
+                    result = _preview_result(self.ui, _label, r, result)
 
             # ── local structured controls: Playwright / pywinauto / PyAutoGUI ──
             # One action per call. capabilities/router.py enforces the permission
@@ -6448,9 +6798,9 @@ class JarvisLive:
                         and r and "status=NOT_DONE" not in str(r)):
                     try:
                         _label = f"PLAYWRIGHT - {str(args.get('target') or args.get('selector') or 'page')[:60]}"
-                        self.ui.show_content(_label, r)
                     except Exception:
-                        pass
+                        _label = "PLAYWRIGHT - page"
+                    result = _preview_result(self.ui, _label, r, result)
 
             elif name == "web_research":
                 from capabilities import router as _capability_router
@@ -6461,7 +6811,7 @@ class JarvisLive:
                 result = r or "Done."
                 if r and "status=NOT_DONE" not in str(r):
                     _label = f"AGENT REACH - {str(args.get('query') or args.get('url') or '')[:60]}"
-                    self.ui.show_content(_label, r)
+                    result = _preview_result(self.ui, _label, r, result)
 
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
@@ -6474,7 +6824,7 @@ class JarvisLive:
                     _query = args.get("query") or ", ".join(args.get("items", []))
                     _query = str(_query or "").strip()
                     _label = f"{_mode.upper()} - {_query[:72]}" if _query else _mode.upper()
-                    self.ui.show_content(_label, r)
+                    result = _preview_result(self.ui, _label, r, result)
             elif name == "generate_image":
                 _prompt = str(args.get("prompt") or "").strip()
                 _ratio = str(args.get("aspect_ratio") or "16:9").strip() or "16:9"
@@ -6729,7 +7079,7 @@ class JarvisLive:
             except Exception:
                 pass
 
-        _status = _tool_result_status(result, _permission_blocked)
+        _status = _tool_result_status(result, _permission_blocked, name)
         if _status in {"FAILED", "VERIFICATION_FAILED"}:
             _tool_ok = False
 
@@ -6996,17 +7346,56 @@ class JarvisLive:
         print(f"[JARVIS] ⏱ Turn finalisation: "
               f"{'client (hybrid VAD)' if self._hybrid_vad else 'server VAD'}")
 
+        # ── Real microphone input processing ─────────────────────────────────
+        # Settings ▸ VOICE ▸ MICROPHONE INPUT must change what the Live session
+        # actually hears, so the DSP runs here on the PortAudio callback thread
+        # ahead of the meter, the wake feed and the voice gate. The instance
+        # lives in a one-element list because the 1 s watchdog below hot-swaps
+        # its settings without reopening the device.
+        _MicSettings = None
+        _mic_dsp = [None]
+        _mic_sig = None
+        if np is not None:
+            try:
+                from voice.mic_dsp import MicDSP, MicSettings as _MicSettingsCls
+                _MicSettings = _MicSettingsCls
+                _start_settings = _MicSettings.from_config()
+                _mic_dsp[0] = MicDSP(_start_settings, sample_rate=SEND_SAMPLE_RATE)
+                _mic_sig = _start_settings.signature()
+                if _start_settings.active:
+                    print("[JARVIS] 🎚 Mic DSP: "
+                          f"gain={_start_settings.gain_percent:.0f}% "
+                          f"ns={'on' if _start_settings.noise_suppression else 'off'} "
+                          f"gate={'on' if _start_settings.gate else 'off'} "
+                          f"comp={'on' if _start_settings.compressor else 'off'} "
+                          f"limiter={'on' if _start_settings.limiter else 'off'}")
+            except Exception as _dsp_err:
+                print(f"[JARVIS] ⚠️ Microphone DSP unavailable: {_dsp_err}")
+
         def callback(indata, frames, time_info, status):
             # _last_cb exists before the stream starts (defined below, before
             # the `with`), so this is safe; the list avoids `nonlocal`.
             _last_cb[0] = time.monotonic()
-            data = indata.tobytes()
+            # The processed block is what the user is "heard as". The meter,
+            # wake word, voice gate and Live session all use the same samples,
+            # so a filter that shows on the meter really changes the audio.
+            proc = indata
+            _dsp = _mic_dsp[0]
+            if _dsp is not None:
+                try:
+                    proc = _dsp.process(indata)
+                except Exception:
+                    proc = indata
+            try:
+                data = proc.tobytes()
+            except AttributeError:
+                data = np.asarray(proc).astype(np.int16, copy=False).tobytes()
 
             # HUD waveform: always reflect the real microphone — even while
             # JARVIS is speaking (that is exactly when you want to see that the
             # mic hears you for barge-in). Purely cosmetic; never disturbs audio.
             try:
-                self.ui.set_audio_level(_pcm_level(indata))
+                self.ui.set_audio_level(_pcm_level(proc))
             except Exception:
                 pass
 
@@ -7038,7 +7427,7 @@ class JarvisLive:
                 if _gate is not None:
                     _gate.reset()
                 return
-            blocks = _gate.accept(indata, data) if _gate is not None else [data]
+            blocks = _gate.accept(proc, data) if _gate is not None else [data]
             # The block that ends a real utterance also tells the Live service
             # the turn is over. Blocks are queued FIRST so the sentinel can
             # never overtake the last of the speech.
@@ -7071,12 +7460,57 @@ class JarvisLive:
                     callback=callback,
                 )
 
+            def _retire_stream(stream):
+                """Close a live stream without waiting on a callback that may
+                never come (abort first — stop() can block on a dead device)."""
+                if stream is None:
+                    return
+                try:
+                    stream.abort()
+                except Exception:
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+            def _attempt_open(preferred_dev):
+                """Open+start a replacement on preferred_dev, then the default.
+
+                The InputStream CONSTRUCTOR opens the PortAudio stream; start()
+                only starts it. A candidate whose start() fails still holds an
+                open stream, so it is closed before the fallback tries the same
+                device — two live streams on one device is the native-crash
+                window this whole watchdog exists to avoid.
+                """
+                for _dev in (preferred_dev, None):
+                    candidate = None
+                    try:
+                        candidate = _open_mic(_dev)
+                        candidate.start()
+                        return candidate
+                    except Exception as _re:
+                        print(f"[JARVIS] ⚠️ Mic open failed ({_dev}): {_re}")
+                        if candidate is not None:
+                            try:
+                                candidate.close()
+                            except Exception:
+                                pass
+                return None
+
             # Which microphone. resolve() returns None for "system default" and
             # for a saved device that is no longer present — so a headset
             # unplugged since the last run falls back to the built-in mic
             # instead of raising on startup and taking the session with it.
             _mic_name = get_input_device()
             _mic_dev  = audio_devices.resolve(_mic_name, "input")
+            # The saved name the stream is currently open on, and a flag the
+            # settings reload sets when the chosen microphone changes.
+            _mic_device_name = _mic_name
+            _mic_switch = [False]
             if _mic_dev is not None:
                 print(f"[JARVIS] 🎤 Input device: {_mic_name}")
             try:
@@ -7121,6 +7555,57 @@ class JarvisLive:
                 # until restart.
                 while True:
                     await asyncio.sleep(1.0)
+                    # Settings ▸ VOICE ▸ MICROPHONE INPUT is live: a slider or
+                    # toggle takes effect on the next audio block. Only the
+                    # settings snapshot is swapped, so the stream (and its
+                    # PortAudio lifecycle) is never disturbed.
+                    if _mic_dsp[0] is not None and _MicSettings is not None:
+                        try:
+                            _new_settings = _MicSettings.from_config()
+                            _new_sig = _new_settings.signature()
+                            if _new_sig != _mic_sig:
+                                _mic_dsp[0].settings = _new_settings
+                                _mic_sig = _new_sig
+                                print(
+                                    "[JARVIS] 🎚 Mic DSP updated: "
+                                    f"gain={_new_settings.gain_percent:.0f}% "
+                                    f"ns={'on' if _new_settings.noise_suppression else 'off'} "
+                                    f"gate={'on' if _new_settings.gate else 'off'} "
+                                    f"comp={'on' if _new_settings.compressor else 'off'} "
+                                    f"limiter={'on' if _new_settings.limiter else 'off'}")
+                            # A different microphone needs a real reopen: the
+                            # device is bound when the stream opens, so the
+                            # swap happens below, once, on this loop.
+                            if (_new_settings.device or "") != (_mic_device_name or ""):
+                                _mic_switch[0] = True
+                        except Exception:
+                            pass
+                    if _mic_switch[0]:
+                        # Settings ▸ MICROPHONE INPUT chose another device. Retire
+                        # the current stream BEFORE opening its replacement so
+                        # only one PortAudio stream is ever live, then adopt the
+                        # new endpoint (falling back to the system default).
+                        _mic_switch[0] = False
+                        _wanted_name = get_input_device()
+                        _mic_dev = audio_devices.resolve(_wanted_name, "input")
+                        print(f"[JARVIS] 🎤 Switching input device to "
+                              f"{_wanted_name or 'system default'}…")
+                        _retire_stream(_mic_stream)
+                        _mic_stream = _attempt_open(_mic_dev)
+                        if _mic_stream is None:
+                            print("[JARVIS] ❌ Selected microphone could not be "
+                                  "opened — voice input disabled.")
+                            self.ui.write_log(
+                                "SYS: Could not open the selected microphone — "
+                                "voice input disabled; text commands still work.")
+                            return
+                        _mic_device_name = _wanted_name
+                        _reopens = _failed_reopens = 0
+                        _last_cb[0] = time.monotonic()
+                        _reopen_mark = _last_cb[0]
+                        print(f"[JARVIS] 🎤 Input device switched to "
+                              f"{_wanted_name or 'system default'}")
+                        continue
                     if time.monotonic() - _last_cb[0] < 3.0:
                         # Only a callback NEWER than the last reopen proves the
                         # replacement stream is delivering audio; the grace
@@ -7150,42 +7635,9 @@ class JarvisLive:
                           f"(attempt {_reopens})…")
                     self.ui.write_log("SYS: Microphone stalled — reconnecting the mic.")
                     # Retire the silent stream BEFORE opening its replacement so
-                    # only one PortAudio stream is ever live on the device, and
-                    # abort() it: the stream is stalled, so waiting for it to
-                    # drain (stop()) can block on a callback that never comes.
-                    stale, _mic_stream = _mic_stream, None
-                    try:
-                        stale.abort()
-                    except Exception:
-                        try:
-                            stale.stop()
-                        except Exception:
-                            pass
-                    try:
-                        stale.close()
-                    except Exception:
-                        pass
-                    for _dev in (_mic_dev, None):
-                        candidate = None
-                        try:
-                            candidate = _open_mic(_dev)
-                            candidate.start()
-                            _mic_stream = candidate
-                            break
-                        except Exception as _re:
-                            print(f"[JARVIS] ⚠️ Mic reopen failed ({_dev}): {_re}")
-                            # The InputStream CONSTRUCTOR opens the PortAudio
-                            # stream; start() merely starts it. If start() fails
-                            # the candidate holds an open stream that would leak
-                            # for the process lifetime — and the fallback open
-                            # on a single-mic machine targets the SAME device,
-                            # giving two live streams on one device: the exact
-                            # native-crash window the watchdog exists to avoid.
-                            if candidate is not None:
-                                try:
-                                    candidate.close()
-                                except Exception:
-                                    pass
+                    # only one PortAudio stream is ever live on the device.
+                    _retire_stream(_mic_stream)
+                    _mic_stream = _attempt_open(_mic_dev)
                     if _mic_stream is None:
                         _failed_reopens += 1
                         if _failed_reopens >= 3:
@@ -7321,7 +7773,12 @@ class JarvisLive:
                                 # arrives instead of waiting for the whole turn.
                                 # The service keeps only the new suffix, so both
                                 # delta-style and cumulative transcripts are safe.
-                                if self._piper is not None:
+                                # The speech firewall guards the ONLY voice
+                                # branch here: with kind="reply" it always
+                                # allows the reply, and the literal feed call
+                                # stays the single Piper entry point.
+                                if (self._piper is not None
+                                        and self._speech_allowed("reply")):
                                     self._piper.feed(txt)
                                 # local mode (Fish Audio and every other local
                                 # engine): the same text goes to the UI and to
@@ -7599,36 +8056,8 @@ class JarvisLive:
                             except Exception:
                                 pass
 
-                            # Vision injection: model finished tool-response turn → now send the image
-                            if self._pending_vision and self.session:
-                                import base64 as _b64
-                                img_b, mime_t, question, angle = self._pending_vision
-                                self._pending_vision = None
-                                b64 = _b64.b64encode(img_b).decode("ascii")
-                                print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
-                                await self.session.send_client_content(
-                                    turns={"parts": [
-                                        {"inline_data": {"mime_type": mime_t, "data": b64}},
-                                        {"text": question},
-                                    ]},
-                                    turn_complete=True,
-                                )
-                                # Mark next turn_complete behaviour depending on angle
-                                if self._vision_cam_active:
-                                    # Camera: keep busy until JARVIS finishes speaking the answer
-                                    self._vision_cam_active    = False
-                                    self._vision_close_pending = True
-                                else:
-                                    # Screen-only: no camera to close; release busy flag now
-                                    self._vision_busy = False
-                            elif self._vision_close_pending:
-                                # This turn_complete IS the vision answer — close camera + release busy flag
-                                self._vision_close_pending = False
-                                self._vision_busy = False
-                                async def _cam_close():
-                                    await asyncio.sleep(2.0)
-                                    self.ui.stop_camera_stream()
-                                asyncio.create_task(_cam_close())
+                            # Vision is analysed inside the tool call itself;
+                            # nothing is injected into a later turn.
 
                     if response.tool_call:
                         # Flush any pre-tool statements accumulated in out_buf so the user
@@ -7733,6 +8162,14 @@ class JarvisLive:
                 self.ui.write_log("SYS: No speaker found — silent mode, text stays on screen.")
                 return
 
+        # PortAudio's own latency estimate feeds the shared playback clock so
+        # the word-by-word typewriter starts in step with the real sound.
+        try:
+            _spk_latency = float(getattr(stream, "latency", 0.0) or 0.0) or 0.08
+        except Exception:
+            _spk_latency = 0.08
+        _spk_latency = min(0.35, max(0.02, _spk_latency))
+
         # Gemini-native modes only reach this point, so everything below plays
         # the realtime voice exactly as before.
         try:
@@ -7797,6 +8234,14 @@ class JarvisLive:
                 # is the honest "audible" instant (first-wins per turn).
                 _timeline.mark("first_audio")
                 _timeline.mark("playback")
+                try:
+                    # Feed the shared playback clock: Gemini-native playback
+                    # used to leave the typewriter on a wall-clock fallback.
+                    from voice.tts import playback_clock as _pclock
+                    _pclock.feed(len(batch) / (2.0 * RECEIVE_SAMPLE_RATE),
+                                 latency_s=_spk_latency)
+                except Exception:
+                    pass
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
@@ -8542,6 +8987,17 @@ class JarvisLive:
             )
         except Exception as e:
             print(f"[CodingApproval] bind failed: {e}")
+        # One approval service for every action kind. Coding keeps its legacy
+        # three-argument adapter; everything else uses the rich card payload.
+        try:
+            from security import approval as _approval
+            _approval.bind(
+                show = self.ui.show_approval,
+                log  = self.ui.write_log,
+                open_panel = getattr(self.ui, "open_task_panel", None),
+            )
+        except Exception as e:
+            print(f"[Approval] bind failed: {e}")
         # ── Automatic task teardown & interactive questions ──────────────────
         # The registry pushes real execution events to the task panel; the
         # question service asks through the panel + chat cards. Both bindings
@@ -8753,9 +9209,6 @@ class JarvisLive:
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
-                    self._pending_vision       = None
-                    self._vision_cam_active    = False
-                    self._vision_close_pending = False
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
@@ -8920,9 +9373,13 @@ class JarvisLive:
 
                 # Crash bookkeeping (spec §53): three failures inside ten
                 # minutes is a loop, not bad luck — that enters safe mode.
+                # A dropped Live connection is tagged "connect": a flaky
+                # network must be recorded and shown, but it is not a crash
+                # and must never trip SAFE MODE on its own.
                 try:
                     from core.diagnostics import note_crash
-                    if note_crash(f"{type(e).__name__}: {err_str[:200]}"):
+                    if note_crash(f"{type(e).__name__}: {err_str[:200]}",
+                                  kind="connect"):
                         self.ui.write_log(
                             "SYS: Three failures in ten minutes — entering SAFE "
                             "MODE. Background work is paused until you clear it.")
@@ -9115,7 +9572,7 @@ def _load_backend_modules():
     global load_memory, update_memory, format_memory_for_prompt
     global save_session_summary, pop_last_session, search_memory, set_trim_notifier
     global file_processor, weather_action, reminder
-    global _capture_camera, _capture_screen, youtube_video
+    global _capture_camera, analyze_desktop, analyze_image_bytes, youtube_video
     global file_controller, code_helper, dev_agent
     global web_search_action, SystemMonitor, get_system_status
     global ProactiveEngine, add_monitor, remove_monitor, list_monitors, monitor_check_all
@@ -9153,7 +9610,7 @@ def _load_action_modules():
     pure attribute bindings (microseconds).
     """
     global file_processor, weather_action, reminder
-    global _capture_camera, _capture_screen, youtube_video
+    global _capture_camera, analyze_desktop, analyze_image_bytes, youtube_video
     global file_controller, code_helper, dev_agent
     global web_search_action, SystemMonitor, get_system_status
     global ProactiveEngine, add_monitor, remove_monitor, list_monitors, monitor_check_all
@@ -9162,7 +9619,9 @@ def _load_action_modules():
     from actions.file_processor import file_processor
     from actions.weather_report import weather_action
     from actions.reminder import reminder
-    from actions.screen_processor import _capture_camera, _capture_screen
+    from actions.screen_processor import (
+        _capture_camera, analyze_desktop, analyze_image_bytes,
+    )
     from actions.youtube_video import youtube_video
     from actions.file_controller import file_controller
     from actions.code_helper import code_helper
@@ -9376,6 +9835,23 @@ def main():
             return
     except Exception:
         pass
+
+    # ── Native backend banner (Rust/Python hybrid) ────────────────────────
+    # One line of truth for every later diagnostic: which backend the audio
+    # hot paths will use — and, when it fell back, the actual reason (missing
+    # build, disabled, load error). Loading the extension costs a few ms.
+    try:
+        from core import native as _native_backend
+        _nb = _native_backend.backend_info()
+        if _nb.get("backend") == "rust":
+            _ninfo = _nb.get("native") or {}
+            print(f"[JARVIS] Native backend: Rust {_ninfo.get('version', '?')} "
+                  f"({_ninfo.get('target', '?')}, {_ninfo.get('profile', '?')})")
+        else:
+            print(f"[JARVIS] Native backend: pure Python "
+                  f"({_nb.get('error') or 'extension not built'})")
+    except Exception as _nb_exc:
+        print(f"[JARVIS] Native backend probe skipped: {_nb_exc}")
 
     # ── Launch optimization: clear leftover cache + temp FIRST ────────────
     # Runs before the UI and backend load so every session starts clean (stale

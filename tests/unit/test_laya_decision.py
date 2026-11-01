@@ -155,7 +155,38 @@ def test_classify_returns_none_when_model_missing(sandbox, monkeypatch):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and ld.get_state() == ld.STATE_LOADING:
         time.sleep(0.05)
-    assert ld.get_state() in (ld.STATE_NOT_FOUND, "uninitialized", "detecting")
+    assert ld.get_state() in (ld.STATE_NOT_FOUND, ld.STATE_IDLE,
+                              "uninitialized")
+
+
+def test_idle_is_an_honest_state_before_any_load(sandbox, monkeypatch):
+    """Enabled + available but not started is IDLE — not a fake 'detecting'."""
+    monkeypatch.setattr(ld, "dependency_available", lambda: True)
+    ld.shutdown()
+    assert ld.get_state() == ld.STATE_IDLE
+
+
+def test_a_missing_laya_package_is_reported_as_a_dependency(sandbox, monkeypatch):
+    """The package is a dependency, not a generic load error: the state names
+    it and the skip reason tells the user the exact repair."""
+    monkeypatch.setattr(ld, "dependency_available", lambda: False)
+    ld.shutdown()
+    assert ld.get_state() == ld.STATE_MISSING_DEPENDENCY
+    st = ld.status()
+    assert st["state"] == ld.STATE_MISSING_DEPENDENCY
+    assert "laya" in st["detail_line"].lower()
+    assert ld.classify_task("Open Chrome") is None
+    assert ld.last_skip()["reason"] == "missing dependency"
+    assert "laya" in ld.last_skip()["detail"].lower()
+
+
+def test_load_records_the_missing_package_instead_of_a_fake_error(monkeypatch):
+    monkeypatch.setattr(ld, "dependency_available", lambda: False)
+    monkeypatch.setattr(ld, "config_enabled", lambda: True)
+    ld.shutdown()
+    ld._load_blocking()          # real checkpoint is present in this checkout
+    assert ld.get_state() == ld.STATE_MISSING_DEPENDENCY
+    assert "pip install laya" in ld.status()["state_detail"]
 
 
 def test_classify_swallows_inference_failure(sandbox, monkeypatch):
@@ -446,6 +477,18 @@ def test_decision_layer_never_blocks_a_turn():
     assert "initialize(background=True)" in src
     assert "background=False" not in src
 
+
+
+def test_laya_active_is_only_claimed_after_readiness():
+    """The false-ACTIVE bug: main.py used to announce ACTIVE before checking
+    whether the model could decide. The readiness gate must come first."""
+    start = MAIN.index("def _laya_note_request")
+    body = MAIN[start:start + 3200]
+    assert "state = laya_decision.get_state()" in body
+    assert "STATE_MISSING_DEPENDENCY" in body
+    ready_gate = body.index("if state != laya_decision.STATE_READY")
+    active = body.index("self._laya_status('ACTIVE'")
+    assert ready_gate < active
 
 
 def test_tool_dispatcher_uses_laya_only_as_fallback():

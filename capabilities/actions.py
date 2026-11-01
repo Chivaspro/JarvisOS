@@ -19,6 +19,8 @@ words are only ever read as data — an action name, a selector, a string to typ
 
 from __future__ import annotations
 
+import inspect
+
 from typing import Callable
 
 from capabilities import registry
@@ -34,11 +36,45 @@ def _progress(on_event: Callable[[str], None] | None, text: str) -> None:
         pass
 
 
+def _call_module(module, action_name: str, args: dict,
+                 on_event: Callable[[str], None] | None):
+    """Call ``module.run``; a module that accepts ``on_event`` gets its phases.
+
+    Most modules finish quickly and report one activity line. A module whose
+    work genuinely runs for minutes (the reverse-engineering pipeline waits for
+    a page and for a model) declares an optional ``on_event`` and receives the
+    same progress sink the runner already has, so the HUD shows the real phases
+    instead of one line until the end.
+    """
+    run = getattr(module, "run")
+    try:
+        wants_event = "on_event" in inspect.signature(run).parameters
+    except (TypeError, ValueError):
+        wants_event = False
+    if wants_event:
+        return run(action_name, dict(args), on_event=on_event)
+    return run(action_name, dict(args))
+
+
 # ── executors ─────────────────────────────────────────────────────────────────
 
 def _pc_runner(action: registry.Action, args: dict,
                on_event: Callable[[str], None] | None):
-    from capabilities import desktop
+    from capabilities import desktop, ocr, uia
+
+    def resolve(action_name: str):
+        """The module that owns this PC action (desktop / OCR / UIA)."""
+        if action_name in ocr._HANDLERS:
+            return ocr
+        if action_name in uia._HANDLERS:
+            return uia
+        return desktop
+
+    module = resolve(action.name)
+    if module is not desktop:
+        # Screen reading and UI Automation report their own controller and
+        # their own availability; the PyAutoGUI probe below is not their gate.
+        return _module_runner(registry.TOOL_PC, action, args, on_event, resolve)
 
     def runner() -> dict:
         status = desktop.status()
@@ -158,7 +194,7 @@ def _module_runner(tool: str, action: registry.Action, args: dict,
                     "output": (f"'{action.name}' is not an action of {tool}. "
                                "Nothing was run.")}
         _progress(on_event, registry.activity_detail(tool, args))
-        result = module.run(action.name, dict(args))  # type: ignore[attr-defined]
+        result = _call_module(module, action.name, args, on_event)
         detail = str(result.get("detail") or "")
         if result.get("ok"):
             _progress(on_event, "Completed")
@@ -264,6 +300,80 @@ def _globe_runner(action: registry.Action, args: dict,
         return geospatial
 
     return _module_runner(registry.TOOL_GLOBE, action, args, on_event, resolve)
+
+
+def _files_runner(action: registry.Action, args: dict,
+                  on_event: Callable[[str], None] | None):
+    """``file_control`` — real filesystem work, with deletes going to the Bin."""
+
+    def resolve(_action_name: str):
+        from capabilities import files
+        return files
+
+    return _module_runner(registry.TOOL_FILES, action, args, on_event, resolve)
+
+
+def _library_runner(action: registry.Action, args: dict,
+                    on_event: Callable[[str], None] | None):
+    """``library`` — local document conversion and FTS5 retrieval."""
+
+    def resolve(_action_name: str):
+        from knowledge import library
+        return library
+
+    return _module_runner(registry.TOOL_LIBRARY, action, args, on_event, resolve)
+
+
+def _meeting_notes_runner(action: registry.Action, args: dict,
+                          on_event: Callable[[str], None] | None):
+    """``meeting_notes`` — local capture, transcription and Markdown notes."""
+
+    def resolve(_action_name: str):
+        from capabilities import meeting_notes
+        return meeting_notes
+
+    return _module_runner(registry.TOOL_MEETING_NOTES, action, args, on_event,
+                          resolve)
+
+
+def _home_assistant_runner(action: registry.Action, args: dict,
+                           on_event: Callable[[str], None] | None):
+    """``home_assistant`` — the user's own HA instance over its REST API."""
+
+    def resolve(_action_name: str):
+        from capabilities import home_assistant
+        return home_assistant
+
+    return _module_runner(registry.TOOL_HOME_ASSISTANT, action, args, on_event,
+                          resolve)
+
+
+def _github_runner(action: registry.Action, args: dict,
+                   on_event: Callable[[str], None] | None):
+    """``github`` — read-only REST calls; no write method exists."""
+
+    def resolve(_action_name: str):
+        from capabilities import github
+        return github
+
+    return _module_runner(registry.TOOL_GITHUB, action, args, on_event, resolve)
+
+
+def _reverse_engineer_runner(action: registry.Action, args: dict,
+                             on_event: Callable[[str], None] | None):
+    """``reverse_engineer`` — capture evidence, then remake or reconstruct.
+
+    The module owns the authorization check (a live target refuses without the
+    user's explicit ``authorized`` statement) and the browser lock around a
+    capture; this runner is the ordinary registry/approval path every other
+    tool uses.
+    """
+
+    def resolve(_action_name: str):
+        from capabilities import reverse_engineer
+        return reverse_engineer
+
+    return _module_runner(registry.TOOL_REVERSE, action, args, on_event, resolve)
 
 
 def _visual_runner(action: registry.Action, args: dict,
@@ -385,6 +495,38 @@ def _instruction(action: registry.Action, args: dict) -> str:
 
 # ── tool entry points ─────────────────────────────────────────────────────────
 
+def _run_action(tool: str, args: dict, enabled=None,
+                on_event: Callable[[str], None] | None = None):
+    """Validate and run ONE action. Returns ``(action, error, result)``.
+
+    ``result`` is the router's :class:`CapabilityResult` (or None when the
+    request never reached a controller). ``_handle`` flattens it into a sentence;
+    ``run_sequence`` reads its ``ok`` to decide whether to continue. Both use
+    this one path, so a sequence step gets exactly the same permission, approval
+    and lock treatment as a standalone call.
+    """
+    from capabilities import router
+
+    args = dict(args or {})
+    action, error = registry.validate(tool, args)
+    if action is None:
+        return None, error, None
+    if tool not in _RUNNERS:
+        return action, (f"{tool} has no local runner in this build, so nothing "
+                        "was run."), None
+    if action.name == "run_sequence":
+        # A composite action must NOT hold the desktop lock while its steps run;
+        # each step takes its own domain lock exactly as a standalone call would.
+        from capabilities import sequence
+        runner = lambda: sequence.run(args, enabled=enabled, on_event=on_event)
+        result = router.route_local(tool, action, args, runner, enabled=enabled,
+                                    lock=False)
+    else:
+        runner = _RUNNERS[tool](action, args, on_event)
+        result = router.route_local(tool, action, args, runner, enabled=enabled)
+    return action, "", result
+
+
 def _handle(tool: str, args: dict, enabled=None,
             on_event: Callable[[str], None] | None = None,
             on_result: Callable[..., None] | None = None) -> str:
@@ -399,21 +541,18 @@ def _handle(tool: str, args: dict, enabled=None,
     data itself; a surface that parsed the sentence back would be guessing at
     what the controller actually reported.
     """
-    from capabilities import router
-
-    args = dict(args or {})
-    action, error = registry.validate(tool, args)
+    action, error, result = _run_action(tool, args, enabled=enabled,
+                                        on_event=on_event)
     if action is None:
         return error
-    if tool not in _RUNNERS:
-        return (f"{tool} has no local runner in this build, so nothing was run.")
-    runner = _RUNNERS[tool](action, args, on_event)
-    result = router.route_local(tool, action, args, runner, enabled=enabled)
+    if result is None:
+        return error
     if on_result is not None:
         try:
             on_result(action.name, dict(result.data or {}), bool(result.ok))
         except Exception:
             pass
+    from capabilities import router
     return router.finalize_local(result)
 
 
@@ -425,10 +564,16 @@ _RUNNERS = {
     registry.TOOL_SYSTEM: _system_runner,
     registry.TOOL_WINDOW: _window_runner,
     registry.TOOL_CLIPBOARD: _clipboard_runner,
+    registry.TOOL_FILES: _files_runner,
     registry.TOOL_DOCUMENTS: _documents_runner,
     registry.TOOL_SMART_HOME: _smart_home_runner,
     registry.TOOL_INSTAGRAM: _instagram_runner,
     registry.TOOL_GLOBE: _globe_runner,
+    registry.TOOL_LIBRARY: _library_runner,
+    registry.TOOL_MEETING_NOTES: _meeting_notes_runner,
+    registry.TOOL_HOME_ASSISTANT: _home_assistant_runner,
+    registry.TOOL_GITHUB: _github_runner,
+    registry.TOOL_REVERSE: _reverse_engineer_runner,
 }
 
 
@@ -476,6 +621,16 @@ def handle_clipboard_sentry(args: dict, enabled=None, on_event=None) -> str:
     return _handle(registry.TOOL_CLIPBOARD, args, enabled, on_event)
 
 
+def handle_file_control(args: dict, enabled=None, on_event=None) -> str:
+    """``file_control`` — list, find, copy, move, zip and recycle-bin deletes.
+
+    Read-only actions answer even when the switch is off; every action that
+    writes needs the file permission, and ``delete`` is declared ``gate=confirm``
+    so it always waits for the on-screen confirmation.
+    """
+    return _handle(registry.TOOL_FILES, args, enabled, on_event)
+
+
 def handle_documents(args: dict, enabled=None, on_event=None) -> str:
     """``documents`` — write real Word/Excel/PowerPoint/PDF deliverables.
 
@@ -496,6 +651,36 @@ def handle_instagram(args: dict, enabled=None, on_event=None) -> str:
     return _handle(registry.TOOL_INSTAGRAM, args, enabled, on_event)
 
 
+def handle_library(args: dict, enabled=None, on_event=None) -> str:
+    """``library`` — index local documents and answer with cited snippets."""
+    return _handle(registry.TOOL_LIBRARY, args, enabled, on_event)
+
+
+def handle_meeting_notes(args: dict, enabled=None, on_event=None) -> str:
+    """``meeting_notes`` — record locally, transcribe locally, write Markdown."""
+    return _handle(registry.TOOL_MEETING_NOTES, args, enabled, on_event)
+
+
+def handle_home_assistant(args: dict, enabled=None, on_event=None) -> str:
+    """``home_assistant`` — devices, scenes and scripts on the user's own HA."""
+    return _handle(registry.TOOL_HOME_ASSISTANT, args, enabled, on_event)
+
+
+def handle_github(args: dict, enabled=None, on_event=None) -> str:
+    """``github`` — read-only notifications, issues, PRs, checks and search."""
+    return _handle(registry.TOOL_GITHUB, args, enabled, on_event)
+
+
+def handle_reverse_engineer(args: dict, enabled=None, on_event=None) -> str:
+    """``reverse_engineer`` — capture evidence, then remake or reconstruct.
+
+    The action itself refuses without the user's explicit authorization, and a
+    capture holds the browser lock exactly like the browser actions do — the
+    layer here is only the shared registry/permission/approval path.
+    """
+    return _handle(registry.TOOL_REVERSE, args, enabled, on_event)
+
+
 def handle_globe(args: dict, enabled=None, on_event=None, on_result=None) -> str:
     """``globe`` — resolve places, then hand the evidence to the HoloGlobe.
 
@@ -509,6 +694,8 @@ def handle_globe(args: dict, enabled=None, on_event=None, on_result=None) -> str
 
 
 __all__ = ["handle_browser_action", "handle_clipboard_sentry", "handle_documents",
-           "handle_globe", "handle_instagram", "handle_pc_control",
-           "handle_power_control", "handle_smart_home", "handle_system_control",
+           "handle_file_control", "handle_globe", "handle_github",
+           "handle_home_assistant", "handle_instagram", "handle_library",
+           "handle_meeting_notes", "handle_pc_control", "handle_power_control",
+           "handle_reverse_engineer", "handle_smart_home", "handle_system_control",
            "handle_visual_control", "handle_window_control"]

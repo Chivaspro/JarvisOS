@@ -123,6 +123,9 @@ class StreamingSpeechService:
         self._first_audio_marked = False
         self._on_state: list = []
         self._state_sink = state_sink
+        #: Markdown → speech filter state for the current turn (voice only —
+        #: the chat display is untouched). Created lazily on first use.
+        self._md_filter = None
 
     # ── state ────────────────────────────────────────────────────────────────
 
@@ -208,14 +211,38 @@ class StreamingSpeechService:
                     new = fragment[len(self._fed):]
                 else:
                     new = fragment
-                self._fed += new
-                self._pending += new
+                self._fed += new                     # RAW text (dedupe basis)
+                speak = self._md_speakable(new)      # voice text (filtered)
+                self._pending += speak
                 chunks, self._pending = split_speech_chunks(self._pending)
                 self._chars_sent += sum(len(c) for c in chunks)
             return self._submit(chunks)
         except Exception as exc:
             self._last_reason = str(exc)
             return 0
+
+    # ── markdown → speech (the voice reads prose, never syntax) ──────────────
+
+    def _md_speakable(self, text: str) -> str:
+        """Reply text → speakable prose (Settings ▸ features toggle)."""
+        try:
+            if not self._md_filter_enabled():
+                return text
+            if self._md_filter is None:
+                from voice.speech_filter import MarkdownSpeechFilter
+                self._md_filter = MarkdownSpeechFilter()
+            return self._md_filter.feed(text)
+        except Exception:
+            return text
+
+    @staticmethod
+    def _md_filter_enabled() -> bool:
+        """``features.speech_markdown_filter`` — default ON."""
+        try:
+            from voice.speech_filter import markdown_speech_enabled
+            return markdown_speech_enabled()
+        except Exception:
+            return True
 
     def warmup(self) -> bool:
         """Build the voice ENGINE now so the first turn never pays for it.
@@ -262,6 +289,7 @@ class StreamingSpeechService:
                 if alive:
                     return True
                 self._idle_deadline = time.monotonic() + max(1.0, float(timeout))
+                self._md_filter = None      # a prepared turn starts fresh
             self._ensure_session()
             return True
         except Exception as exc:
@@ -272,7 +300,17 @@ class StreamingSpeechService:
         """Submit a whole line (corrected replies, tests): tail included."""
         try:
             from voice.hybrid_voice import split_speech_chunks
-            chunks, rest = split_speech_chunks(str(text or ""))
+            raw = str(text or "")
+            # One-shot filter: a whole line is complete text, so its held tail
+            # must be released now. Uses its own filter instance and never
+            # touches the streaming state of the current turn.
+            if self._md_filter_enabled():
+                try:
+                    from voice.speech_filter import filter_markdown_for_speech
+                    raw = filter_markdown_for_speech(raw)
+                except Exception:
+                    pass
+            chunks, rest = split_speech_chunks(raw)
             if rest:
                 chunks.append(rest)
             with self._lock:
@@ -286,7 +324,15 @@ class StreamingSpeechService:
         """End of turn: speak the buffered remainder and close the session."""
         try:
             with self._lock:
-                tail, self._pending = self._pending.strip(), ""
+                held = ""
+                try:
+                    if self._md_filter is not None:
+                        # release any markdown tail the streaming filter held
+                        held = self._md_filter.flush()
+                except Exception:
+                    held = ""
+                self._md_filter = None
+                tail, self._pending = (self._pending + held).strip(), ""
                 self._fed = ""
             queued = self._submit([tail] if tail else [])
             with self._lock:
@@ -568,7 +614,11 @@ class StreamingSpeechService:
                 lost = list(self._session_consumed)
                 self._session_consumed = []
             if heard:
-                return                      # partially heard: never replay
+                # Something was already audible: never replay it. Text the
+                # session CONSUMED but never voiced is deliberately dropped
+                # too — repeating half a phrase is worse than a pause. The
+                # text it never took (still queued) must still be spoken.
+                lost = []
             rest: list[str] = []
             while True:
                 try:
@@ -644,6 +694,7 @@ class StreamingSpeechService:
             self._epoch += 1
             self._fed = ""
             self._pending = ""
+            self._md_filter = None
             self._first_audio_marked = False
             self._inflight = 0
             self._idle_deadline = None
@@ -679,6 +730,11 @@ class StreamingSpeechService:
         try:
             import sounddevice as sd
             sd.stop()
+        except Exception:
+            pass
+        try:
+            from voice.tts import playback_clock
+            playback_clock.stop()
         except Exception:
             pass
 

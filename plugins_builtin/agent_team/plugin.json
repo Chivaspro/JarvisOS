@@ -1,0 +1,28 @@
+{
+  "id": "agent_team",
+  "name": "agent_team",
+  "description": "Route a task to a specialised role and run it on the real backend that role owns: Researcher uses the live web-research capability, Analyst and Planner use the configured model, Code Reviewer reads and reviews a real file, Automation runs gated desktop steps. The Developer role refuses to write code from inside a plugin — that must go through the coding tool so the change is approval-gated — and says so instead of pretending.",
+  "icon": "👥",
+  "version": "1.0.0",
+  "category": "agents",
+  "builtin": true,
+  "permissions": ["network", "filesystem", "automation"],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "role": {"type": "STRING", "description": "researcher | analyst | planner | code_reviewer | automation | developer"},
+      "task": {"type": "STRING", "description": "What the role should do."},
+      "context": {"type": "STRING", "description": "Material to analyse or review."},
+      "path": {"type": "STRING", "description": "File to review (code_reviewer)."},
+      "steps": {"type": "STRING", "description": "JSON steps for the automation role."}
+    },
+    "required": ["role", "task"]
+  },
+  "settings": [
+    {"key": "model", "label": "Reasoning model", "type": "model", "default": "",
+     "help": "Model used by the Analyst and Planner roles. Blank uses the app default."},
+    {"key": "review_chars", "label": "Review excerpt size", "type": "int", "default": 12000, "min": 1000, "max": 60000, "advanced": true,
+     "help": "How much of a file to send to the reviewer."}
+  ],
+  "limits": {"max_calls_per_minute": 20, "timeout_seconds": 240, "max_results": 1}
+}

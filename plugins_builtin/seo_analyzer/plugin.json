@@ -1,0 +1,29 @@
+{
+  "id": "seo_analyzer",
+  "name": "seo_analyzer",
+  "description": "Fetch a real web page and report its on-page SEO: title, meta description, headings, images/alt text, internal vs external links, structured data and page weight. Every number is measured from the fetched HTML.",
+  "icon": "📈",
+  "version": "1.0.0",
+  "category": "marketing",
+  "builtin": true,
+  "permissions": ["network"],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "url": {"type": "STRING", "description": "Page URL to analyse."}
+    },
+    "required": ["url"]
+  },
+  "settings": [
+    {"key": "user_agent", "label": "User agent", "type": "string",
+     "default": "Mozilla/5.0 (compatible; JARVIS-SEO/1.0)",
+     "help": "Sent with the request so sites that block bots still answer."},
+    {"key": "timeout_seconds", "label": "Request timeout", "type": "int", "default": 20, "min": 5, "max": 60,
+     "help": "Give up on a slow page after this many seconds."},
+    {"key": "max_links", "label": "Links to list", "type": "int", "default": 10, "min": 0, "max": 50, "advanced": true,
+     "help": "How many example links to include in the report."},
+    {"key": "recommendations", "label": "Include recommendations", "type": "bool", "default": true, "advanced": true,
+     "help": "Add concrete fixes for the problems that were actually found."}
+  ],
+  "limits": {"max_calls_per_minute": 30, "timeout_seconds": 60, "max_results": 1}
+}

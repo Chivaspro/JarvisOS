@@ -13,6 +13,8 @@ not be scrolled. The contract now is:
 """
 from __future__ import annotations
 
+import time
+
 from PyQt6.QtCore import QAbstractAnimation, Qt
 
 from .test_camera_pipeline import (  # noqa: F401  (fixtures re-exported)
@@ -37,6 +39,21 @@ def _arm_vision(qapp, window, cmd):
     cmd._vision_btn.setChecked(True)
     _pump(qapp, 0.4)
     assert cmd._vision_btn.isChecked()
+
+
+def _wait_width(qapp, scroll, target: int, timeout: float = 8.0) -> None:
+    """Wait for the drawer's width animation to reach *target* on its own.
+
+    A fixed ``_pump(0.6)`` was a coin flip in a full-suite run: Qt coalesces
+    animation ticks when the rest of the suite keeps the process busy, so the
+    190 ms slide could still read 0 after 600 ms of pumped frames. The deadline
+    still fails the assertion if the drawer never reaches its target.
+    """
+    deadline = time.monotonic() + timeout
+    while scroll.maximumWidth() != target and time.monotonic() < deadline:
+        _pump(qapp, 0.1)
+    assert scroll.maximumWidth() == target, \
+        f"the drawer never reached {target} px (stuck at {scroll.maximumWidth()})"
 
 
 # ── default state ───────────────────────────────────────────────────────────
@@ -85,14 +102,12 @@ def test_handle_opens_and_closes_the_drawer(qapp, window):
     btn = cmd._vision_rail_btn
 
     btn.click()
-    _pump(qapp, 0.6)
-    assert scroll.maximumWidth() == RAIL_WIDTH
+    _wait_width(qapp, scroll, RAIL_WIDTH)
     assert not scroll.isHidden(), "the drawer stayed hidden after the handle click"
     assert btn.isChecked(), "the handle must read as engaged while the drawer is open"
 
     btn.click()
-    _pump(qapp, 0.6)
-    assert scroll.maximumWidth() == 0
+    _wait_width(qapp, scroll, 0)
     assert scroll.isHidden()
     assert not btn.isChecked()
 
@@ -107,28 +122,26 @@ def test_drawer_slide_is_animated(qapp, window):
     assert anim.state() == QAbstractAnimation.State.Running, "the slide never ran"
     assert anim.duration() > 0 and anim.endValue() == RAIL_WIDTH
     assert scroll.maximumWidth() < RAIL_WIDTH, "the drawer snapped open"
-    _pump(qapp, 0.6)
-    assert scroll.maximumWidth() == RAIL_WIDTH
+    _wait_width(qapp, scroll, RAIL_WIDTH)
 
     cmd._vision_rail_btn.click()
     assert getattr(scroll, '_jarvis_width_animation').state() == QAbstractAnimation.State.Running
-    _pump(qapp, 0.6)
-    assert scroll.maximumWidth() == 0 and scroll.isHidden(), "closing must end hidden"
+    _wait_width(qapp, scroll, 0)
+    assert scroll.isHidden(), "closing must end hidden"
 
 
 def test_reaming_vision_resets_the_drawer(qapp, window, camera):
     cmd = _command_window(qapp, window)
     _arm_vision(qapp, window, cmd)
     cmd._vision_rail_btn.click()
-    _pump(qapp, 0.5)
-    assert cmd._vision_control_scroll.maximumWidth() == RAIL_WIDTH
+    _wait_width(qapp, cmd._vision_control_scroll, RAIL_WIDTH)
 
     cmd._vision_btn.setChecked(False)
     _pump(qapp, 0.2)
     cmd._vision_btn.setChecked(True)
     _pump(qapp, 0.3)
 
-    assert cmd._vision_control_scroll.maximumWidth() == 0
+    _wait_width(qapp, cmd._vision_control_scroll, 0)
     assert cmd._vision_control_scroll.isHidden()
     assert not cmd._vision_rail_btn.isChecked()
 

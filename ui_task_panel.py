@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from PyQt6.QtCore import Qt, QTimer, QRectF
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPalette
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPalette, QPen
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QScrollArea, QSizePolicy, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
@@ -32,31 +32,13 @@ from PyQt6.QtWidgets import (
 )
 
 from ui_theme import (
-    ACCENT, ACCENT_TEXT, AMBER, BORDER, BORDER_SOFT, CARD, CARD_HI, FIELD_BG,
+    ACCENT, ACCENT_TEXT, AMBER, BG, BORDER, BORDER_SOFT, CARD, CARD_HI, FIELD_BG,
     FONT_HEAD, FONT_MONO, FONT_SMALL, FONT_UI, GREEN, RADIUS_MD, RADIUS_SM,
     RED, TEXT, TEXT_BRIGHT, TEXT_DIM, TEXT_MID, rgba, scrollbar_css,
 )
 
-# This panel owns its palette rather than inheriting the HUD's neon colors.
-# The shell remains translucent, with light-blue surfaces and restrained status tones.
-ACCENT = "#438BCB"
-ACCENT_TEXT = "#FFFFFF"
-AMBER = "#B67B2C"
-BORDER = "#BDD7EE"
-BORDER_SOFT = "#DCEAF6"
-CARD = "#F5FAFF"
-CARD_HI = "#EAF4FD"
-FIELD_BG = "#F7FBFF"
-GREEN = "#2E8A68"
-RED = "#C05260"
-TEXT = "#35516B"
-TEXT_BRIGHT = "#173B59"
-TEXT_DIM = "#91A8BC"
-TEXT_MID = "#617E98"
-FONT_HEAD = "Segoe UI"
-FONT_MONO = "Consolas"
-FONT_UI = "Segoe UI"
-FONT_SMALL = "Segoe UI"
+# ui_theme is the single source of truth for the running HUD's colors and fonts.
+# Task-specific UI states choose semantic tokens rather than maintaining a second palette.
 
 __all__ = ["TaskProgressPane", "QuestionFlowView"]
 
@@ -98,12 +80,16 @@ class _QuestionCheckBox(QCheckBox):
     keyboard accessibility stay native while the checked state is always clear.
     """
 
-    _CHECKED = QColor("#347FBD")
-    _CHECKED_BORDER = QColor("#215F94")
-    _UNCHECKED = QColor("#E4F1FC")
-    _UNCHECKED_HOVER = QColor("#D2E8FA")
-    _BORDER = QColor("#8FB8D9")
-    _CHECK = QColor("#FFFFFF")
+    _CHECKED = QColor(ACCENT)
+    _CHECKED_BORDER = QColor(ACCENT_TEXT)
+    _UNCHECKED = QColor(BG)
+    _UNCHECKED_HOVER = QColor(CARD_HI)
+    _BORDER = QColor(BORDER)
+    _CHECK = QColor(TEXT_BRIGHT)
+
+    def hitButton(self, pos) -> bool:  # noqa: N802 - Qt virtual method name
+        """Make the complete option row clickable across Qt/platform styles."""
+        return self.rect().contains(pos)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt virtual method name
         super().paintEvent(event)
@@ -146,31 +132,126 @@ class _QuestionCheckBox(QCheckBox):
         painter.end()
 
 
+class _CornerLineFrame(QFrame):
+    """Dark Activity-style surface with soft fill and four open corner strokes."""
+
+    def __init__(self, parent=None, *, edge=None, fill=None):
+        super().__init__(parent)
+        self._edge = QColor(edge or ACCENT)
+        self._fill = QColor(fill or QColor(1, 15, 25, 135))
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background:transparent;border:none;")
+
+    def set_edge_color(self, color) -> None:
+        self._edge = QColor(color)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        if rect.width() > 0 and rect.height() > 0:
+            p.fillRect(rect, self._fill)
+            edge = QColor(self._edge)
+            edge.setAlpha(min(210, max(90, edge.alpha())))
+            p.setPen(QPen(edge, 1.15, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            arm = min(12.0, max(6.0, min(rect.width(), rect.height()) * 0.16))
+            l, t, r, b = rect.left(), rect.top(), rect.right(), rect.bottom()
+            for x, y, dx, dy in ((l, t, 1, 1), (r, t, -1, 1),
+                                  (l, b, 1, -1), (r, b, -1, -1)):
+                p.drawLine(QPointF(x, y), QPointF(x + dx * arm, y))
+                p.drawLine(QPointF(x, y), QPointF(x, y + dy * arm))
+        p.end()
+
+
+class _CornerLineButton(QPushButton):
+    """Button that uses the HUD's open-corner treatment, never a rounded box."""
+
+    def __init__(self, text: str, *, accent: bool = False, danger: bool = False,
+                 compact: bool = False):
+        super().__init__(text)
+        self._accent = bool(accent)
+        self._danger = bool(danger)
+        self._hover = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        pad = "4px 10px" if compact else "6px 14px"
+        self.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;padding:{pad};"
+            f"font:700 8pt {FONT_UI};}}"
+        )
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        if r.width() <= 0 or r.height() <= 0:
+            p.end()
+            return
+        active = self._hover or self.isDown() or self.hasFocus()
+        if self.isDown():
+            p.fillRect(r, QColor(0, 92, 124, 105))
+        elif self._hover:
+            p.fillRect(r, QColor(0, 72, 98, 62))
+        elif self._accent:
+            p.fillRect(r, QColor(0, 58, 80, 28))
+
+        if not self.isEnabled():
+            ink = QColor(TEXT_DIM)
+            edge = QColor(BORDER_SOFT)
+        elif self._danger:
+            ink = QColor(RED if active else "#E77B8B")
+            edge = QColor(RED)
+        elif self._accent:
+            ink = QColor(ACCENT_TEXT if active else ACCENT)
+            edge = QColor(ACCENT)
+        else:
+            ink = QColor(TEXT_BRIGHT if active else TEXT_MID)
+            edge = QColor(ACCENT if active else BORDER)
+        edge.setAlpha(220 if active or self._accent or self._danger else 145)
+        p.setPen(QPen(edge, 1.15, Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        arm = min(8.5, max(5.0, min(r.width(), r.height()) * 0.23))
+        l, t, right, bottom = r.left(), r.top(), r.right(), r.bottom()
+        for x, y, dx, dy in ((l, t, 1, 1), (right, t, -1, 1),
+                              (l, bottom, 1, -1), (right, bottom, -1, -1)):
+            p.drawLine(QPointF(x, y), QPointF(x + dx * arm, y))
+            p.drawLine(QPointF(x, y), QPointF(x, y + dy * arm))
+        font = QFont(FONT_UI.strip("'\""), 8, QFont.Weight.Bold)
+        p.setFont(font)
+        p.setPen(ink)
+        p.drawText(r.adjusted(4, 0, -4, 0),
+                   int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
+                   self.text())
+        p.end()
+
+
 def _btn(text: str, *, accent: bool = False, danger: bool = False,
          compact: bool = False) -> QPushButton:
-    b = QPushButton(text)
-    color = ACCENT if accent else (RED if danger else TEXT_MID)
-    hover = ACCENT_TEXT if accent else (RED if danger else ACCENT)
-    pad = "4px 10px" if compact else "6px 14px"
-    b.setStyleSheet(
-        f"QPushButton{{background:{rgba(CARD_HI, 200)};color:{color};"
-        f"border:1px solid {BORDER};border-radius:{RADIUS_SM}px;"
-        f"padding:{pad};font:700 8pt {FONT_UI};letter-spacing:0.6px;}}"
-        f"QPushButton:hover{{color:{hover};border:1px solid {hover};background:rgba(255,255,255,238);}}"
-        f"QPushButton:pressed{{background:rgba(202,229,249,230);border:1px solid {ACCENT};}}"
-        f"QPushButton:disabled{{color:{TEXT_DIM};border:1px solid {BORDER_SOFT};background:rgba(244,249,253,145);}}"
-    )
-    b.setCursor(Qt.CursorShape.PointingHandCursor)
-    return b
+    """Activity-matched angular button; same size hints and callbacks as before."""
+    return _CornerLineButton(text, accent=accent, danger=danger, compact=compact)
 
 
 # ── question flow ─────────────────────────────────────────────────────────────
 
-class QuestionFlowView(QFrame):
+class QuestionFlowView(_CornerLineFrame):
     """One question (or the summary) of an open clarification flow."""
 
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__(parent, edge=ACCENT, fill=QColor(1, 15, 25, 155))
         self._task_id = ""
         self._snapshot: dict = {}
         self._selected: list[str] = []
@@ -179,9 +260,8 @@ class QuestionFlowView(QFrame):
 
     def _build(self) -> None:
         self.setStyleSheet(
-            f"QFrame{{background:{rgba(CARD, 220)};border:1px solid {BORDER};"
-            f"border-radius:{RADIUS_MD}px;}}"
-            f"QLabel{{background:transparent;border:none;}}"
+            "QFrame{background:transparent;border:none;}"
+            "QLabel{background:transparent;border:none;}"
         )
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 9, 10, 9)
@@ -208,9 +288,10 @@ class QuestionFlowView(QFrame):
 
         self._custom = QLineEdit()
         self._custom.setPlaceholderText("Or type your own answer…")
+        self._custom.textChanged.connect(self._sync_selected)
         self._custom.setStyleSheet(
-            f"QLineEdit{{background:{rgba(FIELD_BG, 200)};color:{TEXT};"
-            f"border:1px solid {BORDER};border-radius:{RADIUS_SM}px;"
+            f"QLineEdit{{background:rgba(1,15,25,150);color:{TEXT};"
+            f"border:1px solid {BORDER};border-radius:0px;"
             f"padding:5px 7px;font:400 8.5pt {FONT_UI};}}"
             f"QLineEdit:focus{{border:1px solid {ACCENT};}}")
         lay.addWidget(self._custom)
@@ -286,7 +367,10 @@ class QuestionFlowView(QFrame):
         multi = bool(question.get("multi_select"))
         recommended = str(question.get("recommended_option") or "")
         reason = str(question.get("recommended_reason") or "")
-        current = self._snapshot.get("answered") or {}
+        question_id = str(question.get("id") or "")
+        answered_ids = self._answers_for(question_id)
+        if not multi and answered_ids:
+            answered_ids = answered_ids[:1]
         self._clear_options()
         for option in question.get("options") or []:
             oid = str(option.get("id") or "")
@@ -304,10 +388,23 @@ class QuestionFlowView(QFrame):
                 f"QCheckBox::indicator{{width:18px;height:18px;}}"
                 f"QCheckBox:disabled{{color:{TEXT_DIM};}}")
             box.setCursor(Qt.CursorShape.PointingHandCursor)
-            box.setMinimumHeight(26)
-            box.setChecked(oid in self._answers_for(str(question.get("id") or "")))
-            box.stateChanged.connect(
-                lambda _s, _o=oid, _m=multi: self._on_option(_o, _m))
+            box.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            box.setMouseTracking(True)
+            box.setMinimumWidth(0)
+            box.setMinimumHeight(34)
+            box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+            box.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            box.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation, True)
+            box.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            box.setTristate(False)
+            box.setAccessibleName(label)
+            box.setAccessibleDescription(description or label)
+            box.setChecked(oid in answered_ids)
+            # ``toggled`` fires only for a real boolean change.  The callback
+            # reads every checked row, so restored answers and fresh clicks use
+            # the same source of truth.
+            box.toggled.connect(
+                lambda _checked, _o=oid, _m=multi: self._on_option(_o, _m))
             self._options_box.addWidget(box)
             self._checks[oid] = box
         self._custom.setVisible(bool(question.get("allow_custom")))
@@ -341,13 +438,8 @@ class QuestionFlowView(QFrame):
         box = self._checks.get(option_id)
         if box is None:
             return
-        if multi:
-            if box.isChecked() and option_id not in self._selected:
-                self._selected.append(option_id)
-            elif not box.isChecked() and option_id in self._selected:
-                self._selected.remove(option_id)
-        else:
-            self._selected = [option_id] if box.isChecked() else []
+        if not multi and box.isChecked():
+            # Single-select questions may keep exactly one checked option.
             for oid, other in self._checks.items():
                 if oid != option_id and other.isChecked():
                     other.blockSignals(True)
@@ -355,9 +447,24 @@ class QuestionFlowView(QFrame):
                     other.blockSignals(False)
         self._sync_selected()
 
-    def _sync_selected(self) -> None:
-        # The summary/next action state follows the REAL selection.
-        pass
+    def _sync_selected(self, *_args) -> None:
+        """Rebuild the submitted answer from the visible, actual control state."""
+        checked = [oid for oid, box in self._checks.items() if box.isChecked()]
+        question = self._snapshot.get("question") or {}
+        if not bool(question.get("multi_select")) and len(checked) > 1:
+            checked = checked[:1]
+            keep = checked[0]
+            for oid, box in self._checks.items():
+                if oid != keep and box.isChecked():
+                    box.blockSignals(True)
+                    box.setChecked(False)
+                    box.blockSignals(False)
+        self._selected = checked
+        custom_allowed = bool(question.get("allow_custom"))
+        has_custom = custom_allowed and bool(self._custom.text().strip())
+        has_answer = bool(self._selected) or has_custom
+        if hasattr(self, "_next"):
+            self._next.setEnabled(has_answer or not bool(question.get("required")))
 
     # ── actions (dispatched to the brain question service) ────────────────────
     def _on_next(self) -> None:
@@ -396,11 +503,263 @@ class QuestionFlowView(QFrame):
             service.cancel(self._task_id, "cancelled from the task panel")
 
 
+# ── execution approval card ───────────────────────────────────────────────────
+
+_KIND_LABEL = {
+    "coding": ("CODING", ACCENT),
+    "file_change": ("FILE CHANGE", AMBER),
+    "desktop": ("DESKTOP CONTROL", AMBER),
+    "plugin": ("PLUGIN ACTION", ACCENT),
+    "automation": ("AUTOMATION", AMBER),
+    "action": ("ACTION", ACCENT),
+}
+_STATUS_COLOR = {
+    "pending": AMBER,
+    "approved": GREEN,
+    "declined": RED,
+    "expired": TEXT_DIM,
+    "cancelled": TEXT_DIM,
+}
+
+
+def _approval_service():
+    try:
+        from security.approval import get_approval_service
+        return get_approval_service()
+    except Exception:
+        return None
+
+
+class ApprovalCard(_CornerLineFrame):
+    """One real execution approval: what will happen, where, and the verdict.
+
+    The card never decides anything itself — it reports the user's press to the
+    central approval service (through the pane), so the same decision unblocks
+    the waiting tool regardless of whether the user clicked here or in chat.
+    """
+
+    decided = pyqtSignal(str, bool, bool)  # request_id, accepted, auto_approve
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent, edge=AMBER, fill=QColor(18, 12, 2, 165))
+        self._request: dict = {}
+        self._request_id = ""
+        self._kind = "action"
+        self._status = ""
+        self._build()
+
+    # ── construction ─────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        self.setStyleSheet("QFrame{background:transparent;border:none;}"
+                           "QLabel{background:transparent;border:none;}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(11, 9, 11, 10)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        self._badge = QLabel("APPROVAL REQUIRED")
+        self._badge.setStyleSheet(
+            f"color:{AMBER};font:800 7pt {FONT_HEAD};letter-spacing:1px;")
+        head.addWidget(self._badge)
+        head.addStretch(1)
+        self._status_lbl = QLabel("PENDING")
+        self._status_lbl.setStyleSheet(
+            f"color:{AMBER};font:800 7pt {FONT_HEAD};letter-spacing:1px;")
+        head.addWidget(self._status_lbl)
+        lay.addLayout(head)
+
+        self._title = QLabel("")
+        self._title.setWordWrap(True)
+        self._title.setStyleSheet(
+            f"color:{TEXT_BRIGHT};font:700 10pt {FONT_UI};")
+        lay.addWidget(self._title)
+
+        self._question = QLabel("")
+        self._question.setWordWrap(True)
+        self._question.setStyleSheet(f"color:{TEXT};font:500 8.5pt {FONT_UI};")
+        lay.addWidget(self._question)
+
+        self._description = QLabel("")
+        self._description.setWordWrap(True)
+        self._description.setStyleSheet(
+            f"color:{TEXT_MID};font:400 8pt {FONT_SMALL};")
+        lay.addWidget(self._description)
+
+        # Affected files / concrete changes.  The list is scrollable so a large
+        # diff summary can never push the Approve/Decline buttons off the pane.
+        self._changes_scroll = QScrollArea()
+        self._changes_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._changes_scroll.setWidgetResizable(True)
+        self._changes_scroll.setMaximumHeight(132)
+        self._changes_scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollArea > QWidget > QWidget{background:transparent;}"
+            + scrollbar_css(4))
+        self._changes_host = QWidget()
+        self._changes_host.setStyleSheet("QWidget{background:transparent;}")
+        self._changes_lay = QVBoxLayout(self._changes_host)
+        self._changes_lay.setContentsMargins(0, 0, 2, 0)
+        self._changes_lay.setSpacing(4)
+        self._changes_scroll.setWidget(self._changes_host)
+        self._changes_scroll.setVisible(False)
+        lay.addWidget(self._changes_scroll)
+
+        self._reason = QLabel("")
+        self._reason.setWordWrap(True)
+        self._reason.setStyleSheet(f"color:{TEXT_DIM};font:400 7.5pt {FONT_SMALL};")
+        self._reason.setVisible(False)
+        lay.addWidget(self._reason)
+
+        foot = QHBoxLayout()
+        foot.setContentsMargins(0, 2, 0, 0)
+        foot.setSpacing(8)
+        self._auto = QCheckBox("AUTO-APPROVE")
+        self._auto.setToolTip(
+            "Skip this card for future actions of the same kind. This does not "
+            "approve the current action.")
+        self._auto.setStyleSheet(
+            f"QCheckBox{{color:{TEXT_MID};font:700 7pt {FONT_SMALL};"
+            "letter-spacing:0.6px;spacing:7px;background:transparent;}"
+            "QCheckBox::indicator{width:15px;height:15px;}"
+            f"QCheckBox:checked{{color:{AMBER};}}")
+        self._auto.toggled.connect(self._on_auto_toggled)
+        foot.addWidget(self._auto)
+        foot.addStretch(1)
+        self._approve = _btn("APPROVE", accent=True, compact=True)
+        self._approve.setObjectName("approveActionButton")
+        self._approve.clicked.connect(lambda: self._finish(True))
+        self._decline = _btn("DECLINE", danger=True, compact=True)
+        self._decline.setObjectName("declineActionButton")
+        self._decline.clicked.connect(lambda: self._finish(False))
+        foot.addWidget(self._decline)
+        foot.addWidget(self._approve)
+        lay.addLayout(foot)
+
+    # ── rendering ────────────────────────────────────────────────────────────
+    def _clear_changes(self) -> None:
+        while self._changes_lay.count():
+            item = self._changes_lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def set_request(self, request: dict) -> None:
+        request = dict(request or {})
+        self._request = request
+        self._request_id = str(request.get("request_id") or "")
+        self._kind = str(request.get("kind") or "action").lower()
+        label, color = _KIND_LABEL.get(self._kind, _KIND_LABEL["action"])
+        self._badge.setText(f"APPROVAL REQUIRED · {label}")
+        self._badge.setStyleSheet(
+            f"color:{color};font:800 7pt {FONT_HEAD};letter-spacing:1px;")
+        self.set_edge_color(color)
+        self._title.setText(str(request.get("title") or "Approval required"))
+        question = str(request.get("question") or "").strip()
+        self._question.setText(question if question and question != self._title.text() else "")
+        self._question.setVisible(bool(self._question.text()))
+        description = str(request.get("description") or "").strip()
+        self._description.setText(description)
+        self._description.setVisible(bool(description))
+
+        self._clear_changes()
+        targets = [str(t) for t in (request.get("targets") or []) if str(t).strip()]
+        changes = request.get("changes") or {}
+        for path in targets:
+            row = QLabel(f"▸ {path}")
+            row.setWordWrap(True)
+            row.setStyleSheet(
+                f"color:{TEXT};font:400 7.5pt {FONT_MONO};")
+            self._changes_lay.addWidget(row)
+            summary = str(changes.get(path) or "").strip()
+            if summary:
+                detail = QLabel(f"    {summary}")
+                detail.setWordWrap(True)
+                detail.setStyleSheet(
+                    f"color:{TEXT_DIM};font:400 7.5pt {FONT_SMALL};")
+                self._changes_lay.addWidget(detail)
+        for path, summary in changes.items():
+            if path in targets:
+                continue
+            row = QLabel(f"▸ {path}\n    {summary}")
+            row.setWordWrap(True)
+            row.setStyleSheet(f"color:{TEXT};font:400 7.5pt {FONT_MONO};")
+            self._changes_lay.addWidget(row)
+        self._changes_scroll.setVisible(bool(targets or changes))
+
+        try:
+            self._auto.blockSignals(True)
+            self._auto.setChecked(bool(request.get("auto_approve")))
+            self._auto.blockSignals(False)
+        except Exception:
+            pass
+        self._reason.setText("")
+        self._reason.setVisible(False)
+        self.set_status("pending")
+        self.setVisible(True)
+
+    def set_status(self, status: str, reason: str = "") -> None:
+        status = str(status or "pending").lower()
+        self._status = status
+        color = _STATUS_COLOR.get(status, TEXT_DIM)
+        self._status_lbl.setText(status.upper())
+        self._status_lbl.setStyleSheet(
+            f"color:{color};font:800 7pt {FONT_HEAD};letter-spacing:1px;")
+        terminal = status not in ("", "pending")
+        self._approve.setEnabled(not terminal)
+        self._decline.setEnabled(not terminal)
+        self._approve.setVisible(status in ("", "pending"))
+        self._decline.setVisible(status in ("", "pending"))
+        if reason:
+            self._reason.setText(reason)
+            self._reason.setVisible(True)
+        if terminal:
+            self.set_edge_color(color)
+
+    def status(self) -> str:
+        return self._status
+
+    def request_id(self) -> str:
+        return self._request_id
+
+    # ── interaction ──────────────────────────────────────────────────────────
+    def _finish(self, accepted: bool) -> None:
+        if not self._request_id or self._status not in ("", "pending"):
+            return
+        # Disable immediately: a double-click must never emit two decisions.
+        self.set_status("approved" if accepted else "declined",
+                        "Recording your decision…")
+        self.decided.emit(self._request_id, bool(accepted), self._auto.isChecked())
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        service = _approval_service()
+        if service is None:
+            return
+        try:
+            service.set_auto_approve(self._kind, bool(checked))
+        except Exception:
+            pass
+
+    def refresh_auto_flag(self) -> None:
+        service = _approval_service()
+        if service is None:
+            return
+        try:
+            self._auto.blockSignals(True)
+            self._auto.setChecked(service.auto_approve_enabled(self._kind))
+            self._auto.blockSignals(False)
+        except Exception:
+            pass
+
+
 # ── task progress pane ────────────────────────────────────────────────────────
 
 class TaskProgressPane(QWidget):
     """Compact, glass-like checklist driven by live task-registry snapshots."""
 
+    preferredSizeChanged = pyqtSignal()
     _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "ERROR"}
     _SPINNER = ("◴", "◷", "◶", "◵")
 
@@ -420,6 +779,7 @@ class TaskProgressPane(QWidget):
         self._spinner_index = 0
         self._running_mark: QLabel | None = None
         self._rendering = False
+        self._approval_queue: list[dict] = []
         self._build()
         self._ticker = QTimer(self)
         self._ticker.setInterval(250)
@@ -438,16 +798,17 @@ class TaskProgressPane(QWidget):
     def _build(self) -> None:
         self.setObjectName("TeardownChecklistPane")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMinimumWidth(0)
         # Use a real tinted pane fallback instead of allowing platform-native
         # QWidget/viewport defaults to leak through as white.
         pane_palette = self.palette()
-        pane_palette.setColor(QPalette.ColorRole.Window, QColor("#D7EAFB"))
+        pane_palette.setColor(QPalette.ColorRole.Window, QColor(BG))
         self.setPalette(pane_palette)
         self.setStyleSheet(
-            "QWidget#TeardownChecklistPane{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #E4F2FF,stop:0.55 #D2E8FA,stop:1 #C4DFF5);border:none;}"
+            "QWidget#TeardownChecklistPane{background:transparent;border:none;}"
             "QLabel{background:transparent;border:none;}"
         )
         lay = QVBoxLayout(self)
@@ -469,9 +830,9 @@ class TaskProgressPane(QWidget):
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status.setMinimumHeight(24)
         self._status.setStyleSheet(
-            "QLabel{color:#438BCB;background:rgba(222,240,255,190);"
-            "border:1px solid rgba(125,176,220,135);border-radius:12px;"
-            "padding:3px 10px;font:700 8pt 'Segoe UI';letter-spacing:0.5px;}"
+            f"QLabel{{color:{ACCENT};background:transparent;"
+            "border:none;border-radius:0;padding:3px 2px;"
+            f"font:700 7pt '{FONT_SMALL}';letter-spacing:1px;}}"
         )
         toolbar.addWidget(self._status, 0, Qt.AlignmentFlag.AlignLeft)
         toolbar.addStretch(1)
@@ -479,7 +840,7 @@ class TaskProgressPane(QWidget):
         self._elapsed.setObjectName("taskElapsed")
         self._elapsed.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._elapsed.setStyleSheet(
-            "QLabel{color:#476A88;font:600 10pt 'Consolas';padding:2px 4px;}"
+            f"QLabel{{color:{TEXT_DIM};font:600 10pt '{FONT_MONO}';padding:2px 4px;}}"
         )
         self._elapsed.setToolTip("Elapsed teardown time")
         toolbar.addWidget(self._elapsed)
@@ -498,7 +859,7 @@ class TaskProgressPane(QWidget):
         self._current.setObjectName("taskTitle")
         self._current.setWordWrap(True)
         self._current.setStyleSheet(
-            "QLabel{color:#173B59;font:650 12pt 'Segoe UI';padding:1px 2px;}"
+            f"QLabel{{color:{TEXT_BRIGHT};font:700 12pt '{FONT_HEAD}';padding:1px 2px;}}"
         )
         self._current.setMinimumWidth(0)
         self._current.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -507,6 +868,11 @@ class TaskProgressPane(QWidget):
         self._question = QuestionFlowView()
         self._question.setVisible(False)
         lay.addWidget(self._question)
+
+        self._approval = ApprovalCard()
+        self._approval.setVisible(False)
+        self._approval.decided.connect(self._on_approval_decided)
+        lay.addWidget(self._approval)
 
         self._scroll = QScrollArea()
         self._scroll.setObjectName("taskChecklistScroll")
@@ -532,27 +898,20 @@ class TaskProgressPane(QWidget):
         self._empty_steps.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_steps.setMinimumHeight(54)
         self._empty_steps.setStyleSheet(
-            "QLabel#taskChecklistEmptyState{color:#557B9A;"
-            "background:rgba(205,229,249,115);border:1px dashed #8FB8DA;"
-            "border-radius:10px;padding:12px;font:400 9pt 'Segoe UI';}"
+            f"QLabel#taskChecklistEmptyState{{color:{TEXT_DIM};"
+            f"background:{rgba(BG, 90)};border:none;"
+            f"padding:12px;font:400 9pt '{FONT_MONO}';}}"
         )
         self._steps_lay.addWidget(self._empty_steps)
         self._steps_lay.addStretch(1)
         self._scroll.setWidget(self._steps_host)
         lay.addWidget(self._scroll, 1)
 
-        self._report_card = QFrame(self)
+        self._report_card = _CornerLineFrame(
+            self, edge=QColor(ACCENT), fill=QColor(1, 15, 25, 150))
         self._report_card.setObjectName("TaskReportCard")
-        self._report_card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._report_card.setAutoFillBackground(True)
-        report_palette = self._report_card.palette()
-        report_palette.setColor(QPalette.ColorRole.Window, QColor("#CBE4F9"))
-        self._report_card.setPalette(report_palette)
         self._report_card.setStyleSheet(
-            "QFrame#TaskReportCard{"
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:1,"
-            "stop:0 #D8ECFF,stop:0.50 #C4E1FA,stop:1 #AFCFEF);"
-            "border:1px solid #78ACD9;border-radius:12px;}"
+            "QFrame#TaskReportCard{background:transparent;border:none;}"
             "QLabel{background:transparent;border:none;}"
         )
         self._report_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -562,7 +921,7 @@ class TaskProgressPane(QWidget):
         report_lay.setSpacing(4)
         self._report_title = QLabel("Teardown report")
         self._report_title.setStyleSheet(
-            "QLabel{color:#16466F;font:750 9pt 'Segoe UI';}"
+            "QLabel{color:#5BDDF8;font:800 8pt 'Orbitron';letter-spacing:0.4px;}"
         )
         report_lay.addWidget(self._report_title)
         self._report_metrics = QLabel("")
@@ -570,13 +929,13 @@ class TaskProgressPane(QWidget):
         self._report_metrics.setMinimumWidth(0)
         self._report_metrics.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self._report_metrics.setStyleSheet(
-            "QLabel{color:#244E70;font:550 8.5pt 'Segoe UI';}"
+            "QLabel{color:#C2EAF5;font:500 8.5pt 'Rajdhani';}"
         )
         report_lay.addWidget(self._report_metrics)
         self._report_errors = QLabel("")
         self._report_errors.setWordWrap(True)
         self._report_errors.setStyleSheet(
-            "QLabel{color:#8D5860;font:400 8pt 'Segoe UI';}"
+            "QLabel{color:#FF7E8B;font:400 8pt 'Rajdhani';}"
         )
         self._report_errors.setMinimumWidth(0)
         self._report_errors.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -593,38 +952,37 @@ class TaskProgressPane(QWidget):
         self._report_detail.setMinimumHeight(126)
         self._report_detail.setMaximumHeight(230)
         self._report_detail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._report_detail.setAutoFillBackground(True)
+        self._report_detail.setAutoFillBackground(False)
         self._report_detail.setFrameShape(QFrame.Shape.NoFrame)
         report_text_palette = self._report_detail.palette()
-        report_text_palette.setColor(QPalette.ColorRole.Base, QColor("#DFF0FF"))
-        report_text_palette.setColor(QPalette.ColorRole.Text, QColor("#183F60"))
-        report_text_palette.setColor(QPalette.ColorRole.Window, QColor("#DFF0FF"))
+        report_text_palette.setColor(QPalette.ColorRole.Base, QColor("#071C2A"))
+        report_text_palette.setColor(QPalette.ColorRole.Text, QColor("#DDF7FF"))
+        report_text_palette.setColor(QPalette.ColorRole.Window, QColor("#071C2A"))
         self._report_detail.setPalette(report_text_palette)
         report_css = (
             "QTextBrowser#TaskReportDetails{"
-            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "stop:0 #E7F4FF,stop:1 #CFE6FA);color:#183F60;"
-            "border:1px solid #80B5E1;border-radius:8px;padding:8px;"
-            "selection-background-color:#A9D0F1;}"
-            "QScrollBar:vertical{width:7px;background:#D5E9FA;margin:2px;border:none;}"
-            "QScrollBar::handle:vertical{background:#75A9D7;border-radius:3px;min-height:22px;}"
+            "background:rgba(1,15,25,115);color:#DDF7FF;"
+            "border:none;padding:8px;"
+            "selection-background-color:#0E5670;}"
+            "QScrollBar:vertical{width:7px;background:#041522;margin:2px;border:none;}"
+            "QScrollBar::handle:vertical{background:#2A849F;border-radius:3px;min-height:22px;}"
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
         )
         self._report_detail.setStyleSheet(report_css)
         # QTextBrowser paints its viewport separately; styling only the outer
         # frame leaves that child white on some Qt platform styles.
-        self._report_detail.viewport().setAutoFillBackground(True)
+        self._report_detail.viewport().setAutoFillBackground(False)
         self._report_detail.viewport().setStyleSheet(
-            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #E7F4FF,stop:1 #CFE6FA);border:none;"
+            "background:transparent;border:none;"
         )
         self._report_detail.document().setDefaultStyleSheet(
-            "body { color: #183F60; font-family: 'Segoe UI'; font-size: 10pt; }"
-            "h1,h2,h3,h4 { color: #174D7A; margin-top: 8px; margin-bottom: 4px; }"
-            "p,li { color: #234E70; }"
-            "a { color: #176FB3; text-decoration: underline; }"
-            "pre,code { background-color: #C4DFF5; color: #17466B; }"
-            "blockquote { color: #476F8F; border-left: 3px solid #78ACD9; margin-left: 6px; padding-left: 8px; }"
-            "table { border-collapse: collapse; } th,td { border: 1px solid #9ABFDF; padding: 4px 6px; }"
+            "body { color: #DDF7FF; font-family: 'Rajdhani'; font-size: 10pt; }"
+            "h1,h2,h3,h4 { color: #73E6FF; margin-top: 8px; margin-bottom: 4px; }"
+            "p,li { color: #B9E8F5; }"
+            "a { color: #65DFFB; text-decoration: underline; }"
+            "pre,code { background-color: #0A2A3A; color: #C5F1FF; }"
+            "blockquote { color: #82B7C8; border-left: 3px solid #2C8BA6; margin-left: 6px; padding-left: 8px; }"
+            "table { border-collapse: collapse; } th,td { border: 1px solid #235568; padding: 4px 6px; }"
         )
         self._report_detail.hide()
         report_lay.addWidget(self._report_detail)
@@ -639,7 +997,7 @@ class TaskProgressPane(QWidget):
         self._detail.setObjectName("taskDetails")
         self._detail.setWordWrap(True)
         self._detail.setStyleSheet(
-            "QLabel{color:#67839B;font:400 8pt 'Segoe UI';background:transparent;}"
+            "QLabel{color:#82B7C8;font:400 8pt 'Rajdhani';background:transparent;}"
         )
         self._detail.setSizePolicy(QSizePolicy.Policy.Preferred,
                                    QSizePolicy.Policy.Minimum)
@@ -703,10 +1061,90 @@ class TaskProgressPane(QWidget):
     def show_question(self, snapshot: dict) -> None:
         snapshot = dict(snapshot or {})
         self._question.set_snapshot(snapshot)
+        self._question.updateGeometry()
         task_id = str(snapshot.get("task_id") or "")
         if task_id:
             self._selected = task_id
             self._render()
+
+    # ── execution approvals ───────────────────────────────────────────────────
+    def show_approval(self, request: dict) -> None:
+        """Display one approval card; additional pending requests queue."""
+        request = dict(request or {})
+        request_id = str(request.get("request_id") or "")
+        if not request_id:
+            return
+        current = self._approval.request_id()
+        if (current and current != request_id
+                and self._approval.status() in ("", "pending")):
+            if not any(str(q.get("request_id") or "") == request_id
+                       for q in self._approval_queue):
+                self._approval_queue.append(request)
+            return
+        if current == request_id:
+            self._approval.set_request(request)
+        else:
+            self._approval.set_request(request)
+        self._approval.setVisible(True)
+        self._approval.updateGeometry()
+        self.preferredSizeChanged.emit()
+
+    def update_approval(self, request_id: str, status: str,
+                        reason: str = "") -> bool:
+        """Reflect a decision made elsewhere (chat card / auto-expiry)."""
+        request_id = str(request_id or "")
+        if not request_id or request_id != self._approval.request_id():
+            return False
+        self._approval.set_status(status, reason)
+        self.preferredSizeChanged.emit()
+        if status in ("approved", "declined", "expired", "cancelled"):
+            self._show_next_approval()
+        return True
+
+    def pending_approval_ids(self) -> list[str]:
+        ids = []
+        current = self._approval.request_id()
+        if current and self._approval.status() in ("", "pending"):
+            ids.append(current)
+        ids.extend(str(q.get("request_id") or "") for q in self._approval_queue)
+        return [i for i in ids if i]
+
+    def _on_approval_decided(self, request_id: str, accepted: bool,
+                             auto: bool) -> None:
+        service = _approval_service()
+        resolved = False
+        if service is not None:
+            try:
+                resolved = bool(service.resolve(
+                    request_id, bool(accepted), auto=bool(auto)))
+            except Exception:
+                resolved = False
+        if not resolved:
+            # The chat card may have resolved it first, or the request expired.
+            status = "declined"
+            try:
+                if service is not None:
+                    info = service.get(request_id) or {}
+                    status = str(info.get("status") or status)
+            except Exception:
+                pass
+            self._approval.set_status(
+                status, "" if status != "declined" else "No approval was granted.")
+        else:
+            self._approval.set_status(
+                "approved" if accepted else "declined",
+                "You approved this action." if accepted
+                else "Declined — nothing was executed.")
+        self._show_next_approval()
+        self.preferredSizeChanged.emit()
+
+    def _show_next_approval(self) -> None:
+        if not self._approval_queue:
+            return
+        nxt = self._approval_queue.pop(0)
+        self._approval.set_request(nxt)
+        self._approval.setVisible(True)
+        self.preferredSizeChanged.emit()
 
     # ── internals ─────────────────────────────────────────────────────────────
     @staticmethod
@@ -831,7 +1269,7 @@ class TaskProgressPane(QWidget):
         if raw in {"FAILED", "FAILURE"}:
             return "FAILED", RED
         if raw == "ERROR":
-            return "ERROR", "#B15C2D"
+            return "ERROR", "#F4B24A"
         if raw == "CANCELLED":
             return "CANCELLED", TEXT_DIM
         if raw in {"RUNNING", "INITIALIZING", "VALIDATING", "STARTED"}:
@@ -876,9 +1314,9 @@ class TaskProgressPane(QWidget):
             if not snapshot:
                 self._status.setText("WAITING")
                 self._status.setStyleSheet(
-                    "QLabel{color:#438BCB;background:rgba(222,240,255,190);"
-                    "border:1px solid rgba(125,176,220,135);border-radius:12px;"
-                    "padding:3px 10px;font:700 8pt 'Segoe UI';letter-spacing:0.5px;}"
+                    "QLabel{color:#42C7EF;background:transparent;border:none;"
+                    "border-radius:0;padding:3px 2px;font:700 7pt 'Exo 2';"
+                    "letter-spacing:1px;}"
                 )
                 self._current.setText("Ready for a task")
                 self._elapsed.setText("00:00")
@@ -891,6 +1329,8 @@ class TaskProgressPane(QWidget):
                 self._empty_steps.setText("Waiting for a task to be created.")
                 self._empty_steps.show()
                 self._update_question_visibility()
+                self._update_scroll_preferred_height()
+                self.updateGeometry()
                 return
 
             self._current.setText(self._task_title(snapshot))
@@ -926,77 +1366,48 @@ class TaskProgressPane(QWidget):
             self._detail.setText("\n".join(details))
             self._update_report(snapshot)
             self._update_question_visibility()
+            self._update_scroll_preferred_height()
+            self.updateGeometry()
         finally:
             self._rendering = False
+            # The outer floating window can auto-fit after new rows/report state
+            # changes, including updates discovered by polling rather than events.
+            self.preferredSizeChanged.emit()
 
     def _update_status(self, snapshot: dict) -> None:
         label, color = self._display_state(snapshot)
         self._status.setText(label)
-        bg = "rgba(222,240,255,195)"
-        if label == "COMPLETE":
-            bg = "rgba(222,246,237,205)"
-        elif label in {"FAILED", "ERROR"}:
-            bg = "rgba(255,232,234,205)"
-        elif label == "CANCELLED":
-            bg = "rgba(235,241,247,205)"
-        outline = "rgba(125,176,220,145)"
-        if label == "COMPLETE":
-            outline = "rgba(106,177,151,155)"
-        elif label in {"FAILED", "ERROR"}:
-            outline = "rgba(210,137,147,165)"
-        elif label == "CANCELLED":
-            outline = "rgba(173,194,211,145)"
+        # Activity-panel treatment: status is a colored label, not a rounded pill.
         self._status.setStyleSheet(
-            f"QLabel{{color:{color};background:{bg};border:1px solid {outline};"
-            "border-radius:12px;padding:3px 10px;font:700 8pt 'Segoe UI';"
-            "letter-spacing:0.5px;}"
+            f"QLabel{{color:{color};background:transparent;border:none;"
+            "border-radius:0;padding:3px 2px;font:700 7.2pt 'Exo 2';"
+            "letter-spacing:1px;}"
         )
         self._elapsed.setText(self._format_elapsed(snapshot.get("elapsed_ms", 0)))
 
     def _step_row(self, step: dict) -> QWidget:
         status = str(step.get("status") or "pending").lower()
         if status == "error":
-            glyph, color = ("!", "#B15C2D")
+            glyph, color = ("!", "#F4B24A")
         else:
             glyph, color = _STEP_GLYPH.get(status, ("○", TEXT_DIM))
         if status == "running":
             glyph = self._SPINNER[self._spinner_index]
 
-        row = QFrame()
-        # Stable object name makes the row's own rule win over global HUD QSS.
+        edge_color = QColor(color)
+        if status == "running":
+            fill_color = QColor(0, 38, 55, 190)
+        elif status == "completed":
+            fill_color = QColor(0, 34, 28, 180)
+        elif status in {"failed", "error"}:
+            fill_color = QColor(43, 12, 20, 190)
+        else:
+            fill_color = QColor(1, 15, 25, 145)
+        row = _CornerLineFrame(edge=edge_color, fill=fill_color)
+        # Object name and geometry stay stable; only the paint language changes.
         row.setObjectName("TaskStepCard")
-        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        row.setAutoFillBackground(True)
-        if status == "running":
-            background = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #D9EEFF,stop:1 #B9DDF8)"
-            border = "#78B1E2"
-        elif status == "completed":
-            background = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #E1F5F2,stop:1 #C8EAE5)"
-            border = "#9ACFC7"
-        elif status in {"failed", "error"}:
-            background = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #FFE9EC,stop:1 #F7D2D9)"
-            border = "#DDA2AC"
-        elif status == "waiting":
-            background = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #EAF4FD,stop:1 #D7E9F9)"
-            border = "#B6D2EC"
-        else:
-            background = "qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #E5F2FD,stop:1 #D0E6F8)"
-            border = "#A9CBE8"
-        # Palette is a fallback for styles that do not paint QFrame backgrounds;
-        # the object-specific gradient provides the normal look.
-        row_palette = row.palette()
-        if status == "running":
-            fallback_color = "#C6E4FC"
-        elif status == "completed":
-            fallback_color = "#D3EEE9"
-        elif status in {"failed", "error"}:
-            fallback_color = "#F9DDE2"
-        else:
-            fallback_color = "#D9EBFA"
-        row_palette.setColor(QPalette.ColorRole.Window, QColor(fallback_color))
-        row.setPalette(row_palette)
         row.setStyleSheet(
-            f"QFrame#TaskStepCard{{background:{background};border:1px solid {border};border-radius:10px;}}"
+            "QFrame#TaskStepCard{background:transparent;border:none;}"
             "QLabel{background:transparent;border:none;}"
         )
         row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -1021,15 +1432,15 @@ class TaskProgressPane(QWidget):
         title_label.setMinimumWidth(0)
         title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         if status == "completed":
-            title_color = "#2E705D"
+            title_color = "#68E7B4"
         elif status in {"failed", "error"}:
-            title_color = "#9D4651"
+            title_color = "#FF8792"
         elif status == "running":
-            title_color = "#245D8A"
+            title_color = "#74DFFF"
         else:
-            title_color = "#58748D"
+            title_color = "#87B9C8"
         title_label.setStyleSheet(
-            f"QLabel{{color:{title_color};font:{'600' if status == 'running' else '500'} 9pt 'Segoe UI';}}"
+            f"QLabel{{color:{title_color};font:{'600' if status == 'running' else '500'} 9pt 'Rajdhani';}}"
         )
         text_column.addWidget(title_label)
         outcome = str(step.get("outcome") or "").strip()
@@ -1039,7 +1450,7 @@ class TaskProgressPane(QWidget):
             outcome_label.setMinimumWidth(0)
             outcome_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
             outcome_label.setStyleSheet(
-                "QLabel{color:#456985;font:400 8.2pt 'Segoe UI';}"
+                "QLabel{color:#A2D2E0;font:500 8.2pt 'Rajdhani';}"
             )
             text_column.addWidget(outcome_label)
         lay.addLayout(text_column, 1)
@@ -1070,6 +1481,26 @@ class TaskProgressPane(QWidget):
             if is_tool or is_question or explicitly_visible or is_non_lifecycle:
                 visible.append(raw)
         return visible
+
+    def _update_scroll_preferred_height(self) -> None:
+        """Grow to fit a short checklist, then keep longer lists scrollable."""
+        try:
+            desired = 64
+            for index in range(max(0, self._steps_lay.count() - 2)):
+                item = self._steps_lay.itemAt(index)
+                row = item.widget() if item is not None else None
+                # isHidden() checks this widget's own state, unlike isVisible(),
+                # which is false during construction while an ancestor is hidden.
+                if row is not None and not row.isHidden():
+                    desired += max(28, row.sizeHint().height()) + self._steps_lay.spacing()
+            target = min(360, max(72, desired))
+            self._scroll.setMinimumHeight(target)
+            self._scroll.setMaximumHeight(390)
+            self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            self._scroll.updateGeometry()
+            self.updateGeometry()
+        except Exception:
+            pass
 
     def _clear_steps(self) -> None:
         self._running_mark = None
@@ -1132,10 +1563,12 @@ class TaskProgressPane(QWidget):
         )
         self._report_errors.setText("\n".join(errors[-3:]) if errors else "No errors recorded.")
         self._report_errors.setStyleSheet(
-            "QLabel{color:#923E4C;font:500 8.2pt 'Segoe UI';}"
-            if errors else "QLabel{color:#286B61;font:500 8.2pt 'Segoe UI';}"
+            "QLabel{color:#FF8997;font:600 8.2pt 'Rajdhani';}"
+            if errors else "QLabel{color:#65E0B4;font:600 8.2pt 'Rajdhani';}"
         )
         self._report_card.show()
+        self.updateGeometry()
+        self.preferredSizeChanged.emit()
 
     def _update_question_visibility(self) -> None:
         # Keep the question flow authoritative but do not let an empty question
@@ -1152,16 +1585,16 @@ class TaskProgressPane(QWidget):
         # links and emphasis without creating a second window.
         self._report_detail.setMarkdown(markdown)
         self._report_detail.document().setDefaultStyleSheet(
-            "body { color: #183F60; font-family: 'Segoe UI'; font-size: 10pt; }"
-            "h1,h2,h3,h4 { color: #174D7A; margin-top: 8px; margin-bottom: 4px; }"
-            "p,li { color: #234E70; } a { color: #176FB3; }"
-            "pre,code { background-color: #C4DFF5; color: #17466B; }"
-            "blockquote { color: #476F8F; border-left: 3px solid #78ACD9; margin-left: 6px; padding-left: 8px; }"
-            "table { border-collapse: collapse; } th,td { border: 1px solid #9ABFDF; padding: 4px 6px; }"
+            "body { color: #DDF7FF; font-family: 'Rajdhani'; font-size: 10pt; }"
+            "h1,h2,h3,h4 { color: #73E6FF; margin-top: 8px; margin-bottom: 4px; }"
+            "p,li { color: #B9E8F5; } a { color: #65DFFB; }"
+            "pre,code { background-color: #0A2A3A; color: #C5F1FF; }"
+            "blockquote { color: #82B7C8; border-left: 3px solid #2C8BA6; margin-left: 6px; padding-left: 8px; }"
+            "table { border-collapse: collapse; } th,td { border: 1px solid #235568; padding: 4px 6px; }"
         )
-        self._report_detail.viewport().setAutoFillBackground(True)
+        self._report_detail.viewport().setAutoFillBackground(False)
         self._report_detail.viewport().setStyleSheet(
-            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #E7F4FF,stop:1 #CFE6FA);border:none;"
+            "background:transparent;border:none;"
         )
         self._report_detail.show()
         self._report_card.show()
@@ -1169,12 +1602,16 @@ class TaskProgressPane(QWidget):
         self._report_btn.setToolTip("Hide the detailed Markdown report")
         self._report_card.updateGeometry()
         self.updateGeometry()
+        self.preferredSizeChanged.emit()
 
     def _on_report_clicked(self) -> None:
         if self._report_detail.isVisible():
             self._report_detail.hide()
             self._report_btn.setText("REPORT")
             self._report_btn.setToolTip("Show the detailed report in this panel")
+            self._report_card.updateGeometry()
+            self.updateGeometry()
+            self.preferredSizeChanged.emit()
             return
         task_id = self._selected
         if not task_id:

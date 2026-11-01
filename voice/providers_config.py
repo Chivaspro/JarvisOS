@@ -29,6 +29,18 @@ from __future__ import annotations
 import copy
 from typing import Optional
 
+from voice.fish_defaults import (
+    FISH_DEFAULT_ENDPOINT,
+    FISH_DEFAULT_FORMAT,
+    FISH_DEFAULT_LATENCY,
+    FISH_DEFAULT_MODEL,
+    FISH_DEFAULT_VOICE,
+    FISH_FORMATS,
+    FISH_LATENCIES,
+    FISH_MODELS,
+    looks_like_voice_id,
+)
+
 PROVIDER_IDS = ("fishAudio", "elevenLabs", "gemini", "piperOnnx", "edgeTts", "kokoro", "sapi")
 
 # Canonical TTS engine name each provider maps onto in create_tts_player().
@@ -69,11 +81,11 @@ _ENGINE_TO_PROVIDER = {
 _PROVIDER_DEFAULTS: dict[str, dict] = {
     "fishAudio": {
         "apiKey": "",
-        "endpoint": "https://api.fish.audio/v1/tts",
-        "model": "s2-pro",
-        "voice": "",
-        "format": "mp3",
-        "latency": "normal",
+        "endpoint": FISH_DEFAULT_ENDPOINT,
+        "model": FISH_DEFAULT_MODEL,
+        "voice": FISH_DEFAULT_VOICE,
+        "format": FISH_DEFAULT_FORMAT,
+        "latency": FISH_DEFAULT_LATENCY,
     },
     "elevenLabs": {
         "apiKey": "",
@@ -168,8 +180,9 @@ def providers_block(cfg: dict) -> dict:
             if merged.get("format") == _PROVIDER_DEFAULTS[pid]["format"] and _s(flat.get("fish_audio_format")):
                 merged["format"] = _s(flat.get("fish_audio_format"))
             if merged.get("latency") == _PROVIDER_DEFAULTS[pid]["latency"] and _s(flat.get("fish_audio_latency")):
-                merged["latency"] = "balanced" if _s(flat.get("fish_audio_latency")) == "low" \
-                    else _s(flat.get("fish_audio_latency"))
+                # "low" is a real API value; the old low -> balanced rewrite made
+                # the settings panel lie about the mode actually used.
+                merged["latency"] = _s(flat.get("fish_audio_latency")).lower()
         elif pid == "elevenLabs":
             _fill("apiKey", _s(flat.get("elevenlabs_api_key")))
             _fill("model", _s(flat.get("elevenlabs_model_id")))
@@ -366,15 +379,27 @@ def validate_provider(name: str, values: dict) -> Optional[str]:
     if name == "fishAudio":
         if not _s(v.get("apiKey")):
             return "Fish Audio API key is missing — add it in Settings ▸ Voice ▸ Fish Audio."
-        endpoint = _s(v.get("endpoint")) or "https://api.fish.audio/v1/tts"
+        endpoint = _s(v.get("endpoint")) or FISH_DEFAULT_ENDPOINT
         if not endpoint.startswith(("https://", "http://")):
             return "Fish Audio endpoint must be an HTTP(S) URL."
         if not _s(v.get("voice")):
             return "Fish Audio needs a voice: fill Voice ID in Settings ▸ Voice ▸ Fish Audio."
-        if _s(v.get("model")) and len(_s(v.get("model"))) >= 20 and \
-                all(ch in "0123456789abcdefABCDEF" for ch in _s(v.get("model"))):
+        model = _s(v.get("model"))
+        if looks_like_voice_id(model):
             return ("Fish Audio model looks like a voice ID — put the voice ID in the "
-                    "Voice field and the backend model (s1, s2-pro) in Model.")
+                    f"Voice field and the backend model ({', '.join(FISH_MODELS)}) in Model.")
+        if model and model not in FISH_MODELS:
+            # The API silently falls back to s2.1-pro for an unknown model.
+            return (f"Unknown Fish Audio model '{model}' — choose "
+                    f"{', '.join(FISH_MODELS)}.")
+        fmt = _s(v.get("format")).lower() or FISH_DEFAULT_FORMAT
+        if fmt not in FISH_FORMATS:
+            return (f"Unknown Fish Audio format '{fmt}' — choose "
+                    f"{', '.join(FISH_FORMATS)}.")
+        lat = _s(v.get("latency")).lower() or FISH_DEFAULT_LATENCY
+        if lat not in FISH_LATENCIES:
+            return (f"Unknown Fish Audio latency '{lat}' — choose "
+                    f"{', '.join(FISH_LATENCIES)}.")
         return None
     if name == "elevenLabs":
         if not _s(v.get("apiKey")):
@@ -446,8 +471,7 @@ def migrate_to_providers(cfg: dict) -> tuple[dict, bool]:
                      ("fish_audio_format", "format"), ("fish_audio_latency", "latency")):
         if _s(out.get(src)):
             fish[dst] = _s(out.get(src))
-    if _s(fish.get("latency")) == "low":
-        fish["latency"] = "balanced"
+    fish["latency"] = _s(fish.get("latency")).lower() or FISH_DEFAULT_LATENCY
     providers["fishAudio"] = fish
 
     eleven = _sub("elevenLabs")

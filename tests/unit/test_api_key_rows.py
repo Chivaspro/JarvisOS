@@ -25,6 +25,12 @@ KNOWN_FIELDS = (
     # credential the app reads with no row here would be invisible on Quick
     # Setup and untestable from the API tab.
     "composio_api_key",
+    # The first-party links: a read-only GitHub token, the user's own Home
+    # Assistant URL and long-lived token (plus the TLS choice), and the local
+    # transcription model. Same invariant: read by the app, so described here.
+    "github_token", "github_api_url",
+    "home_assistant_url", "home_assistant_token", "home_assistant_verify_tls",
+    "meeting_notes_model",
 )
 
 

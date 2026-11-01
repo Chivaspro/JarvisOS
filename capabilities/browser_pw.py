@@ -14,6 +14,10 @@ Two details shape the implementation:
 * A persistent profile under the project's automation directory keeps site
   logins between sessions. The user's installed Chrome is used when present and
   the bundled Chromium otherwise — the choice is reported, never assumed.
+* One action (``browser_capture``) exists for reverse-engineering: it records
+  the DOM, a screenshot, computed landmark styles and the page's own network
+  traffic into a folder, so a clean remake can be synthesised from evidence.
+  Credential and session headers are stripped before anything touches the disk.
 
 Nothing here pretends: a missing Playwright, a missing browser binary, or a
 selector that matches nothing all come back as an honest failure with the reason.
@@ -21,14 +25,27 @@ selector that matches nothing all come back as an honest failure with the reason
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
 import time
 from concurrent.futures import Future
+from datetime import datetime, timezone
 from pathlib import Path
 
 _CALL_TIMEOUT_S = 120.0
+
+#: One capture legitimately runs longer than a normal action: the page load,
+#: the bounded wait for a quiet network and a full-page screenshot add up.
+_CAPTURE_TIMEOUT_S = 180.0
+
+#: Header values that never belong in a saved capture. Credentials and session
+#: cookies are removed by name before any file is written.
+_SENSITIVE_HEADERS = frozenset({
+    "authorization", "cookie", "set-cookie", "proxy-authorization",
+    "www-authenticate", "x-api-key", "x-auth-token",
+})
 
 _lock = threading.RLock()
 _thread: threading.Thread | None = None
@@ -690,6 +707,250 @@ def _a_screenshot(args: dict) -> dict:
                **_page_state(page))
 
 
+# ── capture (the reverse-engineering evidence recorder) ───────────────────────
+# One action that writes everything a remake needs from a page: the DOM, a
+# screenshot, the computed styles of its landmark elements, and the network
+# traffic its own load produced (as a HAR 1.2 document). The listeners are
+# attached BEFORE the navigation or reload so the whole load is recorded, and
+# removed afterwards so a later action never inherits them.
+
+#: Reads the computed styles and geometry of the visible landmark elements.
+#: Bounded (60 elements, short text) so the artifact stays small and readable.
+_STYLE_PROBE_JS = """() => {
+  const nodes = document.querySelectorAll(
+    'header,nav,main,section,article,footer,h1,h2,h3,button,a,input,textarea,select,form,ul,li,img');
+  const elements = [];
+  for (const el of nodes) {
+    if (elements.length >= 60) break;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const cs = getComputedStyle(el);
+    elements.push({
+      tag: el.tagName.toLowerCase(),
+      id: el.id || '',
+      classes: (typeof el.className === 'string' ? el.className : '').slice(0, 120),
+      text: (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80),
+      rect: {x: Math.round(rect.x), y: Math.round(rect.y),
+             width: Math.round(rect.width), height: Math.round(rect.height)},
+      styles: {
+        color: cs.color,
+        backgroundColor: cs.backgroundColor,
+        fontFamily: cs.fontFamily,
+        fontSize: cs.fontSize,
+        fontWeight: cs.fontWeight,
+        lineHeight: cs.lineHeight,
+        display: cs.display,
+        position: cs.position,
+        textAlign: cs.textAlign,
+        padding: cs.padding,
+        margin: cs.margin,
+        borderRadius: cs.borderRadius,
+        gap: cs.gap,
+      },
+    });
+  }
+  return {title: document.title || '', url: location.href,
+          viewport: {width: innerWidth, height: innerHeight},
+          elements: elements};
+}"""
+
+
+def _safe_headers(headers) -> dict:
+    """The response/request headers with credentials removed by name."""
+    try:
+        return {str(name): str(value)
+                for name, value in dict(headers or {}).items()
+                if str(name).lower() not in _SENSITIVE_HEADERS}
+    except Exception:
+        return {}
+
+
+def _har_from_records(records: list[dict]) -> dict:
+    """A minimal, standard HAR 1.2 document built from the recorded traffic."""
+    entries = []
+    for record in records:
+        started = float(record.get("started") or 0.0)
+        ended = float(record.get("ended") or started)
+        if not started:
+            started = time.time() * 1000.0
+            ended = ended or started
+        url = str(record.get("url") or "")
+        request_headers = record.get("headers") or {}
+        response_headers = record.get("response_headers") or {}
+        content_type = ""
+        for name, value in response_headers.items():
+            if str(name).lower() == "content-type":
+                content_type = str(value)
+                break
+        entries.append({
+            "startedDateTime": (datetime.fromtimestamp(started / 1000.0,
+                                                       tz=timezone.utc)
+                                .isoformat().replace("+00:00", "Z")),
+            "time": max(0.0, ended - started),
+            "request": {
+                "method": str(record.get("method") or "GET"),
+                "url": url,
+                "httpVersion": "HTTP/1.1",
+                "cookies": [],
+                "headers": [{"name": n, "value": v}
+                            for n, v in request_headers.items()],
+                "queryString": [],
+                "headersSize": -1,
+                "bodySize": -1,
+            },
+            "response": {
+                "status": int(record.get("status") or 0),
+                "statusText": str(record.get("status_text") or ""),
+                "httpVersion": "HTTP/1.1",
+                "cookies": [],
+                "headers": [{"name": n, "value": v}
+                            for n, v in response_headers.items()],
+                "content": {"size": -1, "mimeType": content_type},
+                "redirectURL": "",
+                "headersSize": -1,
+                "bodySize": -1,
+            },
+            "cache": {},
+            "timings": {"send": 0, "wait": max(0.0, ended - started),
+                        "receive": 0},
+            "_resourceType": str(record.get("resource_type") or ""),
+        })
+    return {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "jarvis-browser-capture", "version": "1.0"},
+            "pages": [],
+            "entries": entries,
+        }
+    }
+
+
+def _a_capture(args: dict) -> dict:
+    """Record a page as evidence: DOM, screenshot, styles and network (HAR)."""
+    from capabilities import desktop
+    page = _page()
+    url = str(args.get("url") or "").strip()
+    folder = Path(str(args.get("path") or "").strip()
+                  or Path(desktop.default_artifact_path("capture")).with_suffix(""))
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _fail(f"The capture folder could not be created: {exc}")
+
+    by_request: dict[int, dict] = {}
+
+    def _on_request(request):
+        try:
+            by_request[id(request)] = {
+                # Keeping the wrapper alive fixes id() as the stable key that
+                # the matching response event finds again.
+                "request": request,
+                "started": time.time() * 1000.0,
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "headers": _safe_headers(request.headers),
+            }
+        except Exception:
+            pass
+
+    def _on_response(response):
+        try:
+            record = by_request.get(id(response.request))
+            if record is None:
+                return
+            record["status"] = response.status
+            record["status_text"] = response.status_text
+            record["response_headers"] = _safe_headers(response.headers)
+            record["ended"] = time.time() * 1000.0
+        except Exception:
+            pass
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+    notes: list[str] = []
+    try:
+        try:
+            if url:
+                page.goto(_normalise_url(url), wait_until="domcontentloaded")
+            else:
+                page.reload(wait_until="domcontentloaded")
+        except Exception as exc:
+            return _fail(f"The page could not be loaded for capture: {exc}")
+        # The network is never guaranteed to go quiet; the wait is bounded and
+        # a timeout is not a capture failure — the records collected so far are
+        # still real evidence.
+        try:
+            page.wait_for_load_state("networkidle", timeout=_ms(args, 15.0))
+        except Exception:
+            notes.append("the network did not go fully quiet before the capture")
+
+        try:
+            html = page.content()
+        except Exception as exc:
+            return _fail(f"The DOM could not be read: {exc}")
+        html_path = folder / "dom.html"
+        styles_path = folder / "styles.json"
+        har_path = folder / "network.har"
+        image_path = folder / "page.png"
+        try:
+            html_path.write_text(html, encoding="utf-8")
+        except OSError as exc:
+            return _fail(f"The DOM could not be written: {exc}")
+
+        try:
+            page.screenshot(path=str(image_path), full_page=True)
+        except Exception:
+            try:
+                page.screenshot(path=str(image_path))
+                notes.append("only the visible area was captured (full-page "
+                             "screenshot failed)")
+            except Exception as exc:
+                image_path = None
+                notes.append(f"the screenshot failed: {exc}")
+
+        try:
+            styles = page.evaluate(_STYLE_PROBE_JS)
+        except Exception as exc:
+            styles = {"title": "", "url": page.url, "elements": [],
+                      "error": f"{type(exc).__name__}: {exc}"}
+            notes.append("the computed styles could not be read")
+        try:
+            styles_path.write_text(json.dumps(styles, indent=2), encoding="utf-8")
+        except OSError as exc:
+            # The styles are supplementary evidence; the DOM and the traffic
+            # are what the remake depends on, so a failure here is a note.
+            styles_path = None
+            notes.append(f"the styles could not be written: {exc}")
+
+        records = sorted(by_request.values(), key=lambda r: r.get("started", 0.0))
+        har = _har_from_records(records)
+        try:
+            har_path.write_text(json.dumps(har, indent=2), encoding="utf-8")
+        except OSError as exc:
+            return _fail(f"The network capture could not be written: {exc}")
+    finally:
+        for event, handler in (("request", _on_request),
+                               ("response", _on_response)):
+            try:
+                page.remove_listener(event, handler)
+            except Exception:
+                pass
+
+    count = len(har["log"]["entries"])
+    elements = len(styles.get("elements") or []) if isinstance(styles, dict) else 0
+    detail = (f"Captured {page.url or 'the page'} — {count} network record(s), "
+              f"DOM {len(html)} chars, styles for {elements} element(s)")
+    if notes:
+        detail += " (" + "; ".join(notes) + ")"
+    return _ok(detail, path=str(folder), html_file=str(html_path),
+               styles_file=str(styles_path) if styles_path else None,
+               network_file=str(har_path),
+               requests=count, style_elements=elements,
+               image=str(image_path) if image_path else None,
+               **_page_state(page))
+
+
 _HANDLERS = {
     "browser_open": _a_open,
     "browser_back": _a_back,
@@ -707,6 +968,7 @@ _HANDLERS = {
     "browser_upload": _a_upload,
     "browser_download": _a_download,
     "browser_screenshot": _a_screenshot,
+    "browser_capture": _a_capture,
 }
 
 
@@ -715,8 +977,14 @@ def run(action_name: str, args: dict) -> dict:
     handler = _HANDLERS.get(str(action_name or "").strip())
     if handler is None:
         return _fail(f"'{action_name}' is not a browser action.")
+    args = dict(args or {})
+    timeout_s = _CALL_TIMEOUT_S
+    if str(action_name or "").strip() == "browser_capture":
+        # A capture waits through a page load and a bounded quiet-network
+        # window, so it gets more than a normal action's deadline.
+        timeout_s = max(_CALL_TIMEOUT_S, _ms(args, _CAPTURE_TIMEOUT_S) / 1000.0)
     started = time.monotonic()
-    result = _call(handler, dict(args or {}))
+    result = _call(handler, args, timeout_s=timeout_s)
     result.setdefault("evidence", {})
     result["evidence"]["elapsed_s"] = round(time.monotonic() - started, 2)
     return result

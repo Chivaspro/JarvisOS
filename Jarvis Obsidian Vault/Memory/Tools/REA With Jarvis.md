@@ -12,7 +12,7 @@ tags: [rea, jarvis, integration, python]
 
 # REA With Jarvis
 
-Two ways Jarvis can use REA:
+Three ways Jarvis can use REA:
 
 **A. Through MCP (best):** run `npx rea-agents setup`, choose your agent, restart. The agent then calls REA tools itself and returns evidence.
 
@@ -29,7 +29,14 @@ print(list(result)[:10])
 ```
 CLI: `python jarvis_rea.py js /absolute/path/to/my_app --authorized` and `python jarvis_rea.py help`.
 
-**Flow in Jarvis:** Sir asks, Jarvis checks [[REA Safety And Legal]], picks the target type ([[REA Smart Usage Playbook]]), runs, summarizes with evidence and limits, then saves a case file and memories.
+**C. Through the native `reverse_engineer` tool (the remake half):** REA itself only inspects — it never produces a runnable copy. Jarvis's own `reverse_engineer` tool is the missing half:
+- `capture` — Playwright records a page you own (DOM, screenshot, computed styles, network traffic as HAR) into `data/workspaces/rea/<domain>/<run>/`
+- `api_surface` — the API endpoints the captured traffic revealed
+- `remake` — a clean, original project (index.html + assets + optional mock server) synthesised from the evidence and verified; a clean-room reproduction, never a byte-for-byte copy
+- `reconstruct` — copy an app folder's own sources into a readable tree; when REA is connected its `recover_javascript_sources` adds compiled bundles
+- Every run needs Sir's explicit authorization (`authorized=true`) and is appended to `data/workspaces/rea/audit.log`. Switch: Settings ▸ Permissions ▸ "Allow reverse engineering".
+
+**Flow in Jarvis:** Sir asks, Jarvis checks [[REA Safety And Legal]], picks the target type ([[REA Smart Usage Playbook]]), runs, summarizes with evidence and limits, then saves a case file and memories. For "copy it for me" requests: authorize → `reverse_engineer` capture → `api_surface` → `remake` (or `reconstruct` for an app folder).
 
 ## Related
 - [[REA Setup]]

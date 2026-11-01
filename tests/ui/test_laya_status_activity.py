@@ -103,5 +103,31 @@ def test_not_used_states_the_real_reason(qapp):
     cmd, lbl = _command_window_with_label()
     cmd.set_laya_status('NOT USED', 'decision model still loading on CPU')
     assert 'NOT USED' in lbl.text()
+    assert 'still loading' in lbl.text()
     assert 'still loading' in (lbl.toolTip() or '')
+
+
+def test_idle_loading_and_error_are_distinct_states(qapp):
+    """A loading model, an idle one and a broken one must never look alike."""
+    cmd, lbl = _command_window_with_label()
+
+    cmd.set_laya_status('IDLE', 'idle')
+    assert 'IDLE' in lbl.text() and cmd._laya_status_state == 'idle'
+
+    cmd.set_laya_status('LOADING', 'starting on CPU')
+    assert 'LOADING' in lbl.text() and cmd._laya_status_state == 'loading'
+    assert 'starting on CPU' in lbl.text()
+
+    cmd.set_laya_status('ERROR', 'checkpoint failed to load')
+    assert 'ERROR' in lbl.text() and cmd._laya_status_state == 'error'
+    assert 'checkpoint failed' in lbl.text()
+
+
+def test_a_missing_dependency_is_not_rendered_as_active(qapp):
+    cmd, lbl = _command_window_with_label()
+    cmd.set_laya_status(
+        'NOT USED', "the 'laya' package is not installed — run setup ▸ Laya AI")
+    assert 'NOT USED' in lbl.text()
+    assert "laya" in lbl.text().lower()
+    assert 'ACTIVE' not in lbl.text()
 

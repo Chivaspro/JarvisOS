@@ -26,6 +26,16 @@ env/
 # Root-anchored so data/models/ (the bundled vision model) stays committed.
 /models/
 
+# ── Native (Rust) build artifacts ────────────────────────────────────────
+# The optional jarvis_native extension: source lives in native/, everything
+# generated (cargo target dir, the copied .pyd, its probe files) is local-only.
+# Releases ship the .pyd inside the package; dev machines build it with
+# tools/build_native.py. The app falls back to pure Python without it.
+native/target/
+native/jarvis_native*.pyd
+native/jarvis_native*.dll
+native/Cargo.lock
+
 # ── Runtime state ────────────────────────────────────────────────────────
 memory/*.json
 *.log
@@ -63,6 +73,11 @@ build/
 data/logs/
 config/backups/
 data/automation/
+# The knowledge library index and meeting recordings are private user data.
+# The DB is already covered by *.db, but the extracted text, WAV files and
+# Markdown notes must never be committed either.
+data/library/
+data/meetings/
 data/runtime/
 data/joptimizer/
 data/mcp/

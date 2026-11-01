@@ -382,6 +382,80 @@ def test_fish_stream_session_refuses_a_non_fish_engine(monkeypatch):
 @pytest.mark.skipif(os.getenv("JARVIS_LIVE_FISH", "") != "1",
                     reason="live Fish Audio test: set JARVIS_LIVE_FISH=1 to run "
                            "(spends credits)")
+def test_live_after_vs_before_the_same_reply(monkeypatch):
+    """MEASURED before/after for the one thing this feature changed.
+
+    Same voice, same model, same reply text, no audio device (PCM writes are
+    timestamped). Two pipelines:
+
+      AFTER  - the realtime WebSocket, text fed while it is being "generated"
+               (the last fragment arrives 1.6 s after the first)
+      BEFORE - what shipped previously: the reply is complete before TTS is even
+               asked, then sentence-by-sentence HTTP requests
+
+    The number that matters is time from the FIRST TEXT to the FIRST AUDIO,
+    measured from the same origin, so the comparison is honest.
+    """
+    import json
+    import voice.tts as _tts
+
+    cfg = json.loads((ROOT / "config" / "api_keys.json").read_text(encoding="utf-8"))
+    engine = FishAudioTTSEngine(
+        api_key=str(cfg.get("fish_audio_api_key") or ""),
+        model_id=str(cfg.get("fish_audio_model_id") or "s2-pro"),
+        voice_id=str(cfg.get("fish_audio_voice_id") or ""),
+        endpoint=str(cfg.get("fish_audio_endpoint") or "https://api.fish.audio/v1/tts"),
+    )
+    reply = ["I have checked the reactor diagnostics this evening. ",
+             "Everything is within operating tolerance. "]
+
+    class _Speaker:
+        def __init__(self):
+            self.times: list[float] = []
+
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+        def write(self, data):
+            self.times.append(time.monotonic())
+
+    # ── AFTER: realtime WebSocket, incremental text ──────────────────────────
+    after = _Speaker()
+    monkeypatch.setattr(_tts, "_open_pcm_stream", lambda rate: after)
+    monkeypatch.setattr(_tts, "_push_reactive", lambda pcm, rate=24000: None)
+    t0 = time.monotonic()
+    played = engine.ws_stream(_text_stream(reply, delay=1.6),
+                              on_audio=lambda: after.times.append(time.monotonic()))
+    after_first = (after.times[0] - t0) * 1000 if after.times else float("nan")
+
+    # ── BEFORE: complete reply first, then per-sentence HTTP ─────────────────
+    before = _Speaker()
+    monkeypatch.setattr(_tts, "_open_pcm_stream", lambda rate: before)
+    before_played: list[float] = []
+    t0b = time.monotonic()
+    for i, fragment in enumerate(reply):
+        # The old pipeline could not start until the last fragment existed.
+        if i < len(reply) - 1:
+            time.sleep(1.6)
+    engine.speak("".join(reply), cancel=None,
+                 on_audio=lambda: before_played.append(time.monotonic()))
+    before_first = ((before_played[0] if before_played
+                     else (before.times[0] if before.times else float("nan")))
+                    - t0b) * 1000
+
+    print(f"[live] first audible: BEFORE={before_first:.0f} ms  "
+          f"AFTER={after_first:.0f} ms  "
+          f"(delta {before_first - after_first:+.0f} ms)  "
+          f"after_played={played}")
+    assert played, "the realtime session must produce audio"
+    assert after_first < before_first, (
+        "the realtime pipeline must beat the whole-reply path for the same text")
+
+
+@pytest.mark.skipif(os.getenv("JARVIS_LIVE_FISH", "") != "1",
+                    reason="live Fish Audio test: set JARVIS_LIVE_FISH=1 to run "
+                           "(spends credits)")
 def test_live_fish_realtime_streams_before_the_turn_ends(monkeypatch):
     """Real account, real socket. Reports MEASURED numbers; changes no state."""
     import json

@@ -64,6 +64,18 @@ _PAINTER_TOKENS = (
 )
 _theme_bind(globals(), _PAINTER_TOKENS)
 
+# Fish Audio's verified values and shipped defaults (one owner module).
+from voice.fish_defaults import (  # noqa: E402
+    FISH_DEFAULT_ENDPOINT,
+    FISH_DEFAULT_FORMAT,
+    FISH_DEFAULT_LATENCY,
+    FISH_DEFAULT_MODEL,
+    FISH_DEFAULT_VOICE,
+    FISH_FORMAT_LABELS,
+    FISH_LATENCY_LABELS,
+    FISH_MODELS,
+)
+
 DEFAULTS = {
     "compact_opacity": 0,
     "compact_size": 176,
@@ -76,6 +88,8 @@ DEFAULTS = {
     "voice_pitch": 0.0,
     "voice_volume": 1.0,
     "voice_mode": "standard",
+    # Chat typewriter: characters per second. Completely independent of TTS.
+    "typewriter_cps": 110,
     "tts_engine": "edgetts",
     "tts_voice": "en-GB-RyanNeural",
     "voice_name": "Charon",
@@ -90,11 +104,28 @@ DEFAULTS = {
     "onnx_voice_speaker": "default",
     "onnx_execution_provider": "cpu",
     "fish_audio_api_key": "",
-    "fish_audio_model_id": "s2-pro",
-    "fish_audio_voice_id": "",
-    "fish_audio_endpoint": "https://api.fish.audio/v1/tts",
-    "fish_audio_format": "mp3",
-    "fish_audio_latency": "normal",
+    # Fish Audio defaults come from voice/fish_defaults.py (the same constants
+    # the engine validates against). Opus is the shipped format: 48 kHz mono,
+    # smallest payload, fastest first byte.
+    "fish_audio_model_id": FISH_DEFAULT_MODEL,
+    "fish_audio_voice_id": FISH_DEFAULT_VOICE,
+    "fish_audio_endpoint": FISH_DEFAULT_ENDPOINT,
+    "fish_audio_format": FISH_DEFAULT_FORMAT,
+    "fish_audio_latency": FISH_DEFAULT_LATENCY,
+    # Microphone input processing — Settings ▸ VOICE ▸ MICROPHONE INPUT. Every
+    # one of these is read by voice/mic_dsp.py and applied to the real samples
+    # the Live session hears; none is display-only.
+    "input_device": "",
+    "mic_gain_percent": 100,
+    "mic_noise_suppression": True,
+    "mic_noise_suppression_amount": 60,
+    "mic_noise_gate": False,
+    "mic_noise_gate_db": -45,
+    "mic_compressor": False,
+    "mic_compressor_amount": 50,
+    "mic_limiter": True,
+    "mic_limiter_ceiling_db": -1.0,
+    "mic_monitoring": False,
     "gemini_api_key": "",
     "kokoro_voice": "af_heart",
     "elevenlabs_api_key": "",
@@ -124,7 +155,6 @@ DEFAULTS = {
     "ui_font": "Rajdhani",
     "ui_color": DEFAULT_ACCENT,
     "web_homepage": "https://www.google.com",
-    "world_monitor_refresh": 60,
     "memory_autosave": True,
     "panel_always_on_top": True,
     "hud_grid": True,
@@ -164,7 +194,6 @@ DEFAULTS = {
         # one is available, instead of the internal WebView player.
         "native_music_apps": True,
         "web_task": True,
-        "world_monitor": True,
         "floating_windows": True,
         "draggable_panels": True,
         "enable_sfx": True,
@@ -174,6 +203,11 @@ DEFAULTS = {
         "voice_engine_control": True,
         "self_diagnostics": True,
         "auto_approve_coding": False,
+        "auto_approve_file_change": False,
+        "auto_approve_desktop": False,
+        "auto_approve_plugin": False,
+        "auto_approve_automation": False,
+        "typewriter_enabled": True,
         "document_architect": True,
         "connect": True,
         "laya_ai": True,
@@ -198,6 +232,54 @@ _ESSENTIAL_SWITCHES: tuple[tuple[str, str, str], ...] = (
     ("connect", "JarvisOS Connect",
      "Let a paired phone or browser reach this machine through the gateway."),
 )
+
+
+# ── plugin discovery for the Settings panel ──────────────────────────────────
+# The live registry is preferred (MainWindow publishes it). When JARVIS is not
+# running, the panel still lists plugins by scanning the same two directories
+# the app scans, so the tab is never a dead end.
+_PLUGIN_SCAN_CACHE: list | None = None
+
+
+def _scan_plugins_locally(force: bool = False) -> list:
+    global _PLUGIN_SCAN_CACHE
+    if _PLUGIN_SCAN_CACHE is not None and not force:
+        return _PLUGIN_SCAN_CACHE
+    rows: list = []
+    try:
+        from app.plugin_loader import BUILTIN_PLUGINS_DIR, discover_plugins
+        root = Path(__file__).resolve().parent
+        registry = discover_plugins(
+            root / "plugins", core_tool_names=set(), logger=lambda _m: None,
+            extra_dirs=[BUILTIN_PLUGINS_DIR])
+        rows = registry.list_for_ui()
+    except Exception:
+        rows = []
+    _PLUGIN_SCAN_CACHE = rows
+    return rows
+
+
+def _plugin_model_choices() -> list[str]:
+    """Model names the app already knows about, for a plugin's model picker."""
+    out: list[str] = []
+    try:
+        from config import settings as cfg
+        for key in ("ai_model",):
+            value = str(cfg.get(key, "") or "").strip()
+            if value:
+                out.append(value)
+        roles = cfg.get("model_roles", {}) or {}
+        if isinstance(roles, dict):
+            out.extend(str(v).strip() for v in roles.values() if str(v).strip())
+    except Exception:
+        pass
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in out:
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
 
 
 def load(path: str | Path) -> dict:
@@ -620,6 +702,9 @@ class SettingsWindow(QDialog):
     # 8-20 s and four of them used to freeze the HUD when Settings first
     # opened. The signal marshals the found indexes back to the GUI thread.
     camera_scan_found = pyqtSignal(list)
+    # Microphone enumeration runs on a worker too: a cold sounddevice query
+    # opens every endpoint and can take seconds on a busy Windows machine.
+    mic_devices_found = pyqtSignal(list)
 
     def __init__(self, config_path: str | Path | None = None, parent=None):
         super().__init__(parent)
@@ -1893,9 +1978,308 @@ class SettingsWindow(QDialog):
         self._on_provider_selected(self.provider_selector.currentIndex())
         pf.addRow("", self.provider_stack)
         vv.addWidget(provider_box)
+
+        # ── 2 · Microphone input (real DSP on the live mic path) ──────────
+        # Every control here is read by voice/mic_dsp.py and applied to the
+        # exact samples the Live session, the voice gate, the wake feed and the
+        # HUD meter all use — none is display-only.
+        mic_box = HudGroupBox("2 · MICROPHONE INPUT")
+        mv = QVBoxLayout(mic_box)
+        mform = QFormLayout()
+        self.mic_device = QComboBox()
+        self.mic_devices_found.connect(self._apply_mic_devices)
+        self._populate_mic_devices()
+        self.mic_device.setToolTip(
+            "Which microphone JARVIS hears you with. Changing it reconnects the "
+            "input stream; the conversation is kept.")
+        mform.addRow("Input device", self.mic_device)
+        mv.addLayout(mform)
+
+        self.mic_gain = self._slider_row(
+            mv, "Input gain",
+            int(self._data.get("mic_gain_percent", DEFAULTS["mic_gain_percent"])),
+            0, 400, "%")
+        self.mic_gain.setToolTip(
+            "Digital gain applied to every microphone block. Above 100 % really "
+            "amplifies a quiet microphone; the limiter below keeps it from "
+            "clipping.")
+
+        self.mic_ns = QCheckBox("Noise suppression (spectral gate)")
+        self.mic_ns.setChecked(bool(self._data.get(
+            "mic_noise_suppression", DEFAULTS["mic_noise_suppression"])))
+        self.mic_ns.setToolTip(
+            "Learns the steady room noise and subtracts it from each block, so "
+            "fans and hum are quieter without gating your voice.")
+        mv.addWidget(self.mic_ns)
+        self.mic_ns_amount = self._slider_row(
+            mv, "Suppression amount",
+            int(self._data.get("mic_noise_suppression_amount",
+                               DEFAULTS["mic_noise_suppression_amount"])),
+            0, 100, "%")
+        self.mic_ns_amount.setToolTip(
+            "How hard the noise floor is subtracted. 60 % removes most steady "
+            "noise; very high values can make the room sound artificial.")
+
+        self.mic_gate = QCheckBox("Noise gate (mute below threshold)")
+        self.mic_gate.setChecked(bool(self._data.get(
+            "mic_noise_gate", DEFAULTS["mic_noise_gate"])))
+        self.mic_gate.setToolTip(
+            "Silences blocks quieter than the threshold. Opens 3 dB above it "
+            "and only closes 6 dB below it, so speech is never chopped.")
+        mv.addWidget(self.mic_gate)
+        self.mic_gate_db = self._slider_row(
+            mv, "Gate threshold",
+            int(self._data.get("mic_noise_gate_db", DEFAULTS["mic_noise_gate_db"])),
+            -80, -5, " dB")
+        self.mic_gate_db.setToolTip(
+            "RMS level at which the gate opens. -45 dB suits a typical room; "
+            "raise it for a noisy one, lower it for a quiet talker.")
+
+        self.mic_comp = QCheckBox("Compressor (even out loud and quiet)")
+        self.mic_comp.setChecked(bool(self._data.get(
+            "mic_compressor", DEFAULTS["mic_compressor"])))
+        self.mic_comp.setToolTip(
+            "Reduces blocks above -18 dB and adds modest makeup gain, so a "
+            "shout and a murmur arrive at a similar level.")
+        mv.addWidget(self.mic_comp)
+        self.mic_comp_amount = self._slider_row(
+            mv, "Compression amount",
+            int(self._data.get("mic_compressor_amount",
+                               DEFAULTS["mic_compressor_amount"])),
+            0, 100, "%")
+        self.mic_comp_amount.setToolTip(
+            "How firmly loud blocks are pulled down. 50 % is broadcast-normal.")
+
+        self.mic_limiter = QCheckBox("Limiter (hard ceiling, prevents clipping)")
+        self.mic_limiter.setChecked(bool(self._data.get(
+            "mic_limiter", DEFAULTS["mic_limiter"])))
+        self.mic_limiter.setToolTip(
+            "A true ceiling on the processed signal. Keeps a hot gain setting "
+            "from wrapping int16 samples into loud crackle.")
+        mv.addWidget(self.mic_limiter)
+        self.mic_ceiling = self._slider_row(
+            mv, "Limiter ceiling",
+            int(round(float(self._data.get("mic_limiter_ceiling_db",
+                                           DEFAULTS["mic_limiter_ceiling_db"])))),
+            -12, 0, " dB")
+        self.mic_ceiling.setToolTip(
+            "Highest level the limiter allows. -1 dB leaves headroom; 0 dB is "
+            "full scale.")
+
+        self.mic_monitoring = QCheckBox(
+            "Input monitoring — hear the processed mic through your speakers")
+        self.mic_monitoring.setChecked(bool(self._data.get(
+            "mic_monitoring", DEFAULTS["mic_monitoring"])))
+        self.mic_monitoring.setToolTip(
+            "Live test of the filters above: the processed microphone is played "
+            "back through the default output, with the meter below showing its "
+            "real level. Use headphones to avoid feedback. This never changes "
+            "what the live session hears.")
+        mv.addWidget(self.mic_monitoring)
+
+        meter_row = QHBoxLayout()
+        meter_cap = QLabel("Input level")
+        meter_cap.setMinimumWidth(185)
+        self.mic_level = QProgressBar()
+        self.mic_level.setRange(0, 100)
+        self.mic_level.setValue(0)
+        self.mic_level.setTextVisible(False)
+        self.mic_level.setFixedHeight(10)
+        meter_row.addWidget(meter_cap)
+        meter_row.addWidget(self.mic_level, 1)
+        mv.addLayout(meter_row)
+
+        self._mic_status = QLabel("")
+        self._mic_status.setWordWrap(True)
+        self._mic_status.setStyleSheet(
+            f"color:{TEXT_DIM};font:7pt 'Exo 2';background:transparent;")
+        mv.addWidget(self._mic_status)
+
+        self._mic_monitor = None
+        self._mic_timer = QTimer(self)
+        self._mic_timer.setInterval(80)
+        self._mic_timer.timeout.connect(self._mic_tick)
+        for _ctrl in (self.mic_gain, self.mic_ns_amount, self.mic_gate_db,
+                      self.mic_comp_amount, self.mic_ceiling):
+            _ctrl.valueChanged.connect(self._mic_controls_changed)
+        for _chk in (self.mic_ns, self.mic_gate, self.mic_comp, self.mic_limiter):
+            _chk.toggled.connect(self._mic_controls_changed)
+        self.mic_monitoring.toggled.connect(self._toggle_mic_monitor)
+        self.mic_device.currentIndexChanged.connect(self._mic_device_changed)
+        self._mic_ready = True
+        vv.addWidget(mic_box)
+
         lay.addWidget(voice)
         lay.addStretch(1)
         self.tabs.addTab(scroll, "VOICE")
+
+    # -- microphone input (voice/mic_dsp.py) ---------------------------------
+    def _populate_mic_devices(self) -> None:
+        """Seed the input-device combo, then enumerate on a worker thread.
+
+        The saved choice is shown immediately so the panel reflects the real
+        setting before any enumeration; the worker (``settings-mic-devices``)
+        adds the hardware and reports a saved-but-missing device. Nothing here
+        blocks the Qt thread."""
+        current = str(self._data.get("input_device", "") or "")
+        try:
+            from voice.audio_devices import DEFAULT_LABEL
+        except Exception:
+            DEFAULT_LABEL = "System default"
+        self.mic_device.addItem(DEFAULT_LABEL, "")
+        if current:
+            self.mic_device.addItem(current, current)
+            self.mic_device.setCurrentIndex(1)
+        else:
+            self.mic_device.setCurrentIndex(0)
+        self._start_mic_device_scan()
+
+    def _start_mic_device_scan(self) -> None:
+        current = str(self._data.get("input_device", "") or "")
+
+        def _work():
+            names: list = []
+            try:
+                from voice.audio_devices import list_devices
+                names = list(list_devices("input"))
+            except Exception:
+                names = []
+            try:
+                self.mic_devices_found.emit(names)
+            except Exception:
+                pass
+
+        try:
+            import threading
+            threading.Thread(target=_work, name="settings-mic-devices",
+                             daemon=True).start()
+        except Exception:
+            pass
+
+    def _apply_mic_devices(self, names: list) -> None:
+        """GUI-thread: merge the enumerated microphones into the picker."""
+        try:
+            names = [str(n) for n in (names or []) if n]
+            if not names:
+                return
+            combo = self.mic_device
+            current = str(combo.currentData() or "")
+            present = {str(combo.itemData(i)) for i in range(combo.count())}
+            for name in names:
+                if name not in present:
+                    combo.addItem(name, name)
+                    present.add(name)
+            # A saved device the scan did not find is shown as disconnected,
+            # but stays selected: the runtime falls back to the system default.
+            if current and current not in names:
+                i = combo.findData(current)
+                if i >= 0 and "(not connected)" not in combo.itemText(i):
+                    combo.setItemText(i, f"{current}  (not connected)")
+            idx = combo.findData(current) if current else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        except Exception:
+            pass
+
+    def _mic_settings_from_panel(self):
+        """The panel's current values as a real :class:`MicSettings` snapshot."""
+        from voice.mic_dsp import MicSettings
+        return MicSettings(
+            device=str(self.mic_device.currentData() or ""),
+            gain_percent=float(self.mic_gain.value()),
+            noise_suppression=bool(self.mic_ns.isChecked()),
+            suppression_amount=float(self.mic_ns_amount.value()) / 100.0,
+            gate=bool(self.mic_gate.isChecked()),
+            gate_db=float(self.mic_gate_db.value()),
+            compressor=bool(self.mic_comp.isChecked()),
+            compressor_amount=float(self.mic_comp_amount.value()) / 100.0,
+            limiter=bool(self.mic_limiter.isChecked()),
+            ceiling_db=float(self.mic_ceiling.value()),
+            monitoring=bool(self.mic_monitoring.isChecked()),
+        )
+
+    def _mic_controls_changed(self, *_args) -> None:
+        """Push an edited control into a running monitor immediately."""
+        if not getattr(self, "_mic_ready", False):
+            return
+        monitor = getattr(self, "_mic_monitor", None)
+        if monitor is None:
+            return
+        try:
+            monitor.update_settings(self._mic_settings_from_panel())
+        except Exception:
+            pass
+
+    def _mic_device_changed(self, *_args) -> None:
+        """A new device reopens a running monitor on the new endpoint."""
+        if not getattr(self, "_mic_ready", False):
+            return
+        if (getattr(self, "_mic_monitor", None) is not None
+                and self.mic_monitoring.isChecked()):
+            self._start_mic_monitor()
+
+    def _toggle_mic_monitor(self, checked: bool) -> None:
+        if not getattr(self, "_mic_ready", False):
+            return
+        if checked:
+            self._start_mic_monitor()
+        else:
+            self._stop_mic_monitor()
+
+    def _start_mic_monitor(self) -> None:
+        self._stop_mic_monitor()
+        try:
+            from voice.audio_devices import resolve
+            from voice.mic_dsp import MicMonitor
+            settings = self._mic_settings_from_panel()
+            device = resolve(settings.device, "input")
+            monitor = MicMonitor(settings, sample_rate=16000, device=device)
+            if not monitor.start():
+                self._mic_status.setText(
+                    "Could not open the microphone for monitoring: "
+                    + (monitor.error or "unknown error"))
+                monitor.stop()
+                try:
+                    self.mic_monitoring.blockSignals(True)
+                    self.mic_monitoring.setChecked(False)
+                finally:
+                    self.mic_monitoring.blockSignals(False)
+                return
+            self._mic_monitor = monitor
+            self._mic_timer.start()
+            self._mic_status.setText(
+                "Live monitoring active — speak and watch the meter. Turn the "
+                "switch off to stop (headphones avoid feedback).")
+        except Exception as exc:
+            self._mic_status.setText(f"Monitoring unavailable: {exc}")
+
+    def _stop_mic_monitor(self) -> None:
+        try:
+            self._mic_timer.stop()
+        except Exception:
+            pass
+        monitor = getattr(self, "_mic_monitor", None)
+        self._mic_monitor = None
+        if monitor is not None:
+            try:
+                monitor.stop()
+            except Exception:
+                pass
+        try:
+            self.mic_level.setValue(0)
+        except Exception:
+            pass
+
+    def _mic_tick(self) -> None:
+        monitor = getattr(self, "_mic_monitor", None)
+        if monitor is None:
+            return
+        try:
+            level = float(getattr(monitor, "level", 0.0) or 0.0)
+            # A square-root curve so quiet speech still moves the meter.
+            value = int(min(100.0, max(0.0, (max(level, 0.0) ** 0.5) * 150.0)))
+            self.mic_level.setValue(value)
+        except Exception:
+            pass
 
     # -- per-provider panels -------------------------------------------------
     def _panel_buttons(self, pid: str, with_refresh: bool = False) -> QFormLayout:
@@ -1937,24 +2321,53 @@ class SettingsWindow(QDialog):
         self.fish_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.fish_api_key.setPlaceholderText("Fish Audio API key")
         ff.addRow("API key", self.fish_api_key)
-        self.fish_model_id = QLineEdit(str(self._data.get("fish_audio_model_id", "s2-pro")))
-        self.fish_model_id.setPlaceholderText("Backend: s1 or s2-pro")
-        self.fish_model_id.setToolTip("Fish Audio backend model (e.g. s1, s2.1-pro). A voice ID typed here is auto-detected as the voice.")
+        self.fish_model_id = QComboBox()
+        for _mid in FISH_MODELS:
+            self.fish_model_id.addItem(_mid, userData=_mid)
+        _cur_model = str(self._data.get("fish_audio_model_id") or FISH_DEFAULT_MODEL)
+        _mi = self.fish_model_id.findData(_cur_model)
+        if _mi < 0:
+            # Keep an unsupported stored value visible so the user can see why
+            # the engine refuses it, instead of silently showing a different
+            # model than the one that would be sent.
+            self.fish_model_id.addItem(f"{_cur_model} (unsupported)", userData=_cur_model)
+            _mi = self.fish_model_id.count() - 1
+        self.fish_model_id.setCurrentIndex(_mi)
+        self.fish_model_id.setToolTip(
+            "Fish Audio backend model (sent as the request's `model` header). "
+            "s2.1-pro-free is the free developer tier. An unknown model makes "
+            "the API fall back to s2.1-pro, so unsupported values are refused. "
+            "The voice ID belongs in Voice ID, never here.")
         ff.addRow("Model", self.fish_model_id)
-        self.fish_voice_id = QLineEdit(str(self._data.get("fish_audio_voice_id", "")))
+        self.fish_voice_id = QLineEdit(str(self._data.get("fish_audio_voice_id") or FISH_DEFAULT_VOICE))
         self.fish_voice_id.setPlaceholderText("Reference voice ID")
+        self.fish_voice_id.setToolTip(
+            "Fish Audio voice (reference_id). The shipped default is the JARVIS "
+            "voice; it is used exactly as typed and never substituted.")
         ff.addRow("Voice ID", self.fish_voice_id)
         self.fish_endpoint = QLineEdit(str(self._data.get("fish_audio_endpoint", DEFAULTS["fish_audio_endpoint"])))
         ff.addRow("Endpoint", self.fish_endpoint)
         fish_row = QHBoxLayout()
         self.fish_format = QComboBox()
-        self.fish_format.addItems(["mp3", "wav", "opus"])
-        self.fish_format.setCurrentText(str(self._data.get("fish_audio_format", "mp3")))
+        for _fid, _flabel in FISH_FORMAT_LABELS:
+            self.fish_format.addItem(_flabel, userData=_fid)
+        _cur_fmt = str(self._data.get("fish_audio_format") or FISH_DEFAULT_FORMAT)
+        _fi = self.fish_format.findData(_cur_fmt)
+        self.fish_format.setCurrentIndex(_fi if _fi >= 0 else 0)
+        self.fish_format.setToolTip(
+            "Audio format requested from Fish Audio. Opus is 48 kHz mono and "
+            "the smallest/fastest payload; MP3/WAV/PCM are larger. The engine "
+            "decodes exactly the chosen format.")
         fish_row.addWidget(self.fish_format)
         self.fish_latency = QComboBox()
-        self.fish_latency.addItems(["normal", "balanced"])
-        _lat = str(self._data.get("fish_audio_latency", "normal"))
-        self.fish_latency.setCurrentText("balanced" if _lat == "low" else _lat)
+        for _lid, _llabel in FISH_LATENCY_LABELS:
+            self.fish_latency.addItem(_llabel, userData=_lid)
+        _cur_lat = str(self._data.get("fish_audio_latency") or FISH_DEFAULT_LATENCY).lower()
+        _li = self.fish_latency.findData(_cur_lat)
+        self.fish_latency.setCurrentIndex(_li if _li >= 0 else 0)
+        self.fish_latency.setToolTip(
+            "Speed/quality trade-off reported by the API: normal (best "
+            "quality), balanced (reduced latency), low (lowest latency).")
         fish_row.addWidget(self.fish_latency)
         ff.addRow("Format / latency", fish_row)
         self._panel_buttons("fishAudio", with_refresh=True)
@@ -2216,6 +2629,10 @@ class SettingsWindow(QDialog):
              "Stream cloud voices sentence by sentence (Fish Audio / ElevenLabs)"),
             ("tts_realtime",
              "Speak and show the reply as it is written (realtime voice)"),
+            ("typewriter_enabled",
+             "Typewriter: reveal the reply smoothly, letter by letter"),
+            ("speech_markdown_filter",
+             "Speak prose only (skip Markdown symbols and code blocks)"),
         ]:
             hv.addWidget(self._flag_checkbox(
                 self._voice_checks, key, label,
@@ -2229,7 +2646,32 @@ class SettingsWindow(QDialog):
                  "dashboard, command pipeline) keep working exactly as before. "
                  "This never turns the microphone off."),
                 saved=voice_features))
+        self.typewriter_cps = self._slider_row(
+            hv, "Typewriter speed",
+            int(self._data.get("typewriter_cps", DEFAULTS["typewriter_cps"])),
+            40, 300, " cps")
+        self.typewriter_cps.setToolTip(
+            "Characters per second for the chat reveal. 110 reads comfortably; "
+            "300 is nearly instant. Independent of the voice engine.")
         for _k, _tip in (
+            ("typewriter_enabled",
+             "The chat reveals the reply one character at a time at a steady "
+             "reading speed, from the very first token. There is no pause "
+             "after punctuation and no mid-message slowdown: it keeps typing "
+             "until there is no text left, then the finished bubble is "
+             "rendered once.\n"
+             "It is NOT tied to the voice: muted, silent and spoken replies "
+             "animate identically, the first characters appear as the voice "
+             "starts, and an audio stall can never freeze or hurry the text.\n"
+             "OFF = the text appears as fast as the model writes it."),
+            ("speech_markdown_filter",
+             "The chat still SHOWS the full answer — headings, bold text, code "
+             "blocks and tables. Only the VOICE changes: it reads the prose and "
+             "says nothing when a fenced code block or table begins, instead of "
+             "reading '#' and backticks aloud.\n"
+             "ON is the default, e.g. \"Certainly, sir. Here is an example of "
+             "Markdown formatting for your review:\". OFF reads the raw text "
+             "aloud, symbols and all."),
             ("narrator",
              "J.A.R.V.I.S. speaks one short sentence while he works — \"Sir, "
              "I'm opening the page.\" Every line comes from a real event and "
@@ -2591,10 +3033,10 @@ class SettingsWindow(QDialog):
             return {
                 "apiKey": self.fish_api_key.text().strip(),
                 "endpoint": self.fish_endpoint.text().strip() or DEFAULTS["fish_audio_endpoint"],
-                "model": self.fish_model_id.text().strip() or DEFAULTS["fish_audio_model_id"],
-                "voice": self.fish_voice_id.text().strip(),
-                "format": self.fish_format.currentText(),
-                "latency": self.fish_latency.currentText(),
+                "model": self.fish_model_id.currentData() or DEFAULTS["fish_audio_model_id"],
+                "voice": self.fish_voice_id.text().strip() or DEFAULTS["fish_audio_voice_id"],
+                "format": self.fish_format.currentData() or DEFAULTS["fish_audio_format"],
+                "latency": self.fish_latency.currentData() or DEFAULTS["fish_audio_latency"],
             }
         if pid == "elevenLabs":
             return {
@@ -2796,8 +3238,8 @@ class SettingsWindow(QDialog):
                            "fish_audio_endpoint": values.get("endpoint", ""),
                            "fish_audio_model_id": values.get("model", ""),
                            "fish_audio_voice_id": values.get("voice", ""),
-                           "fish_audio_format": values.get("format", "mp3"),
-                           "fish_audio_latency": values.get("latency", "normal")})
+                           "fish_audio_format": values.get("format", DEFAULTS["fish_audio_format"]),
+                           "fish_audio_latency": values.get("latency", DEFAULTS["fish_audio_latency"])})
         elif pid == "elevenLabs":
             merged.update({"elevenlabs_api_key": values.get("apiKey", ""),
                            "elevenlabs_model_id": values.get("model", ""),
@@ -3713,79 +4155,401 @@ class SettingsWindow(QDialog):
         lay.setSpacing(10)
         self._tab_intro(lay, "PLUGINS  //  EXTEND JARVIS")
         self._plugin_list = QListWidget()
+        self._plugin_list.setFixedHeight(176)
         self._plugin_list.setStyleSheet(
             f"QListWidget{{background:rgba(0,12,20,130);color:{TEXT_BRIGHT};border:1px solid {STROKE_MID};border-radius:10px;padding:5px;}}"
             "QListWidget::item{padding:7px 8px;border-bottom:1px solid rgba(41,135,170,45);}"
             "QListWidget::item:selected{background:rgba(0,103,143,105);}"
         )
-        lay.addWidget(self._plugin_list, 1)
+        self._plugin_list.currentItemChanged.connect(
+            lambda *_a: self._show_plugin_detail())
+        lay.addWidget(self._plugin_list, 0)
         row = QHBoxLayout()
         row.setSpacing(8)
         refresh = QPushButton("REFRESH")
-        refresh.clicked.connect(self._reload_plugins)
+        refresh.setToolTip("Re-scan plugins/ and plugins_builtin/ for new or edited plugins.")
+        refresh.clicked.connect(lambda: self._reload_plugins(force=True))
         row.addWidget(refresh)
         toggle = QPushButton("ENABLE / DISABLE")
-        toggle.setToolTip("Toggle the selected plugin. Takes effect on next voice request.")
+        toggle.setToolTip("Toggle the selected plugin. Takes effect on the next request.")
         toggle.clicked.connect(self._toggle_plugin)
         row.addWidget(toggle)
         folder = QPushButton("OPEN FOLDER")
         folder.clicked.connect(self._open_plugins_folder)
         row.addWidget(folder)
+        row.addStretch(1)
         lay.addLayout(row)
         self._plugin_status = QLabel("")
         self._plugin_status.setWordWrap(True)
         self._plugin_status.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
         lay.addWidget(self._plugin_status)
+
+        self._plugin_detail = HudGroupBox("PLUGIN")
+        self._plugin_detail_lay = QVBoxLayout(self._plugin_detail)
+        self._plugin_detail_hint = QLabel("Select a plugin to see what it does and how it is configured.")
+        self._plugin_detail_hint.setWordWrap(True)
+        self._plugin_detail_hint.setStyleSheet(f"color:{TEXT_DIM};background:transparent;")
+        self._plugin_detail_lay.addWidget(self._plugin_detail_hint)
+        lay.addWidget(self._plugin_detail)
         lay.addStretch(1)
         self.tabs.addTab(scroll, "PLUGINS")
+        self._plugin_field_widgets = {}
+        self._plugin_limits_widgets = {}
+        self._plugin_advanced = False
         self._reload_plugins()
 
-    def _iter_plugins(self):
+    # ── plugin discovery (live registry, or a local scan when offline) ──────
+    def _iter_plugins(self, force: bool = False):
         try:
             fn = getattr(self, "get_plugins", None)
             if callable(fn):
-                return list(fn() or [])
+                rows = list(fn() or [])
+                if rows:
+                    return rows
         except Exception:
             pass
-        return []
+        return _scan_plugins_locally(force=force)
 
-    def _reload_plugins(self):
+    def _reload_plugins(self, force: bool = False):
         try:
+            current = str(self._selected_plugin_name() or "")
+            plugins = self._iter_plugins(force=force)
+            self._plugin_list.blockSignals(True)
             self._plugin_list.clear()
-            plugins = self._iter_plugins()
             if not plugins:
-                self._plugin_list.addItem("No plugins found. Drop a plugin folder into plugins/ and press REFRESH.")
+                self._plugin_list.addItem(
+                    "No plugins found. Drop a plugin folder into plugins/ and press REFRESH.")
             for p in plugins:
                 try:
-                    state = "ON" if p.get("enabled", True) else "OFF"
-                    problem = "" if p.get("valid", True) else f"  ·  BROKEN: {p.get('error', '?')}"
-                    item = QListWidgetItem(f"[{state}]  {p.get('name', '?')}  —  {p.get('description', '')[:90]}{problem}")
-                    item.setData(Qt.ItemDataRole.UserRole, p.get("name", ""))
+                    item = QListWidgetItem(self._plugin_row_text(p))
+                    item.setData(Qt.ItemDataRole.UserRole, p)
                     self._plugin_list.addItem(item)
+                    if str(p.get("name") or "") == current:
+                        self._plugin_list.setCurrentItem(item)
                 except Exception:
                     pass
+            self._plugin_list.blockSignals(False)
+            if self._plugin_list.currentItem() is None and self._plugin_list.count():
+                self._plugin_list.setCurrentRow(0)
             self._plugin_status.setText(f"{len(plugins)} plugin(s) discovered.")
         except Exception as exc:
             self._plugin_status.setText(f"Plugin scan failed: {exc}")
+        self._show_plugin_detail()
 
-    def _toggle_plugin(self):
+    def _plugin_row_text(self, p: dict) -> str:
+        icon = str(p.get("icon") or "✚")
+        name = str(p.get("name") or "?")
+        if not p.get("valid", True):
+            state = "NEEDS APP" if p.get("requires") else "UNAVAILABLE"
+        elif p.get("enabled", True):
+            state = "ACTIVE"
+        else:
+            state = "OFF"
+        origin = "built-in" if p.get("builtin") else "user"
+        return f"{icon}  {name}   [{state} · {origin}]"
+
+    def _selected_plugin(self) -> dict | None:
         item = self._plugin_list.currentItem()
         if item is None:
+            return None
+        data = item.data(Qt.ItemDataRole.UserRole)
+        return data if isinstance(data, dict) else None
+
+    def _selected_plugin_name(self) -> str:
+        data = self._selected_plugin()
+        return str((data or {}).get("name") or "")
+
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            child = layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _show_plugin_detail(self) -> None:
+        p = self._selected_plugin()
+        self._plugin_field_widgets = {}
+        self._plugin_limits_widgets = {}
+        self._clear_layout(self._plugin_detail_lay)
+        if not p:
+            hint = QLabel("Select a plugin to see what it does and how it is configured.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet(f"color:{TEXT_DIM};background:transparent;")
+            self._plugin_detail_lay.addWidget(hint)
+            return
+
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(6)
+
+        header = QLabel(f"{p.get('icon') or '✚'}  {p.get('name', '?')}")
+        header.setStyleSheet(f"color:{ACCENT_TEXT};font:800 11pt 'Orbitron';background:transparent;")
+        wl.addWidget(header)
+
+        meta_bits = [f"category: {p.get('category', 'general')}",
+                     "built-in" if p.get("builtin") else "user plugin"]
+        if p.get("version"):
+            meta_bits.append(f"v{p['version']}")
+        meta_bits.append(f"file: {p.get('file', '?')}")
+        meta = QLabel("   ·   ".join(meta_bits))
+        meta.setWordWrap(True)
+        meta.setStyleSheet(f"color:{TEXT_DIM};font:7pt 'Exo 2';background:transparent;")
+        wl.addWidget(meta)
+
+        if not p.get("valid", True):
+            reason = QLabel(f"⚠  Unavailable: {p.get('error') or 'the plugin failed validation'}")
+            reason.setWordWrap(True)
+            reason.setStyleSheet(f"color:{AMBER};background:rgba(244,178,74,18);border:1px solid rgba(244,178,74,90);border-radius:6px;padding:6px 8px;")
+            wl.addWidget(reason)
+        elif not p.get("enabled", True):
+            off = QLabel("○  Disabled — enable it above to offer it to the model.")
+            off.setWordWrap(True)
+            off.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
+            wl.addWidget(off)
+
+        desc = QLabel(str(p.get("description") or "No description."))
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
+        wl.addWidget(desc)
+
+        permissions = p.get("permissions") or []
+        if permissions:
+            perms = QLabel("Permissions: " + ", ".join(str(x) for x in permissions)
+                           + ("   —   blocked: " + str(p.get("permission_block")).split("needs")[-1].strip()
+                              if p.get("permission_block") else ""))
+            perms.setWordWrap(True)
+            perms.setStyleSheet(f"color:{TEXT_DIM};font:7pt 'Exo 2';background:transparent;")
+            wl.addWidget(perms)
+        if p.get("requires"):
+            req = QLabel("Requires: " + ", ".join(str(x) for x in p["requires"]))
+            req.setWordWrap(True)
+            req.setStyleSheet(f"color:{TEXT_DIM};font:7pt 'Exo 2';background:transparent;")
+            wl.addWidget(req)
+
+        schema = p.get("settings_schema") or []
+        values = p.get("settings") or {}
+        basic = [s for s in schema if not s.get("advanced")]
+        advanced = [s for s in schema if s.get("advanced")]
+
+        if basic or advanced:
+            wl.addWidget(self._plugin_section_label("SETTINGS"))
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        for field in basic:
+            widget = self._plugin_field(field, values)
+            if widget is not None:
+                form.addRow(str(field.get("label") or field.get("key")), widget)
+        wl.addLayout(form)
+
+        self._plugin_advanced_box = QWidget()
+        adv_lay = QVBoxLayout(self._plugin_advanced_box)
+        adv_lay.setContentsMargins(0, 0, 0, 0)
+        adv_lay.setSpacing(6)
+        adv_toggle = QCheckBox("ADVANCED SETTINGS")
+        adv_toggle.setChecked(bool(self._plugin_advanced))
+        adv_toggle.toggled.connect(self._toggle_plugin_advanced)
+        adv_lay.addWidget(adv_toggle)
+        if advanced:
+            adv_form = QFormLayout()
+            for field in advanced:
+                widget = self._plugin_field(field, values)
+                if widget is not None:
+                    adv_form.addRow(str(field.get("label") or field.get("key")), widget)
+            adv_lay.addLayout(adv_form)
+
+        limits = p.get("limits") or {}
+        if limits:
+            adv_lay.addWidget(self._plugin_section_label("EXECUTION LIMITS"))
+            lim_form = QFormLayout()
+            for key, label, hi in (("max_calls_per_minute", "Max calls per minute", 600),
+                                   ("timeout_seconds", "Timeout (seconds)", 3600),
+                                   ("max_results", "Max results", 500)):
+                if key not in limits:
+                    continue
+                spin = QSpinBox()
+                spin.setRange(1, hi)
+                spin.setValue(int(limits.get(key) or 1))
+                lim_form.addRow(label, spin)
+                self._plugin_limits_widgets[key] = spin
+            adv_lay.addLayout(lim_form)
+        self._plugin_advanced_box.setVisible(bool(self._plugin_advanced))
+        wl.addWidget(self._plugin_advanced_box)
+
+        actions = QHBoxLayout()
+        save = QPushButton("SAVE PLUGIN SETTINGS")
+        save.setToolTip("Persist this plugin's settings, credentials and execution limits.")
+        save.clicked.connect(self._save_plugin_settings)
+        actions.addWidget(save)
+        enable = QPushButton("ENABLE / DISABLE")
+        enable.clicked.connect(self._toggle_plugin)
+        actions.addWidget(enable)
+        actions.addStretch(1)
+        wl.addLayout(actions)
+        self._plugin_detail_lay.addWidget(wrap)
+
+    def _plugin_section_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(f"color:{ACCENT_TEXT};font:800 7.5pt 'Orbitron';"
+                            f"letter-spacing:1px;background:transparent;")
+        return label
+
+    def _plugin_field(self, field: dict, values: dict):
+        """One typed editor for a manifest setting field."""
+        key = str(field.get("key") or "")
+        if not key:
+            return None
+        ftype = str(field.get("type") or "string")
+        value = values.get(key, field.get("default"))
+        tooltip = str(field.get("help") or "")
+        if ftype == "bool":
+            widget = QCheckBox()
+            widget.setChecked(bool(value))
+        elif ftype == "int":
+            widget = QSpinBox()
+            widget.setRange(int(field.get("min") or 0), int(field.get("max") or 1_000_000))
+            widget.setValue(int(value or 0))
+        elif ftype == "float":
+            widget = QDoubleSpinBox()
+            widget.setRange(float(field.get("min") or 0.0), float(field.get("max") or 1_000_000.0))
+            widget.setSingleStep(float(field.get("step") or 0.1))
+            widget.setValue(float(value or 0.0))
+        elif ftype == "choice":
+            widget = QComboBox()
+            for choice in (field.get("choices") or []):
+                if isinstance(choice, (list, tuple)) and len(choice) >= 2:
+                    widget.addItem(str(choice[1]), str(choice[0]))
+            idx = widget.findData(str(value))
+            widget.setCurrentIndex(idx if idx >= 0 else 0)
+        elif ftype == "model":
+            widget = QComboBox()
+            widget.setEditable(True)
+            for candidate in _plugin_model_choices():
+                widget.addItem(candidate, candidate)
+            widget.setCurrentText(str(value or ""))
+        elif ftype == "text":
+            widget = QTextEdit()
+            widget.setPlainText(str(value or ""))
+            widget.setFixedHeight(72)
+        elif ftype == "secret":
+            widget = QLineEdit(str(value or ""))
+            widget.setEchoMode(QLineEdit.EchoMode.Password)
+            widget.setPlaceholderText("stored in the local config")
+        else:
+            widget = QLineEdit(str(value or ""))
+        if tooltip:
+            widget.setToolTip(tooltip)
+        self._plugin_field_widgets[key] = (ftype, widget)
+        return widget
+
+    def _plugin_field_value(self, ftype: str, widget):
+        if ftype == "bool":
+            return bool(widget.isChecked())
+        if ftype in ("int", "float"):
+            return widget.value()
+        if ftype == "choice":
+            return str(widget.currentData())
+        if ftype == "model":
+            return str(widget.currentText()).strip()
+        if ftype == "text":
+            return str(widget.toPlainText())
+        return str(widget.text()).strip()
+
+    def _toggle_plugin_advanced(self, checked: bool) -> None:
+        self._plugin_advanced = bool(checked)
+        try:
+            self._plugin_advanced_box.setVisible(self._plugin_advanced)
+        except Exception:
+            pass
+
+    def _write_plugin_config(self, section: str, plugin_id: str, values,
+                             merge: bool) -> None:
+        """Write one plugin's block into THIS window's config file.
+
+        The plugin settings must land in the same file the rest of the panel
+        saves to (``self._config_path``), not a hard-coded path — otherwise a
+        window opened against another config would silently write elsewhere.
+        """
+        try:
+            from core import config_guard as guard
+            data = dict(guard.read(self._config_path) or {})
+        except Exception:
+            data = dict(getattr(self, "_data", {}) or {})
+        block = data.get(section)
+        if not isinstance(block, dict):
+            block = {}
+        existing = block.get(plugin_id)
+        if merge and isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(values or {})
+            block[plugin_id] = merged
+        else:
+            block[plugin_id] = (values if section != "plugins_enabled"
+                                else bool(values))
+        data[section] = block
+        saved = False
+        try:
+            from core import config_guard as guard2
+            ok, msg, _bak = guard2.save_with_history(
+                data, tag="plugin", path=self._config_path)
+            saved = bool(ok)
+            if not ok:
+                raise RuntimeError(msg)
+        except Exception:
+            saved = False
+        if not saved:
+            Path(self._config_path).write_text(
+                json.dumps(data, indent=4), encoding="utf-8")
+        self._data = data
+
+    def _save_plugin_settings(self) -> None:
+        p = self._selected_plugin()
+        if not p:
             self._plugin_status.setText("Select a plugin first.")
             return
-        name = str(item.data(Qt.ItemDataRole.UserRole) or "")
-        if not name:
+        plugin_id = str(p.get("id") or p.get("name") or "")
+        if not plugin_id:
             return
         try:
-            cur = {p.get("name"): bool(p.get("enabled", True)) for p in self._iter_plugins()}
-            new_state = not cur.get(name, True)
+            values = {}
+            for key, (ftype, widget) in self._plugin_field_widgets.items():
+                try:
+                    values[key] = self._plugin_field_value(ftype, widget)
+                except Exception:
+                    pass
+            if values:
+                self._write_plugin_config("plugin_settings", plugin_id,
+                                          values, merge=True)
+            limit_values = {key: int(spin.value())
+                            for key, spin in self._plugin_limits_widgets.items()}
+            if limit_values:
+                self._write_plugin_config("plugin_limits", plugin_id,
+                                          limit_values, merge=False)
+            self._plugin_status.setText(
+                f"Saved settings for '{plugin_id}'. They apply to the next call.")
+            self._reload_plugins()
+        except Exception as exc:
+            self._plugin_status.setText(f"Save failed: {exc}")
+
+    def _toggle_plugin(self):
+        p = self._selected_plugin()
+        name = str((p or {}).get("name") or "")
+        if not name:
+            self._plugin_status.setText("Select a plugin first.")
+            return
+        new_state = not bool((p or {}).get("enabled", True))
+        try:
             fn = getattr(self, "set_plugin_enabled", None)
             if callable(fn):
                 fn(name, new_state)
-                self._plugin_status.setText(f"Plugin '{name}' {'enabled' if new_state else 'disabled'}. Applies to the next request.")
-                self._reload_plugins()
             else:
-                self._plugin_status.setText("Plugin control is unavailable while JARVIS is offline.")
+                self._write_plugin_config("plugins_enabled", name,
+                                          new_state, merge=False)
+            self._plugin_status.setText(
+                f"Plugin '{name}' {'enabled' if new_state else 'disabled'}. "
+                f"Applies to the next request.")
+            self._reload_plugins()
         except Exception as exc:
             self._plugin_status.setText(f"Toggle failed: {exc}")
 
@@ -5231,13 +5995,6 @@ class SettingsWindow(QDialog):
         info.setWordWrap(True); info.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
         v.addWidget(info)
         lay.addWidget(box)
-        mon = HudGroupBox("WORLD MONITOR")
-        mv = QVBoxLayout(mon)
-        self.world_refresh = self._slider_row(mv, "Headline refresh", int(self._data.get("world_monitor_refresh", 60)), 15, 600, " s")
-        note = QLabel("World Monitor shows global clocks, CPU/RAM/GPU telemetry, a grid sweep, and live world headlines.")
-        note.setWordWrap(True); note.setStyleSheet(f"color:{TEXT_MID};background:transparent;")
-        mv.addWidget(note)
-        lay.addWidget(mon)
         lay.addStretch(1)
         self._memory_tab_index = self.tabs.addTab(scroll, "MEMORY")
         self.tabs.currentChanged.connect(self._on_memory_tab_shown)
@@ -5498,7 +6255,6 @@ class SettingsWindow(QDialog):
             ("preview_tabs", "Enable preview tabs"),
             ("webview", "Enable Webview windows"),
             ("web_task", "Enable Web Task queue"),
-            ("world_monitor", "Enable World Monitor"),
             ("floating_windows", "Allow multiple independent HUD windows"),
             ("draggable_panels", "Drag windows from the title bar"),
             ("enable_sfx", "Futuristic UI sound effects"),
@@ -6209,8 +6965,21 @@ class SettingsWindow(QDialog):
             reactor_animation_speed=self.anim_speed.value() / 100.0,
             equalizer_sensitivity=self.eq_sens.value() / 100.0,
             voice_speed=self.voice_speed.value() / 100.0,
+            typewriter_cps=self.typewriter_cps.value(),
             voice_pitch=self.voice_pitch.value() / 10.0,
             voice_volume=self.voice_volume.value() / 100.0,
+            # Microphone input processing (voice/mic_dsp.py owns the reader).
+            input_device=str(self.mic_device.currentData() or ""),
+            mic_gain_percent=int(self.mic_gain.value()),
+            mic_noise_suppression=bool(self.mic_ns.isChecked()),
+            mic_noise_suppression_amount=int(self.mic_ns_amount.value()),
+            mic_noise_gate=bool(self.mic_gate.isChecked()),
+            mic_noise_gate_db=int(self.mic_gate_db.value()),
+            mic_compressor=bool(self.mic_comp.isChecked()),
+            mic_compressor_amount=int(self.mic_comp_amount.value()),
+            mic_limiter=bool(self.mic_limiter.isChecked()),
+            mic_limiter_ceiling_db=float(self.mic_ceiling.value()),
+            mic_monitoring=bool(self.mic_monitoring.isChecked()),
             # Extended voice style: collected from the sliders and carried
             # through the same save path; delivery_style.py validates on read.
             voice_style=self._collect_voice_style(),
@@ -6236,10 +7005,10 @@ class SettingsWindow(QDialog):
                         if _active_pid != "gemini" else self.live_voice.currentText()),
             fish_audio_api_key=(_fish or {}).get("apiKey", self._data.get("fish_audio_api_key", "")),
             fish_audio_model_id=(_fish or {}).get("model", self._data.get("fish_audio_model_id", DEFAULTS["fish_audio_model_id"])),
-            fish_audio_voice_id=(_fish or {}).get("voice", self._data.get("fish_audio_voice_id", "")),
+            fish_audio_voice_id=(_fish or {}).get("voice", self._data.get("fish_audio_voice_id") or DEFAULTS["fish_audio_voice_id"]),
             fish_audio_endpoint=(_fish or {}).get("endpoint", self._data.get("fish_audio_endpoint", DEFAULTS["fish_audio_endpoint"])),
-            fish_audio_format=(_fish or {}).get("format", self._data.get("fish_audio_format", "mp3")),
-            fish_audio_latency=(_fish or {}).get("latency", self._data.get("fish_audio_latency", "normal")),
+            fish_audio_format=(_fish or {}).get("format", self._data.get("fish_audio_format", DEFAULTS["fish_audio_format"])),
+            fish_audio_latency=(_fish or {}).get("latency", self._data.get("fish_audio_latency", DEFAULTS["fish_audio_latency"])),
             elevenlabs_api_key=(_eleven or {}).get("apiKey", self._data.get("elevenlabs_api_key", "")),
             elevenlabs_voice_id=(_eleven or {}).get("voice", self._data.get("elevenlabs_voice_id", DEFAULTS["elevenlabs_voice_id"])),
             elevenlabs_model_id=(_eleven or {}).get("model", self._data.get("elevenlabs_model_id", DEFAULTS["elevenlabs_model_id"])),
@@ -6267,7 +7036,6 @@ class SettingsWindow(QDialog):
             custom_ai_base_url=self.custom_ai_base_url.text().strip().rstrip("/"),
             custom_ai_model=self.custom_ai_model.text().strip(),
             web_homepage=self.web_homepage.text().strip() or DEFAULTS["web_homepage"],
-            world_monitor_refresh=self.world_refresh.value(),
             memory_autosave=self._memory_autosave.isChecked(),
             panel_always_on_top=self._web_ontop.isChecked(),
             features=features,
@@ -6292,8 +7060,29 @@ class SettingsWindow(QDialog):
         self.anim_speed.setValue(100)
         self.eq_sens.setValue(100)
         self.voice_speed.setValue(100)
+        try:
+            self.typewriter_cps.setValue(int(DEFAULTS["typewriter_cps"]))
+        except Exception:
+            pass
         self.voice_pitch.setValue(0)
         self.voice_volume.setValue(100)
+        try:
+            self.mic_gain.setValue(int(DEFAULTS["mic_gain_percent"]))
+            self.mic_ns.setChecked(bool(DEFAULTS["mic_noise_suppression"]))
+            self.mic_ns_amount.setValue(
+                int(DEFAULTS["mic_noise_suppression_amount"]))
+            self.mic_gate.setChecked(bool(DEFAULTS["mic_noise_gate"]))
+            self.mic_gate_db.setValue(int(DEFAULTS["mic_noise_gate_db"]))
+            self.mic_comp.setChecked(bool(DEFAULTS["mic_compressor"]))
+            self.mic_comp_amount.setValue(int(DEFAULTS["mic_compressor_amount"]))
+            self.mic_limiter.setChecked(bool(DEFAULTS["mic_limiter"]))
+            self.mic_ceiling.setValue(
+                int(round(float(DEFAULTS["mic_limiter_ceiling_db"]))))
+            self.mic_monitoring.setChecked(False)
+            _di = self.mic_device.findData("")
+            self.mic_device.setCurrentIndex(_di if _di >= 0 else 0)
+        except Exception:
+            pass
         try:
             self._reset_voice_style()
         except Exception:
@@ -6303,11 +7092,14 @@ class SettingsWindow(QDialog):
         self.tts_voice.setText(DEFAULTS["tts_voice"])
         self.live_voice.setCurrentText(DEFAULTS["voice_name"])
         self.fish_api_key.clear()
-        self.fish_model_id.setText(DEFAULTS["fish_audio_model_id"])
-        self.fish_voice_id.clear()
+        _mi = self.fish_model_id.findData(DEFAULTS["fish_audio_model_id"])
+        self.fish_model_id.setCurrentIndex(_mi if _mi >= 0 else 0)
+        self.fish_voice_id.setText(DEFAULTS["fish_audio_voice_id"])
         self.fish_endpoint.setText(DEFAULTS["fish_audio_endpoint"])
-        self.fish_format.setCurrentText(DEFAULTS["fish_audio_format"])
-        self.fish_latency.setCurrentText(DEFAULTS["fish_audio_latency"])
+        _fi = self.fish_format.findData(DEFAULTS["fish_audio_format"])
+        self.fish_format.setCurrentIndex(_fi if _fi >= 0 else 0)
+        _li = self.fish_latency.findData(DEFAULTS["fish_audio_latency"])
+        self.fish_latency.setCurrentIndex(_li if _li >= 0 else 0)
         self.elevenlabs_api_key.clear()
         self.elevenlabs_voice_id.setText(DEFAULTS["elevenlabs_voice_id"])
         self.elevenlabs_model_id.setCurrentText(DEFAULTS["elevenlabs_model_id"])
@@ -6331,8 +7123,6 @@ class SettingsWindow(QDialog):
                 _fld.clear()
         if hasattr(self, "web_homepage"):
             self.web_homepage.setText(DEFAULTS["web_homepage"])
-        if hasattr(self, "world_refresh"):
-            self.world_refresh.setValue(DEFAULTS["world_monitor_refresh"])
         if hasattr(self, "_memory_autosave"):
             self._memory_autosave.setChecked(True)
         if hasattr(self, "_web_ontop"):
@@ -6507,10 +7297,24 @@ class SettingsWindow(QDialog):
             self._refresh_laya_status()
         except Exception:
             pass
+        # Resume the persisted input monitoring: the switch says what the user
+        # last chose, so the panel comes back in that state.
+        try:
+            if (getattr(self, "mic_monitoring", None) is not None
+                    and self.mic_monitoring.isChecked()):
+                self._start_mic_monitor()
+        except Exception:
+            pass
 
     def hideEvent(self, event):
         try:
             self._laya_timer.stop()
+        except Exception:
+            pass
+        # Never hold the microphone open for a hidden test monitor: the live
+        # session owns the input while this window is closed.
+        try:
+            self._stop_mic_monitor()
         except Exception:
             pass
         super().hideEvent(event)
@@ -6518,6 +7322,10 @@ class SettingsWindow(QDialog):
     def closeEvent(self, event):
         try:
             self._stop_video()
+        except Exception:
+            pass
+        try:
+            self._stop_mic_monitor()
         except Exception:
             pass
         self.hide()

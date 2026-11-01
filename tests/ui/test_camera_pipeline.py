@@ -333,8 +333,14 @@ def test_newest_frame_wins_and_stale_frames_are_dropped(qapp, window, camera, mo
     assert state["decoded"] < camera.sent, \
         f"decoded {state['decoded']} of {camera.sent} pushed frames — nothing was coalesced"
     # Never paint an older frame after a newer one (JPEG shifts values a little).
+    # The fake generator's shade CYCLES every 40 frames (8 + n%40*5), so a big
+    # drop from the top of the cycle back to its start is the pattern wrapping,
+    # not a stale frame: a loaded suite sends >40 frames inside the 1.4 s pump
+    # and the old assertion read the wrap as a regression.
     for older, newer in zip(presented_shades, presented_shades[1:]):
-        assert newer >= older - 3, f"stale frame presented: {older} then {newer}"
+        wrapped = older >= 190 and newer <= 30
+        assert wrapped or newer >= older - 3, \
+            f"stale frame presented: {older} then {newer}"
 
 
 def test_ui_thread_cost_per_frame_is_small(qapp, window, monkeypatch):
@@ -464,7 +470,14 @@ def test_vision_look_closes_its_own_surfaces(qapp, window, camera):
     _pump(qapp, 0.3)
     assert window._cam_live_lbl._scan._tmr.isActive(), "no scan on a vision look"
 
-    _pump(qapp, 0.6)
+    # The look closes itself after the scan. A fixed 0.6 s pump was a coin
+    # flip on a loaded machine (Qt coalesces timer ticks when the rest of the
+    # suite keeps the process busy), so wait for the close on its own — the
+    # deadline still fails if it never closes.
+    deadline = time.monotonic() + 8.0
+    while (window._cam_live_lbl.isVisible() or camera.subscriber_count) \
+            and time.monotonic() < deadline:
+        _pump(qapp, 0.1)
     assert not window._cam_live_lbl.isVisible(), "the panel lingered after the look"
     assert not camera.subscriber_count, "the preview kept its stream subscription"
 

@@ -1,0 +1,95 @@
+/* Minimal Tailwind replacement reset & bespoke styling */
+@import "https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css";
+
+:root {
+  --studio-shimmer-crest: #ffffff;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: #0b0c0e;
+  color: #f4f4f5;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+/* Studio Shimmer Text Sweep Animation Captured in Target Evidence */
+@keyframes studio-shimmer-sweep {
+  from { background-position: 0 0; }
+  to   { background-position: 73ch 0; }
+}
+
+.studio-shimmer-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.studio-shimmer-clone {
+  display: none;
+  position: absolute;
+  inset: 0;
+  padding: inherit;
+  overflow: clip;
+  color: transparent;
+  pointer-events: none;
+}
+
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .studio-shimmer-clone {
+    display: block;
+    background-image: linear-gradient(
+      90deg,
+      transparent calc(50% - 31ch),
+      var(--studio-shimmer-crest) 50%,
+      transparent calc(50% + 31ch)
+    );
+    background-size: 73ch 100%;
+    background-repeat: repeat-x;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: studio-shimmer-sweep 2400ms linear infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-shimmer-clone { display: none; }
+}
+
+/* Background canvas grid pattern */
+.grid-pattern {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.canvas-grid {
+  background-size: 24px 24px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+}
+
+/* Interactive Sandbox elements */
+.tool-btn.active {
+  background-color: rgba(255, 255, 255, 0.15);
+  color: #ffffff;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+```
+
+```text

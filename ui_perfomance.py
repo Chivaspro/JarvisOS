@@ -16,6 +16,7 @@ reports only what it measured.
 
 from __future__ import annotations
 
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -44,7 +45,6 @@ DEFAULTS: dict[str, Any] = {
     "animations": True,
     "sound_effects": True,
     "audio_reactive": True,
-    "world_monitor_refresh": 60,
     "mind_reload_s": 10,
     "vault_watch_s": 6,
     "index_fresh_s": 5,
@@ -69,7 +69,6 @@ PROFILES: dict[str, dict[str, Any]] = {
         "animations": False,
         "sound_effects": False,
         "audio_reactive": False,
-        "world_monitor_refresh": 300,
         "mind_reload_s": 30,
         "vault_watch_s": 30,
         "index_fresh_s": 60,
@@ -99,7 +98,6 @@ PROFILE_NOTES = {
 }
 
 _LIMITS = {
-    "world_monitor_refresh": (15, 600),
     "mind_reload_s": (5, 120),
     "vault_watch_s": (2, 120),
     "index_fresh_s": (2, 300),
@@ -186,36 +184,48 @@ def save_custom(settings: dict) -> dict:
 
 def scan_vault_metrics(index=None, path: str | Path | None = None) -> dict:
     """Real vault-index numbers: existence, note count, last scan age, and the
-    measured cost of one incremental scan. Never raises."""
+    measured cost of one incremental scan. Never raises.
+
+    A throwaway index (the ``path`` case) lives in a TemporaryDirectory that is
+    removed by its ``with`` block — the old mkdtemp version leaked one folder
+    per scan.
+    """
     out: dict[str, Any] = {"ok": False, "configured": "", "exists": False,
                            "notes": 0, "folders": 0, "last_scan_age_s": -1.0,
                            "scan_elapsed_s": -1.0, "detail": ""}
     try:
+        if index is None and path is not None:
+            from memory.vault_store import VaultIndex
+            with tempfile.TemporaryDirectory(prefix="jarvis-perf-") as tmp:
+                probe_index = VaultIndex(path=str(path),
+                                         db_path=Path(tmp) / "scan.db")
+                return _scan_vault(probe_index, out)
         if index is None:
-            from memory.vault_store import VaultIndex, get_index
-            if path is not None:
-                import tempfile
-                db = Path(tempfile.mkdtemp(prefix="jarvis-perf-")) / "scan.db"
-                index = VaultIndex(path=str(path), db_path=db)
-            else:
-                index = get_index()
-        out["configured"] = str(index.path)
-        out["exists"] = bool(Path(index.path).exists())
-        if not out["exists"]:
-            out["detail"] = "the vault folder does not exist"
-            return out
-        started = time.perf_counter()
-        result = index.scan()
-        out["scan_elapsed_s"] = round(time.perf_counter() - started, 3)
-        out["ok"] = bool(result.get("ok"))
-        out["detail"] = str(result.get("detail") or "")
-        stats = index.stats()
-        out["notes"] = int(stats.get("notes") or 0)
-        out["folders"] = int(stats.get("folders") or 0)
-        last = float(stats.get("last_scan") or 0)
-        out["last_scan_age_s"] = round(max(0.0, time.time() - last), 1) if last else -1.0
+            from memory.vault_store import get_index
+            index = get_index()
+        return _scan_vault(index, out)
     except Exception as exc:
         out["detail"] = str(exc)
+    return out
+
+
+def _scan_vault(index, out: dict) -> dict:
+    """Measure one vault scan into ``out`` (shared by the real and temp index)."""
+    out["configured"] = str(index.path)
+    out["exists"] = bool(Path(index.path).exists())
+    if not out["exists"]:
+        out["detail"] = "the vault folder does not exist"
+        return out
+    started = time.perf_counter()
+    result = index.scan()
+    out["scan_elapsed_s"] = round(time.perf_counter() - started, 3)
+    out["ok"] = bool(result.get("ok"))
+    out["detail"] = str(result.get("detail") or "")
+    stats = index.stats()
+    out["notes"] = int(stats.get("notes") or 0)
+    out["folders"] = int(stats.get("folders") or 0)
+    last = float(stats.get("last_scan") or 0)
+    out["last_scan_age_s"] = round(max(0.0, time.time() - last), 1) if last else -1.0
     return out
 
 
@@ -426,8 +436,6 @@ _CONTROL_DEFS: tuple[tuple[str, str, str, str], ...] = (
      "How often the background watcher checks the vault for changes made in Obsidian."),
     ("index_fresh_s", "Index freshness window", "seconds",
      "How long the vault index may be used before it re-checks the folder."),
-    ("world_monitor_refresh", "World Monitor refresh", "seconds",
-     "Headline and telemetry refresh interval."),
     ("neural_max_nodes", "Neural Map node budget", "nodes",
      "Most notes the map draws. Omitted notes stay searchable in the Mind panel."),
     ("neural_tick_ms", "Neural Map tick interval", "ms",

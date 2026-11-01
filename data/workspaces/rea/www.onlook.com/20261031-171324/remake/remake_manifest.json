@@ -1,0 +1,26 @@
+{
+  "kind": "remake",
+  "target": "https://www.onlook.com/",
+  "at": 1793438123.1839657,
+  "at_iso": "2026-10-31T09:15:23.183971+00:00",
+  "tool": "reverse_engineer",
+  "feature": "",
+  "provider": "gemini",
+  "files": [
+    "README.md",
+    "app.js",
+    "index.html",
+    "server.py",
+    "styles.css"
+  ],
+  "checks": {
+    "files_written": 5,
+    "index_html": true,
+    "python_ok": false,
+    "empty_files": [],
+    "python_errors": [
+      "server.py: line 107: invalid syntax"
+    ]
+  },
+  "capture_dir": "C:\\Users\\CHIV4S\\Documents\\JarvisOS Main\\data\\workspaces\\rea\\www.onlook.com\\20261031-171324\\capture"
+}

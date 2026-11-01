@@ -30,7 +30,11 @@ WIZARD_SOURCE = ROOT / "setup_jarvis.py"
 # bare interpreter can import them before any pip install has happened.
 # start_jarvis is the authority for HARD_IMPORTS (its own test enforces that it
 # imports nothing but the standard library), so the launch gate reuses it.
-PROJECT_PACKAGES = {"core", "app", "start_jarvis"}
+# ``voice`` is listed for ``voice.fish_defaults`` alone — the single owner of
+# the Fish Audio constants the fresh-config seed needs. That module imports
+# only ``__future__`` and ``voice/__init__.py`` is empty, so the import stays
+# runnable on a bare interpreter; nothing else under ``voice`` is imported.
+PROJECT_PACKAGES = {"core", "app", "start_jarvis", "voice"}
 
 
 def _imported_top_level_modules(path: Path) -> set[str]:
@@ -455,6 +459,28 @@ def test_the_build_only_bundles_folders_that_exist(tmp_path, monkeypatch):
     assert len(bundled) == 1 and bundled[0].endswith(f"{os.pathsep}config")
 
 
+def test_the_build_bundles_the_native_extension_when_it_exists(tmp_path, monkeypatch):
+    # Hybrid packaging: a built jarvis_native.pyd must ride along in .exe
+    # builds (single file, into native/); without it the args stay untouched.
+    monkeypatch.setattr(setup_jarvis, "ROOT", tmp_path)
+    (tmp_path / "native").mkdir()
+    (tmp_path / "native" / "jarvis_native.pyd").write_bytes(b"MZ")
+    args = setup_jarvis.build_pyinstaller_args("Jarvis OS")
+    bundled = [args[i + 1] for i, item in enumerate(args) if item == "--add-data"]
+    assert any(entry.endswith(f"{os.pathsep}native") for entry in bundled)
+    assert "jarvis_native" in args
+
+
+def test_native_status_helpers_survive_a_missing_tool(tmp_path, monkeypatch):
+    # The optional backend must degrade, never crash: no build tool → report
+    # False with guidance; unknown cargo → None rather than an exception.
+    monkeypatch.setattr(setup_jarvis, "NATIVE_TOOL", tmp_path / "missing.py")
+    assert setup_jarvis.native_backend_report() is False
+    monkeypatch.setattr(setup_jarvis.shutil, "which", lambda name: None)
+    monkeypatch.setattr(setup_jarvis, "ROOT", tmp_path)
+    assert setup_jarvis._cargo_exe() is None or setup_jarvis._cargo_exe().endswith("cargo.exe")
+
+
 # ── Reset data ───────────────────────────────────────────────────────────────
 
 def test_reset_plan_backs_up_the_stores_and_clears_only_caches(tmp_path):
@@ -734,3 +760,126 @@ def test_heal_node_runtime_skips_instead_of_failing_when_node_is_absent(monkeypa
     monkeypatch.setattr(setup_jarvis.shutil, "which", lambda name: None)
     fixed, detail = setup_jarvis._heal_node_runtime()
     assert fixed is None and "not installed" in detail
+
+# ── REA wiring: the pin is shared, and the menus can reach it ────────────────
+
+def test_the_wizard_pins_the_same_rea_release_and_node_matrices_as_the_host():
+    from mcp_host import rea
+
+    assert setup_jarvis.REA_PACKAGE == rea.REA_PACKAGE
+    assert setup_jarvis.REA_VERSION == rea.REA_VERSION
+    for version in ("v22.18.0", "v22.19.0", "v24.20.0", "v24.22.1",
+                    "v26.0.0", "v26.12.1", "v23.1.0", "v25.0.0",
+                    "v28.0.0", "v22.23.4-rc.1", "", "garbage"):
+        assert (setup_jarvis._rea_node_supported(version)
+                is rea.node_supported(version)), version
+        assert (setup_jarvis._rea_node_recommended(version)
+                is rea.node_recommended(version)), version
+
+
+def test_rea_is_reachable_from_install_and_diagnose():
+    assert setup_jarvis._lookup_choice("r", "install-menu")[1] is setup_jarvis.install_rea
+    assert setup_jarvis._lookup_choice("r", "diag-menu")[1] is setup_jarvis.test_rea
+
+
+def test_install_all_missing_prewarms_rea_after_the_node_runtime(monkeypatch):
+    called: list[bool] = []
+    monkeypatch.setattr(setup_jarvis, "install_python_deps", lambda: True)
+    monkeypatch.setattr(setup_jarvis, "fix_gemini", lambda: (True, "ok"))
+    monkeypatch.setattr(setup_jarvis, "_feature_rows", lambda: [])
+    monkeypatch.setattr(setup_jarvis, "install_node_deps", lambda: True)
+    monkeypatch.setattr(setup_jarvis, "install_playwright_browser", lambda: True)
+    monkeypatch.setattr(setup_jarvis, "install_rea",
+                        lambda confirm=True: called.append(confirm) or True)
+
+    assert setup_jarvis.install_all_missing() is True
+    assert called == [False], "the all-missing pass must not ask a second question"
+
+
+def test_heal_rea_skips_when_node_cannot_run_rea(monkeypatch):
+    monkeypatch.setattr(setup_jarvis.shutil, "which",
+                        lambda name: f"C:/node/{name}.exe")
+    monkeypatch.setattr(setup_jarvis, "_version_of",
+                        lambda *a, **k: "v20.11.0")
+    fixed, detail = setup_jarvis._heal_rea()
+    assert fixed is None and "unsupported" in detail
+
+
+def test_heal_rea_reports_a_cached_release_without_downloading(monkeypatch):
+    monkeypatch.setattr(setup_jarvis.shutil, "which",
+                        lambda name: f"C:/node/{name}.exe")
+    monkeypatch.setattr(setup_jarvis, "_version_of", lambda *a, **k: "v24.20.0")
+    monkeypatch.setattr(setup_jarvis, "_rea_cache_dirs",
+                        lambda version=None: [Path("cache-entry")])
+    monkeypatch.setattr(setup_jarvis, "_rea_prewarm",
+                        lambda: pytest.fail("a cached release needs no download"))
+    fixed, detail = setup_jarvis._heal_rea()
+    assert fixed is True and setup_jarvis.REA_VERSION in detail
+
+
+def test_heal_rea_prewarms_a_missing_release(monkeypatch):
+    monkeypatch.setattr(setup_jarvis.shutil, "which",
+                        lambda name: f"C:/node/{name}.exe")
+    monkeypatch.setattr(setup_jarvis, "_version_of", lambda *a, **k: "v24.20.0")
+    monkeypatch.setattr(setup_jarvis, "_rea_cache_dirs", lambda version=None: [])
+    monkeypatch.setattr(setup_jarvis, "_rea_prewarm",
+                        lambda: (True, "207 tools, protocol 2025-06-18"))
+    fixed, detail = setup_jarvis._heal_rea()
+    assert fixed is True and "207 tools" in detail
+
+# ── Laya AI wiring ───────────────────────────────────────────────────────────
+
+def test_laya_is_reachable_from_install_and_diagnose():
+    assert setup_jarvis._lookup_choice("a", "install-menu")[1] is setup_jarvis.install_laya
+    assert setup_jarvis._lookup_choice("y", "diag-menu")[1] is setup_jarvis.test_laya
+
+
+def test_laya_model_detection_names_the_real_missing_piece(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_jarvis, "ROOT", tmp_path)
+    path, missing = setup_jarvis._laya_model_dir()
+    assert path is None and "laya-multilingual/" in missing
+
+    model = tmp_path / "models" / "laya-multilingual"
+    (model / "tokenizer").mkdir(parents=True)
+    (model / "encoder").mkdir()
+    (model / "rl_agent_config.json").write_text("{}", encoding="utf-8")
+    path, missing = setup_jarvis._laya_model_dir()
+    assert path == model
+    assert "model.safetensors" in missing
+
+
+def test_install_laya_refuses_without_the_checkpoint(monkeypatch):
+    monkeypatch.setattr(setup_jarvis, "_laya_model_dir",
+                        lambda: (None, ["laya-multilingual/"]))
+    monkeypatch.setattr(setup_jarvis, "_confirm",
+                        lambda *a, **k: pytest.fail("nothing to confirm"))
+    assert setup_jarvis.install_laya() is False
+
+
+def test_heal_laya_skips_when_the_checkpoint_is_absent(monkeypatch):
+    monkeypatch.setattr(setup_jarvis, "_laya_model_dir",
+                        lambda: (None, ["laya-multilingual/"]))
+    fixed, detail = setup_jarvis._heal_laya()
+    assert fixed is None and "not found" in detail
+
+
+def test_heal_laya_installs_only_when_the_import_is_missing(monkeypatch):
+    monkeypatch.setattr(setup_jarvis, "_laya_model_dir",
+                        lambda: (Path("model"), []))
+    monkeypatch.setattr(setup_jarvis, "_laya_import_probe",
+                        lambda: (False, "No module named 'laya'"))
+    monkeypatch.setattr(setup_jarvis, "_install_laya_packages", lambda: True)
+    fixed, detail = setup_jarvis._heal_laya()
+    assert fixed is True and "installed" in detail
+
+
+def test_laya_pins_are_the_same_everywhere():
+    from app import installer
+    from core import laya_decision
+
+    req = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert setup_jarvis.LAYA_PACKAGE in req
+    assert any(row[2] == setup_jarvis.LAYA_PACKAGE
+               for row in installer._FEATURE_EXTRAS)
+    assert setup_jarvis.LAYA_REQUIRED_FILES == laya_decision.REQUIRED_FILES
+    assert setup_jarvis.LAYA_REQUIRED_DIRS == laya_decision.REQUIRED_DIRS

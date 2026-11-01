@@ -287,3 +287,65 @@ def test_an_empty_stream_leaves_no_empty_row(qapp, win, store):
 
     assert store.messages(panel.active_conversation_id()) == []
     assert _rows(panel) == []
+
+
+# ── streaming paint stays bounded (no O(n²) re-measure per tick) ─────────────
+
+UI_SRC = (ROOT / "ui.py").read_text(encoding="utf-8")
+
+
+def _method_code(class_name: str, fn_name: str) -> str:
+    """The CODE of one method (docstring and comments excluded) as a string."""
+    import ast
+
+    tree = ast.parse(UI_SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == fn_name:
+                    body = item.body
+                    if (body and isinstance(body[0], ast.Expr)
+                            and isinstance(body[0].value, ast.Constant)
+                            and isinstance(body[0].value.value, str)):
+                        body = body[1:]          # drop the docstring
+                    return "\n".join(ast.unparse(stmt) for stmt in body)
+    return ""
+
+
+def test_streaming_never_re_measures_the_whole_text_per_tick():
+    """The reveal used to measure every character of the reply on every tick
+    (and then measure it AGAIN inside ``_resize_naturally``) — O(n²) over a
+    message, which starved the reveal timer and made the text visibly stall
+    late in a reply. The measurement is now incremental and rate-bounded."""
+    render = _method_code("_ChatBubble", "_render_streaming")
+    assert render, "the streaming paint method must exist"
+    assert "_resize_naturally" not in render, (
+        "the streaming tick must not re-measure the whole message")
+    assert "_STREAM_MEASURE_MS" in render, (
+        "the wrapped-height pass must stay rate-bounded")
+
+    resize = _method_code("_ChatBubble", "_resize_streaming_size")
+    assert resize, "the streaming resize helper must exist"
+    assert "adjustSize" not in resize, (
+        "applying a measured size must not trigger a full heightForWidth layout")
+
+
+def test_streaming_a_long_reply_stays_complete(qapp, win, store):
+    panel = _open_panel(qapp, win)
+    text = "The reactor design uses superconducting magnets. " * 70
+
+    for i in range(0, len(text), 7):
+        win.stream_assistant_text(text[i:i + 7])
+    win.finish_assistant_stream()
+    _pump(qapp, 1.0)
+
+    rows = _rows(panel)
+    assert rows and rows[-1]._bubble._raw_text == text, (
+        "the incremental streaming paint must still show every character")
+
+
+def test_the_streaming_measurement_is_incremental():
+    """The width accumulation only ever advances forward over the text."""
+    assert "_stream_done_upto" in UI_SRC
+    assert "_stream_line_max" in UI_SRC
+    assert "_stream_tail_px" in UI_SRC

@@ -19,6 +19,7 @@ the assistant. Read-only apart from the runtime-state file it owns.
 
 from __future__ import annotations
 
+import ast
 import importlib.metadata as _md
 import importlib.util as _util
 import json
@@ -27,9 +28,12 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import Future as _Future
+from concurrent.futures import TimeoutError as _FutureTimeout
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -200,17 +204,99 @@ def _python_version(module: str) -> str:
     return ""
 
 
-def _binary_version(binary: str, args: tuple) -> str:
+def _binary_version(binary: str, args: tuple, timeout: float = 2.5) -> str:
     try:
         out = subprocess.run([binary, *args], capture_output=True, text=True,
-                             timeout=6, **_NO_WINDOW)
+                             timeout=timeout, **_NO_WINDOW)
         text = (out.stdout or out.stderr or "").strip().splitlines()
         return text[0][:80] if text else ""
     except Exception:
         return ""
 
 
+# ── bounded probes ────────────────────────────────────────────────────────────
+#
+# A diagnostics check that hangs must not hang the assistant, and work that was
+# never run must never be graded ONLINE. Both need a real timeout — and the
+# timeout has to leave the interpreter free to exit. stdlib ThreadPoolExecutor
+# workers are non-daemon and joined at shutdown, so one hung probe would keep
+# the whole process alive for its full duration; the work therefore runs on
+# daemon threads here and the concurrent.futures Future carries the result.
+
+def _future_call(fn, *args, **kwargs) -> _Future:
+    """Run ``fn(*args)`` on a daemon thread and return its Future."""
+    fut: _Future = _Future()
+
+    def _target() -> None:
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - delivered through the Future
+            fut.set_exception(exc)
+
+    threading.Thread(target=_target, daemon=True,
+                     name=f"diag-{getattr(fn, '__name__', 'probe')}").start()
+    return fut
+
+
+def _run_bounded(name: str, fn, timeout_s: float) -> Check:
+    """Run one check under a hard timeout.
+
+    On timeout the check is ERROR, never ONLINE: a probe that did not finish
+    proved nothing.
+    """
+    fut = _future_call(fn)
+    try:
+        return fut.result(timeout=max(0.001, float(timeout_s)))
+    except _FutureTimeout:
+        return Check(str(name), ERROR, f"check timed out after {timeout_s:g}s",
+                     "A hanging probe is a bug worth reporting.")
+    except Exception as exc:
+        return Check(str(name), ERROR, f"{type(exc).__name__}: {exc}",
+                     "The check itself failed — that is a bug worth reporting.")
+
+
+_PROBE_CACHE_TTL_S = 300.0
+#: One shared wall-clock deadline for the whole tool sweep: a single hanging
+#: binary cannot push tool discovery past this.
+_PROBE_BUDGET_S = 8.0
+#: Per-binary `--version` timeout.
+_BINARY_VERSION_TIMEOUT_S = 2.5
+
 _probe_cache: tuple[float, list[Tool]] | None = None
+_probe_cache_lock = threading.Lock()
+
+
+def invalidate_probe_cache() -> None:
+    """Drop the cached tool sweep (called after an install or a settings fix)."""
+    global _probe_cache
+    with _probe_cache_lock:
+        _probe_cache = None
+
+
+def _probe_one(t: Tool) -> Tool:
+    """Probe one tool and return an updated copy (never mutates the input)."""
+    try:
+        if t.kind == "python":
+            installed = _util.find_spec(t.module) is not None
+            if installed:
+                version = _python_version(t.module)
+                return replace(t, installed=True, version=version, health=ONLINE,
+                               detail=f"importable ({version or 'version unknown'})")
+            return replace(t, installed=False, health=OFFLINE,
+                           detail="package not installed")
+        path = shutil.which(t.binary) or ""
+        if not path:
+            return replace(t, path="", installed=False, health=OFFLINE,
+                           detail="not on PATH")
+        version = _binary_version(t.binary, t.version_args,
+                                  timeout=_BINARY_VERSION_TIMEOUT_S)
+        # A binary that exists but cannot report a version has not been proven
+        # usable.
+        return replace(t, path=path, installed=True, version=version,
+                       health=ONLINE if version else DEGRADED,
+                       detail=version or "found on PATH but --version gave nothing")
+    except Exception as exc:
+        return replace(t, health=ERROR, detail=f"{type(exc).__name__}: {exc}")
 
 
 def probe_tools(refresh: bool = False) -> list[Tool]:
@@ -218,41 +304,41 @@ def probe_tools(refresh: bool = False) -> list[Tool]:
 
     `health` is only ONLINE when the thing was actually located; a binary that
     is on PATH but fails to run is reported as ERROR with the output, not as
-    available.
+    available. Every probe runs concurrently under one shared deadline, and a
+    probe that misses it is DEGRADED — its usability was never proven.
     """
     global _probe_cache
     now = time.time()
-    if not refresh and _probe_cache and (now - _probe_cache[0]) < 300:
-        return _probe_cache[1]
+    if not refresh:
+        with _probe_cache_lock:
+            cached = _probe_cache
+        if cached and (now - cached[0]) < _PROBE_CACHE_TTL_S:
+            return cached[1]
+
     tools = _registry()
+    deadline = time.monotonic() + _PROBE_BUDGET_S
+    futures = {t.key: _future_call(_probe_one, t) for t in tools}
+    probed: list[Tool] = []
     for t in tools:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            probed.append(replace(
+                t, health=DEGRADED,
+                detail="probe skipped — tool-discovery budget exceeded"))
+            continue
         try:
-            if t.kind == "python":
-                t.installed = _util.find_spec(t.module) is not None
-                if t.installed:
-                    t.version = _python_version(t.module)
-                    t.health = ONLINE
-                    t.detail = f"importable ({t.version or 'version unknown'})"
-                else:
-                    t.health = OFFLINE
-                    t.detail = "package not installed"
-            else:
-                t.path = shutil.which(t.binary) or ""
-                t.installed = bool(t.path)
-                if t.installed:
-                    t.version = _binary_version(t.binary, t.version_args)
-                    # A binary that exists but cannot report a version has not
-                    # been proven usable.
-                    t.health = ONLINE if t.version else DEGRADED
-                    t.detail = t.version or "found on PATH but --version gave nothing"
-                else:
-                    t.health = OFFLINE
-                    t.detail = "not on PATH"
+            probed.append(futures[t.key].result(timeout=remaining))
+        except _FutureTimeout:
+            probed.append(replace(
+                t, health=DEGRADED,
+                detail="probe timed out — usability not proven"))
         except Exception as exc:
-            t.health = ERROR
-            t.detail = f"{type(exc).__name__}: {exc}"
-    _probe_cache = (now, tools)
-    return tools
+            probed.append(replace(t, health=ERROR,
+                                  detail=f"{type(exc).__name__}: {exc}"))
+
+    with _probe_cache_lock:
+        _probe_cache = (now, probed)
+    return probed
 
 
 def tool_report(refresh: bool = False) -> str:
@@ -374,13 +460,39 @@ def _check_ai() -> Check:
                  "pip install google-genai, then add an API key in Settings → AI.")
 
 
-def _check_memory() -> Check:
+def _brain_db_path() -> Path:
+    """Where the brain store lives, without opening (and so creating) it."""
     try:
-        from memory.manager import get_brain_memory
-        mem = get_brain_memory()
-        counts = mem.db.count()
+        from memory.database import DEFAULT_DB_PATH
+        env = os.environ.get("JARVIS_BRAIN_DB", "").strip()
+        return Path(env) if env else Path(DEFAULT_DB_PATH)
+    except Exception:
+        return BASE_DIR / "data" / "brain_memory.db"
+
+
+def _check_memory() -> Check:
+    """Read the brain store. Diagnostics never creates it (read-only contract).
+
+    Opening BrainDatabase runs the schema migration, i.e. a status check would
+    silently create data/brain_memory.db and its WAL sidecars. A store that has
+    never been created therefore reports the truth — zero memories — without
+    writing anything, and an existing one is opened and closed around the count.
+    """
+    path = _brain_db_path()
+    if not path.exists():
+        return Check("memory", ONLINE,
+                     "no memories recorded yet (the brain store has not been created)",
+                     "", {"total": 0})
+    try:
+        from memory.database import BrainDatabase
+        db = BrainDatabase(path=path)
+        try:
+            enabled = bool(db.kv_get("memory_enabled", True))
+            counts = db.count()
+        finally:
+            db.close()
         total = sum(counts.values())
-        if not mem.is_enabled():
+        if not enabled:
             return Check("memory", DISABLED, "brain memory is switched off in Settings",
                          "Enable it in Settings → MEMORY if you want recall.")
         return Check("memory", ONLINE, f"{total} active memories across {len(counts)} areas",
@@ -508,39 +620,133 @@ def _check_tools() -> Check:
                  "", {"missing": [t.name for t in missing]})
 
 
-def _check_plugins() -> Check:
-    """Plugin scan. discover_plugins(plugins_dir, core_tool_names, logger) never
-    raises for a bad plugin, so a failure here means the loader itself changed."""
+def _core_tool_names() -> set[str]:
+    """Names of the core tools ``main.py`` declares, read from its AST.
+
+    The startup scan passes this set so a plugin cannot shadow a built-in tool.
+    Importing main.py would build the whole UI/voice stack just to answer
+    "would a plugin name collide?"; parsing the declaration literals is
+    read-only and cheap. An empty set only means the collision rule cannot
+    fire — it never turns a plugin result into a pass.
+    """
     try:
-        from app.plugin_loader import discover_plugins
+        tree = ast.parse((BASE_DIR / "main.py").read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    names: set[str] = set()
+
+    def _add_decl(node) -> None:
+        if not isinstance(node, ast.Dict):
+            return
+        for key, value in zip(node.keys, node.values):
+            if (isinstance(key, ast.Constant) and key.value == "name"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)):
+                names.add(value.value)
+
+    def _add_list(node) -> None:
+        if isinstance(node, ast.List):
+            for element in node.elts:
+                _add_decl(element)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "TOOL_DECLARATIONS"
+                   for t in node.targets):
+                _add_list(node.value)
+        elif isinstance(node, ast.AugAssign):
+            if (isinstance(node.target, ast.Name)
+                    and node.target.id == "TOOL_DECLARATIONS"
+                    and isinstance(node.op, ast.Add)):
+                _add_list(node.value)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            if (isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "TOOL_DECLARATIONS"):
+                if call.func.attr == "append":
+                    for arg in call.args:
+                        _add_decl(arg)
+                elif call.func.attr == "extend":
+                    for arg in call.args:
+                        _add_list(arg)
+    return names
+
+
+def _check_plugins() -> Check:
+    """Plugin scan over the registry's real records.
+
+    The scan runs exactly like the startup one (same collision set, same
+    built-in folder) and reports the loader's own truth: how many records were
+    found, how many are valid/enabled, and the error on any rejected file. A
+    rejected plugin is DEGRADED — it exists and is not working. DISABLED is
+    only for a machine with no plugin files at all.
+    """
+    try:
+        from app.plugin_loader import discover_plugins, get_plugin_enabled
     except ImportError:
         return Check("plugins", DISABLED, "plugin loader not present in this build", "")
     try:
-        reg = discover_plugins(BASE_DIR / "plugins", set(), logger=lambda _m: None)
+        registry = discover_plugins(
+            BASE_DIR / "plugins", _core_tool_names(), logger=lambda _m: None,
+            extra_dirs=[BASE_DIR / "plugins_builtin"])
+        records = registry.records()
     except Exception as exc:
-        return Check("plugins", ERROR, f"plugin scan failed: {type(exc).__name__}: {exc}",
+        return Check("plugins", ERROR,
+                     f"plugin scan failed: {type(exc).__name__}: {exc}",
                      "The plugin loader could not run; plugins are not loaded at all.")
-    try:
-        records = list(getattr(reg, "all_records", None) or getattr(reg, "plugins", None)
-                       or getattr(reg, "valid", None) or [])
-        enabled = sum(1 for r in records
-                      if bool(getattr(r, "enabled", True)))
-    except Exception:
-        records, enabled = [], 0
     if not records:
         return Check("plugins", DISABLED, "no plugins installed", "")
-    return Check("plugins", ONLINE, f"{len(records)} plugin(s) discovered, {enabled} enabled",
-                 "", {"count": len(records), "enabled": enabled})
+
+    valid = [r for r in records if bool(getattr(r, "valid", False))]
+    rejected = [r for r in records if not bool(getattr(r, "valid", False))]
+    enabled = 0
+    enabled_known = True
+    for record in valid:
+        try:
+            enabled += 1 if get_plugin_enabled(record.name) else 0
+        except Exception:
+            enabled_known = False
+            break
+
+    stats = f"{len(valid)} valid" + (f", {enabled} enabled" if enabled_known else "")
+    evidence = {"count": len(records), "valid": len(valid),
+                "enabled": enabled if enabled_known else None,
+                "rejected": [r.name for r in rejected]}
+    if rejected:
+        shown = "; ".join(f"{r.name} ({r.file or 'unknown file'}): "
+                          f"{r.error or 'rejected'}" for r in rejected[:3])
+        more = f"; +{len(rejected) - 3} more" if len(rejected) > 3 else ""
+        return Check("plugins", DEGRADED,
+                     f"{len(records)} plugin(s) discovered: {stats}, "
+                     f"{len(rejected)} rejected — {shown}{more}",
+                     "Fix or remove the rejected plugin file listed above.", evidence)
+    return Check("plugins", ONLINE, f"{len(records)} plugin(s) discovered, {stats}",
+                 "", evidence)
 
 
 def _check_filesystem() -> Check:
+    """Writability + free space, without writing anything permanent.
+
+    A status check must not create folders or files just to prove it can: it
+    probes with os.access and a TempFile that is removed by the `with` block,
+    and reports the real errno when the probe fails.
+    """
+    data_dir = BASE_DIR / "data"
     try:
         import psutil
-        probe = BASE_DIR / "data"
-        probe.mkdir(parents=True, exist_ok=True)
-        test = probe / ".diag_write_test"
-        test.write_text("ok", encoding="utf-8")
-        test.unlink()
+        if not os.access(str(data_dir), os.W_OK):
+            return Check("filesystem", ERROR,
+                         f"data/ is not writable (os.access W_OK is False): {data_dir}",
+                         "Fix the permissions on the project data/ folder.")
+        try:
+            with tempfile.TemporaryFile(dir=str(data_dir)) as probe:
+                probe.write(b"ok")
+        except OSError as exc:
+            return Check("filesystem", ERROR,
+                         f"cannot create a temporary file in data/ — "
+                         f"{type(exc).__name__}: {exc} (errno={exc.errno})",
+                         "Check that the project data/ folder is writable.")
         du = psutil.disk_usage(str(BASE_DIR))
         free_gb = du.free / (1024 ** 3)
         if free_gb < 2:
@@ -553,10 +759,20 @@ def _check_filesystem() -> Check:
                      "Check that the project data/ folder is writable.")
 
 
+_cpu_primed = False
+
+
 def _check_system() -> Check:
+    """CPU/RAM/disk telemetry — reads the primed CPU counter, never blocks."""
+    global _cpu_primed
     try:
         import psutil
-        cpu = psutil.cpu_percent(interval=0.25)
+        if not _cpu_primed:
+            # cpu_percent(interval=None) needs one prior call to diff against;
+            # the first reading is meaningless, so prime it and say so.
+            psutil.cpu_percent(interval=None)
+            _cpu_primed = True
+        cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory()
         detail = (f"CPU {cpu:.0f}% · RAM {ram.percent:.0f}% "
                   f"({ram.available / (1024 ** 3):.1f} GB free)")
@@ -750,6 +966,11 @@ def check(name: str, **kw) -> Check:
     if fn is None:
         return Check(str(name or "?"), ERROR,
                      f"no such check (have: {', '.join(sorted(CHECKS))})", "")
+    if key == "camera" and "probe_camera" in kw:
+        # The camera check spells its flag `probe`; a caller asking through the
+        # generic API must not get a TypeError reported as a failed check.
+        kw = {**kw}
+        kw["probe"] = kw.pop("probe_camera")
     try:
         return fn(**kw)
     except Exception as exc:
@@ -757,18 +978,61 @@ def check(name: str, **kw) -> Check:
                      "The check itself failed — that is a bug worth reporting.")
 
 
-def check_all(probe_camera: bool = False) -> list[Check]:
+# ── verdict: the one machine-readable answer ──────────────────────────────────
+
+def verdict(checks) -> str:
+    """Overall state of a set of checks: ``OK`` / ``ATTENTION`` / ``FAILED``.
+
+    FAILED is reserved for a check that could not run or threw. A capability
+    the user deliberately switched off (DISABLED) is not a failure, and a
+    missing optional tool is ATTENTION rather than a broken install.
+    """
+    states = {str(getattr(c, "state", "") or "") for c in checks}
+    if ERROR in states:
+        return "FAILED"
+    if states & {OFFLINE, DEGRADED}:
+        return "ATTENTION"
+    return "OK"
+
+
+def verdict_line(checks) -> str:
+    """The final machine line the tool-result classifier can trust."""
+    return f"VERDICT: {verdict(checks).lower()}"
+
+
+#: A check is only started when at least this much budget remains; starting a
+#: probe with a few milliseconds left would only manufacture a fake timeout.
+_MIN_CHECK_S = 0.25
+
+
+def check_all(probe_camera: bool = False, budget_s: float = 20.0,
+              per_check_s: float = 6.0) -> list[Check]:
+    """Run every check under a total budget and a per-check timeout.
+
+    A check that is not run because the budget ran out is DEGRADED, never
+    ONLINE: "not measured" and "measured fine" are different answers.
+    """
     out: list[Check] = []
+    started = time.monotonic()
     for name in CHECKS:
+        remaining = float(budget_s) - (time.monotonic() - started)
+        if remaining < _MIN_CHECK_S:
+            out.append(Check(name, DEGRADED,
+                             "not run — diagnostics budget exceeded",
+                             "Re-run when the machine is idle."))
+            continue
+        timeout_s = min(float(per_check_s), remaining)
         if name == "camera":
-            out.append(_check_camera(probe=probe_camera))
+            c = _run_bounded(name, lambda: _check_camera(probe=probe_camera),
+                             timeout_s)
         else:
-            out.append(check(name))
+            c = _run_bounded(name, lambda n=name: check(n), timeout_s)
+        out.append(c)
     return out
 
 
 def report(name: str = "all", probe_camera: bool = False) -> str:
-    """Human/voice readable health report (spec §51)."""
+    """Human/voice readable health report (spec §51), ending in a VERDICT line."""
     if str(name or "all").lower() in ("all", "*", ""):
         checks = check_all(probe_camera=probe_camera)
         head = "DIAGNOSTICS  //  " + summary_line(checks)
@@ -781,12 +1045,13 @@ def report(name: str = "all", probe_camera: bool = False) -> str:
         if not worst:
             body.append("Nothing is failing. Missing optional tools only disable "
                         "their own capability.")
+        body.append(verdict_line(checks))
         return "\n".join(body)
     c = check(name, probe_camera=probe_camera) if name == "camera" else check(name)
     line = f"{c.name}: {c.state} — {c.detail}"
     if c.fix and c.state != ONLINE:
         line += f"\nfix: {c.fix}"
-    return line
+    return line + "\n" + verdict_line([c])
 
 
 def summary_line(checks: list[Check]) -> str:
@@ -805,8 +1070,19 @@ _RANGES = {
     "chat_font_scale": (50, 400), "equalizer_sensitivity": (0.0, 5.0),
     "reactor_animation_speed": (0.1, 5.0), "voice_volume": (0.0, 3.0),
     "voice_speed": (0.25, 4.0), "voice_pitch": (-24.0, 24.0),
-    "world_monitor_refresh": (5, 3600), "camera_index": (0, 32),
+    "camera_index": (0, 32),
 }
+
+#: Keys that accept a documented non-numeric sentinel. ``camera_index="auto"``
+#: (vision/config.py) means "pick a working device at open time" and is a legal
+#: setting, not a corrupted number.
+_SENTINELS = {"camera_index": ("auto", "")}
+
+
+def is_sentinel(key: str, value) -> bool:
+    """True when ``value`` is the documented sentinel for ``key``."""
+    allowed = _SENTINELS.get(key)
+    return bool(allowed) and isinstance(value, str) and value.strip().lower() in allowed
 
 
 def validate_settings(data: dict) -> list[str]:
@@ -820,6 +1096,8 @@ def validate_settings(data: dict) -> list[str]:
         return ["configuration is not an object"]
     for key, (lo, hi) in _RANGES.items():
         if key not in data or data.get(key) is None:
+            continue
+        if is_sentinel(key, data.get(key)):
             continue
         try:
             val = float(data[key])
@@ -856,20 +1134,37 @@ def validate_settings(data: dict) -> list[str]:
 # ── runtime state / safe mode / correlation ids (spec §53-§56) ───────────────
 
 _state_lock = threading.RLock()
+_STATE_DEFAULTS = {
+    "crash_count": 0, "restart_count": 0, "last_crash": 0.0,
+    "last_reason": "", "safe_mode": False, "correlation_seq": 0,
+}
+#: Last state this process wrote. Used only to keep counters monotonic when a
+#: disk write fails, so a failed write can never hand out a repeated id or
+#: forget a crash.
+_last_state: dict | None = None
+
+
+def _state_snapshot_locked() -> dict:
+    """Read the state file and apply defaults. Caller must hold _state_lock."""
+    st = _read_json(STATE_PATH)
+    if not isinstance(st, dict):
+        st = {}
+    for key, default in _STATE_DEFAULTS.items():
+        st.setdefault(key, default)
+    if _last_state:
+        for key in ("correlation_seq", "crash_count", "restart_count"):
+            try:
+                if int(_last_state.get(key, 0) or 0) > int(st.get(key, 0) or 0):
+                    st[key] = _last_state[key]
+            except Exception:
+                continue
+    return st
 
 
 def runtime_state() -> dict:
+    """A read-only snapshot of the persisted runtime state."""
     with _state_lock:
-        st = _read_json(STATE_PATH)
-    if not isinstance(st, dict):
-        st = {}
-    st.setdefault("crash_count", 0)
-    st.setdefault("restart_count", 0)
-    st.setdefault("last_crash", 0.0)
-    st.setdefault("last_reason", "")
-    st.setdefault("safe_mode", False)
-    st.setdefault("correlation_seq", 0)
-    return st
+        return _state_snapshot_locked()
 
 
 def _write_state(st: dict) -> None:
@@ -883,36 +1178,74 @@ def _write_state(st: dict) -> None:
             pass
 
 
+def update_state(mutate) -> dict:
+    """Atomic read-modify-write of the runtime state under ``_state_lock``.
+
+    Writers used to read the file, change their copy, then write it back while
+    holding the lock only for each half — so concurrent crashes lost increments
+    and concurrent correlation ids repeated. ``mutate`` receives the live dict
+    (and may return a replacement); the result is written before the lock is
+    released, so no other writer can interleave between the read and the write.
+    """
+    global _last_state
+    with _state_lock:
+        st = _state_snapshot_locked()
+        replacement = mutate(st)
+        if isinstance(replacement, dict):
+            st = replacement
+        _write_state(st)
+        _last_state = dict(st)
+        return st
+
+
 def note_startup_ok() -> dict:
     """A clean start clears the crash streak (spec §53)."""
-    st = runtime_state()
-    st["restart_count"] = int(st.get("restart_count", 0) or 0) + 1
-    st["crash_count"] = 0
-    st["last_reason"] = ""
-    _write_state(st)
-    return st
-
-
-def note_crash(reason: str = "", safe_mode_threshold: int = 3,
-               window_seconds: float = 600.0) -> bool:
-    """Record a crash. Returns True when this put JARVIS into safe mode.
-
-    Three crashes inside ten minutes is a loop, not bad luck — safe mode stops
-    the background work that could be causing it.
-    """
-    st = runtime_state()
-    now = time.time()
-    last = float(st.get("last_crash", 0) or 0)
-    if last and (now - last) > window_seconds:
+    def _mutate(st: dict) -> dict:
+        st["restart_count"] = int(st.get("restart_count", 0) or 0) + 1
         st["crash_count"] = 0
-    st["crash_count"] = int(st.get("crash_count", 0) or 0) + 1
-    st["last_crash"] = now
-    st["last_reason"] = str(reason or "")[:300]
+        st["last_reason"] = ""
+        return st
+    return update_state(_mutate)
+
+
+def note_crash(reason: str = "", kind: str = "crash", safe_mode_threshold: int = 3,
+               window_seconds: float = 600.0) -> bool:
+    """Record a failure event. Returns True when this put JARVIS into safe mode.
+
+    Three *crashes* inside ten minutes is a loop, not bad luck — safe mode stops
+    the background work that could be causing it. Only ``kind="crash"`` counts
+    towards that streak and can trip safe mode. Every other kind (for example a
+    dropped Live connection) is still recorded honestly — last kind/reason and a
+    per-kind counter — but never enters safe mode: a network blip is not a crash
+    loop, and treating it as one used to disable JARVIS after three hiccups.
+    """
     entered = False
-    if int(st["crash_count"]) >= int(safe_mode_threshold):
-        st["safe_mode"] = True
-        entered = True
-    _write_state(st)
+    event_kind = str(kind or "crash").strip().lower() or "crash"
+
+    def _mutate(st: dict) -> dict:
+        nonlocal entered
+        counts = st.get("event_counts")
+        if not isinstance(counts, dict):
+            counts = {}
+        counts[event_kind] = int(counts.get(event_kind, 0) or 0) + 1
+        st["event_counts"] = counts
+        st["last_event_kind"] = event_kind
+        if event_kind != "crash":
+            st["last_event_reason"] = str(reason or "")[:300]
+            return st
+        now = time.time()
+        last = float(st.get("last_crash", 0) or 0)
+        if last and (now - last) > float(window_seconds):
+            st["crash_count"] = 0
+        st["crash_count"] = int(st.get("crash_count", 0) or 0) + 1
+        st["last_crash"] = now
+        st["last_reason"] = str(reason or "")[:300]
+        if int(st["crash_count"]) >= int(safe_mode_threshold):
+            st["safe_mode"] = True
+            entered = True
+        return st
+
+    update_state(_mutate)
     return entered
 
 
@@ -921,14 +1254,14 @@ def safe_mode() -> bool:
 
 
 def set_safe_mode(enabled: bool, reason: str = "") -> dict:
-    st = runtime_state()
-    st["safe_mode"] = bool(enabled)
-    if reason:
-        st["last_reason"] = str(reason)[:300]
-    if not enabled:
-        st["crash_count"] = 0
-    _write_state(st)
-    return st
+    def _mutate(st: dict) -> dict:
+        st["safe_mode"] = bool(enabled)
+        if reason:
+            st["last_reason"] = str(reason)[:300]
+        if not enabled:
+            st["crash_count"] = 0
+        return st
+    return update_state(_mutate)
 
 
 def clear_safe_mode() -> str:
@@ -939,10 +1272,11 @@ def clear_safe_mode() -> str:
 
 def new_correlation(prefix: str = "TASK") -> str:
     """TASK-2026-000001 style id (spec §56), persisted so ids never repeat."""
-    st = runtime_state()
-    seq = int(st.get("correlation_seq", 0) or 0) + 1
-    st["correlation_seq"] = seq
-    _write_state(st)
+    def _mutate(st: dict) -> dict:
+        st["correlation_seq"] = int(st.get("correlation_seq", 0) or 0) + 1
+        return st
+    st = update_state(_mutate)
+    seq = int(st.get("correlation_seq", 0) or 0)
     return f"{str(prefix or 'TASK').upper()}-{time.strftime('%Y')}-{seq:06d}"
 
 
@@ -965,12 +1299,53 @@ def what_changed() -> str:
         return f"Could not compare configurations: {exc}"
 
 
+def _verdict_text(text: str, value: str) -> str:
+    """Append the machine line unless the text already ends with one.
+
+    Never invents a success: every caller passes the verdict its own measured
+    data supports, and the fallback for a path that cannot prove itself is
+    ``failed``.
+    """
+    body = str(text or "").rstrip()
+    lines = body.splitlines()
+    if lines and lines[-1].startswith("VERDICT: "):
+        return body
+    return f"{body}\nVERDICT: {str(value).lower()}"
+
+
+def _tools_verdict(tools: list[Tool]) -> str:
+    """Verdict from a completed tool sweep (missing tool = ATTENTION)."""
+    return verdict([Check(t.name, t.health if t.installed else OFFLINE)
+                    for t in tools])
+
+
+def _ai_verdict() -> str:
+    try:
+        return verdict([_check_ai()])
+    except Exception:
+        return "FAILED"
+
+
+def _install_verdict() -> str:
+    """Verdict after an install: what requirements.txt still cannot import."""
+    try:
+        from core import dependency_ops
+        summary = dependency_ops.sync_requirements(allow_install=False)
+    except Exception:
+        return "FAILED"
+    if summary.get("error"):
+        return "FAILED"
+    return "ATTENTION" if summary.get("failed") else "OK"
+
+
 def handle_diagnostics(args: Mapping | None = None) -> str:
     """Single entry point for the ``diagnostics`` tool. Never raises.
 
     Modes mirror the master spec's commands: run diagnostics, check one
     subsystem, list tools, fix settings, what changed, restore a backup, and
-    safe mode. Every mode reports only what it actually did.
+    safe mode. Every mode reports only what it actually did and ends with a
+    ``VERDICT: ok|attention|failed`` line, so an outcome can be read from the
+    tool's own verdict instead of guessing from its prose.
     """
     a = dict(args or {})
     mode = str(a.get("mode") or "all").strip().lower()
@@ -978,14 +1353,20 @@ def handle_diagnostics(args: Mapping | None = None) -> str:
     probe = bool(a.get("probe_camera", False))
     try:
         if mode in ("all", "full", "run", "diagnostics"):
-            return report("all", probe_camera=probe)
+            return _verdict_text(report("all", probe_camera=probe), "FAILED")
         if mode in ("check", "health", "status"):
-            return report(target or "all", probe_camera=probe)
+            return _verdict_text(report(target or "all", probe_camera=probe),
+                                 "FAILED")
         if mode in ("tools", "tool", "inventory", "installed"):
-            return tool_report(refresh=True)
+            tools = probe_tools(refresh=True)
+            return _verdict_text(tool_report(), _tools_verdict(tools))
         if mode in ("settings", "fix_settings", "fix", "repair"):
             from app import config_guard as cg
-            return cg.report_repair(cg.repair(apply=True))
+            result = cg.repair(apply=True)
+            invalidate_probe_cache()
+            health = str(result.get("health") or "").upper()
+            return _verdict_text(cg.report_repair(result),
+                                 "OK" if health == "OK" else "ATTENTION")
         if mode in ("restore", "rollback", "last_good"):
             from app import config_guard as cg
             if target:
@@ -1004,7 +1385,7 @@ def handle_diagnostics(args: Mapping | None = None) -> str:
             return "BACKUPS\n" + "\n".join(
                 f"- {e['name']} ({e['size']} bytes)" for e in items[:10])
         if mode in ("safe_mode", "safe"):
-            return report("safe_mode")
+            return _verdict_text(report("safe_mode"), "FAILED")
         if mode in ("models", "model", "roles", "ai_stack", "aistack"):
             from app import model_router
             lines = ["AI STACK"]
@@ -1016,32 +1397,38 @@ def handle_diagnostics(args: Mapping | None = None) -> str:
                 pass
             lines.append("MODEL ROUTER")
             lines.append(model_router.describe_report(model_router.report()))
-            return "\n".join(lines)
+            return _verdict_text("\n".join(lines), _ai_verdict())
         if mode in ("clear_safe_mode", "clear_safe", "resume"):
             return clear_safe_mode()
         if mode in ("install", "add_dependency", "fix_dependency"):
             # Blocking (runs pip) — the dispatcher already executes diagnostics
             # off the event loop, so this never stalls audio or the UI.
             from core import dependency_ops
-            return dependency_ops.handle_install(a)
+            text = dependency_ops.handle_install(a)
+            invalidate_probe_cache()
+            return _verdict_text(text, _install_verdict())
         if mode in ("optimize", "maintain", "maintenance", "cleanup", "clean"):
             # Housekeeping only — rotates logs, expires the cache and drops
             # regenerable bytecode. It never touches config, memory, documents,
             # models or voices (see core/maintenance.py).
             from core import maintenance
-            return maintenance.format_report(maintenance.run_maintenance())
-        return (f"Unknown diagnostics mode '{mode}'. Use all, check, tools, "
-                "settings, models, restore, what_changed, backups, safe_mode, "
-                "clear_safe_mode, optimize or install.")
+            return _verdict_text(
+                maintenance.format_report(maintenance.run_maintenance()), "OK")
+        return _verdict_text(
+            f"Unknown diagnostics mode '{mode}'. Use all, check, tools, "
+            "settings, models, restore, what_changed, backups, safe_mode, "
+            "clear_safe_mode, optimize or install.", "FAILED")
     except Exception as exc:
-        return f"Diagnostics failed: {type(exc).__name__}: {exc}"
+        return _verdict_text(
+            f"Diagnostics failed: {type(exc).__name__}: {exc}", "FAILED")
 
 
 __all__ = [
     "handle_diagnostics", "what_changed",
     "Tool", "Check", "STATES", "ONLINE", "DEGRADED", "OFFLINE", "ERROR", "DISABLED",
     "config", "features", "probe_tools", "tool_report", "missing_for",
+    "invalidate_probe_cache", "verdict", "verdict_line",
     "check", "check_all", "report", "summary_line", "validate_settings",
-    "runtime_state", "note_startup_ok", "note_crash", "safe_mode",
+    "runtime_state", "update_state", "note_startup_ok", "note_crash", "safe_mode",
     "set_safe_mode", "clear_safe_mode", "new_correlation", "STATE_PATH",
 ]

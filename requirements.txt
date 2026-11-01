@@ -48,6 +48,14 @@ playwright
 pywinauto
 pyautogui
 
+# ── Local Decision AI (Laya) ──────────────────────────────────────────────────
+# The 322M System-1 classifier behind Settings ▸ Laya AI. It is advisory: when
+# the package or the checkpoint is absent, routing falls back to the general AI.
+# The pin matches core/laya_decision.py and setup_jarvis.py; transformers is
+# laya's own >=4.48.0 requirement, kept explicit so a partial install is visible.
+laya==0.4.14
+transformers>=4.48.0
+
 # ── Data & Documents ──────────────────────────────────────────────────────────
 numpy
 python-pptx
@@ -68,3 +76,14 @@ qrcode[pil]
 pywin32; sys_platform == "win32"
 wmi; sys_platform == "win32"
 win10toast; sys_platform == "win32"
+
+# ── Native (Rust) extension — OPTIONAL, build tooling only ────────────────────
+# The app runs FULLY without Rust: core/native.py falls back to numpy for the
+# PCM hot paths. To BUILD the jarvis_native extension for this venv, use
+#   setup_jarvis.py  →  [2] Install & update  →  Native Rust backend
+#   (or: python tools/build_native.py        — release build, no pip needed)
+# The wizard detects/installs the Rust prerequisites itself:
+#   rustup (winget Rustlang.Rustup) + a linker (MSVC Build Tools or the GNU
+#   toolchain) + binutils dlltool for GNU (winget WinLibs). Only needed to
+#   compile; a prebuilt release ships the .pyd ready to use.
+# maturin is only needed for installable wheels:  pip install "maturin>=1.16"

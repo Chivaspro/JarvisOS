@@ -266,7 +266,6 @@ def _root_candidates(main: QWidget) -> list[tuple[str, QWidget]]:
         "3D Display": "3D Display",
         "Webview": "Webview",
         "Web Task": "Web Task",
-        "World Monitor": "World Monitor",
         "Mind": "Mind",
         "Tools Deck": "Tools Deck",
     }
@@ -282,7 +281,6 @@ def _root_candidates(main: QWidget) -> list[tuple[str, QWidget]]:
         ("Activity Log", "_activity_panel"),
         ("Webview", "_webview_panel"),
         ("Web Task", "_web_task_panel"),
-        ("World Monitor", "_world_monitor_panel"),
         ("Mind", "_memory_panel"),
         ("Tools Deck", "_tools_panel"),
     ):

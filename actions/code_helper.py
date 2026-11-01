@@ -6,6 +6,15 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+try:
+    from actions.coding_events import emit_coding, unified_diff_text
+except Exception:  # pragma: no cover - the progress bridge must never block an edit
+    def emit_coding(player, kind, **payload):
+        pass
+
+    def unified_diff_text(old, new, *, path='', max_lines=160):
+        return ''
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -293,15 +302,19 @@ def _build(description, language, output_path, args, timeout, speak=None, player
 
     if player:
         player.write_log("[Code] Build started...")
+    emit_coding(player, 'stage', stage='Writing the initial code…')
 
     lang = language or "python"
 
     try:
         code, path = _write(description, lang, output_path, player)
         print(f"[Code] ✅ Written: {path}")
+        emit_coding(player, 'file', path=str(path), code=code,
+                    language=lang, index=1, total=1)
     except Exception as e:
         msg = f"Could not write initial code: {e}"
         if speak: speak(msg)
+        emit_coding(player, 'failed', summary=msg)
         return msg
 
     last_outcome = _RunOutcome("", started=False)
@@ -309,8 +322,12 @@ def _build(description, language, output_path, args, timeout, speak=None, player
         print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
         if player:
             player.write_log(f"[Code] Attempt {attempt}...")
+        emit_coding(player, 'stage',
+                    stage=f'Running attempt {attempt}/{MAX_BUILD_ATTEMPTS}…')
 
         last_outcome = _run_file(path, args, timeout)
+        emit_coding(player, 'run', attempt=attempt, total=MAX_BUILD_ATTEMPTS,
+                    output=(last_outcome.output or '')[:400])
 
         if not _has_error(last_outcome):
             if last_outcome.timed_out:
@@ -326,19 +343,26 @@ def _build(description, language, output_path, args, timeout, speak=None, player
                     f"Saved to {path}."
                 )
             if speak: speak(msg)
+            emit_coding(player, 'done', path=str(path), success=True, summary=msg)
             body = f"\n\nOutput:\n{last_outcome.output}" if last_outcome.output.strip() else ""
             return f"{msg}{body}"
 
         print(f"[Code] ⚠️ Error on attempt {attempt}, fixing...")
         if player:
             player.write_log(f"[Code] Fixing (attempt {attempt})...")
+        emit_coding(player, 'stage', stage=f'Fixing the code (attempt {attempt})…')
 
         try:
-            code = _fix_code(code, last_outcome.output, description)
-            _save_file(path, code)
+            fixed_code = _fix_code(code, last_outcome.output, description)
+            _save_file(path, fixed_code)
+            emit_coding(player, 'diff', path=str(path),
+                        diff=unified_diff_text(code, fixed_code, path=str(path)))
+            code = fixed_code
         except Exception as e:
             msg = f"Could not fix code on attempt {attempt}: {e}"
             if speak: speak(msg)
+            emit_coding(player, 'failed', path=str(path), success=False,
+                        summary=msg)
             return msg
 
     msg = (
@@ -346,6 +370,7 @@ def _build(description, language, output_path, args, timeout, speak=None, player
         f"The last error was: {last_outcome.output[:200]}"
     )
     if speak: speak(msg)
+    emit_coding(player, 'failed', path=str(path), success=False, summary=msg)
     return f"{msg}\n\nLast code saved to: {path}"
 
 def _write_action(description, language, output_path, player) -> str:
@@ -353,12 +378,19 @@ def _write_action(description, language, output_path, player) -> str:
         return "Please describe what you want me to write, sir."
     if player:
         player.write_log("[Code] Writing code...")
+    emit_coding(player, 'stage', stage='Writing the code…')
     try:
         code, path = _write(description, language, output_path, player)
         print(f"[Code] ✅ Written: {path}")
-        return f"Code written. Saved to: {path}\n\nPreview:\n{_preview(code)}"
+        emit_coding(player, 'file', path=str(path), code=code,
+                    language=language or 'python', index=1, total=1)
+        msg = f"Code written. Saved to: {path}"
+        emit_coding(player, 'done', path=str(path), success=True, summary=msg)
+        return f"{msg}\n\nPreview:\n{_preview(code)}"
     except Exception as e:
-        return f"Could not generate code: {e}"
+        msg = f"Could not generate code: {e}"
+        emit_coding(player, 'failed', summary=msg)
+        return msg
 
 
 def _edit_action(file_path, instruction, player) -> str:
@@ -373,6 +405,7 @@ def _edit_action(file_path, instruction, player) -> str:
 
     if player:
         player.write_log("[Code] Editing file...")
+    emit_coding(player, 'stage', stage='Editing the file…')
 
     model  = _get_gemini()
     prompt = f"""You are an expert code editor.
@@ -390,10 +423,17 @@ Updated code:"""
         response = model.generate_content(prompt)
         edited   = _clean_code(response.text)
     except Exception as e:
-        return f"Could not edit code: {e}"
+        msg = f"Could not edit code: {e}"
+        emit_coding(player, 'failed', summary=msg)
+        return msg
 
     status = _save_file(Path(file_path), edited)
     print(f"[Code] ✅ Edited: {file_path}")
+    # The card shows the REAL change: a unified diff of before → after.
+    emit_coding(player, 'diff', path=str(file_path),
+                diff=unified_diff_text(content, edited, path=str(file_path)))
+    emit_coding(player, 'done', path=str(file_path), success=True,
+                summary=f"File edited. {status}")
     return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
 
 
@@ -433,8 +473,13 @@ def _run_action(file_path, args, timeout, player) -> str:
         return f"File not found: {file_path}"
     if player:
         player.write_log(f"[Code] Running {p.name}...")
+    emit_coding(player, 'stage', stage=f'Running {p.name}…')
     outcome = _run_file(p, args, timeout)
+    emit_coding(player, 'run', attempt=1, total=1,
+                output=(outcome.output or '')[:400])
     if outcome.timed_out:
+        emit_coding(player, 'done', path=str(p), success=True,
+                    summary=f'{p.name} kept running and was stopped.')
         return (f"'{p.name}' kept running for {timeout}s and was stopped, sir — "
                 f"that is normal for a server or a GUI.\n\n{outcome.output}")
     text = outcome.output
@@ -443,6 +488,12 @@ def _run_action(file_path, args, timeout, player) -> str:
             for s in ("error", "exception", "traceback", "syntaxerror")):
         text = (f"{text}\n\n[it exited with status {outcome.exit_code} and printed "
                 f"no recognised error]")
+    if outcome.exit_code not in (0, None):
+        emit_coding(player, 'done', path=str(p), success=False,
+                    summary=f'{p.name} exited with status {outcome.exit_code}.')
+    else:
+        emit_coding(player, 'done', path=str(p), success=True,
+                    summary=f'{p.name} ran and exited cleanly.')
     return text
 
 
@@ -479,7 +530,9 @@ Optimized code:"""
         response  = model.generate_content(prompt)
         optimized = _clean_code(response.text)
     except Exception as e:
-        return f"Could not optimize code: {e}"
+        msg = f"Could not optimize code: {e}"
+        emit_coding(player, 'failed', summary=msg)
+        return msg
 
     # Kaydet
     if file_path:
@@ -489,6 +542,10 @@ Optimized code:"""
 
     status = _save_file(save_path, optimized)
     print(f"[Code] ✅ Optimized: {save_path}")
+    emit_coding(player, 'diff', path=str(save_path),
+                diff=unified_diff_text(code, optimized, path=str(save_path)))
+    emit_coding(player, 'done', path=str(save_path), success=True,
+                summary=f"Code optimized. {status}")
 
     original_lines  = len(code.splitlines())
     optimized_lines = len(optimized.splitlines())
@@ -641,6 +698,13 @@ def code_helper(
                 return "Understood, sir — I have not made that change. Say the word and I will."
         except Exception as exc:
             return f"The coding approval gate is unavailable ({exc}); I have not made that change."
+
+    if action in ("write", "edit", "run", "build", "optimize"):
+        # The gate passed and the action really runs: the chat opens its live
+        # coding card for it from this point.
+        emit_coding(player, 'start',
+                    description=description or file_path or output_path,
+                    language=language)
 
     if action == "write":
         return _write_action(description, language, output_path, player)

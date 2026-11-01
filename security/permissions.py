@@ -17,6 +17,16 @@ _TERMINAL_ACTIONS = {"run", "build", "install", "execute", "terminal"}
 #: to physical mouse/keyboard input (PyAutoGUI).
 _WINDOW_ACTIONS = {"open_application", "close_application", "focus_window"}
 
+#: pc_control actions that read the screen through the Windows OCR engine.
+_OCR_READ_ACTIONS = {"read_screen", "find_text", "wait_for_text"}
+
+#: pc_control actions that drive a named Windows control through UI Automation.
+_UI_ACTIONS = {"ui_tree", "ui_read", "ui_click", "ui_set_text"}
+
+#: file_control actions that only read. They answer even when the file switch is
+#: off, because looking at a folder is not changing it.
+_FILE_READ_ACTIONS = {"list", "find", "info"}
+
 #: system_control actions that touch processes rather than system settings.
 _PROCESS_ACTIONS = {"list_processes", "kill_process", "suspend_process",
                     "resume_process", "set_process_priority"}
@@ -60,6 +70,16 @@ _PERMISSION_LABEL = {
     # accounts on other people's services, not devices on this network.
     "external_apps": "External apps (Spotify, Gmail, GitHub and the rest, "
                      "through the Composio connector)",
+    # First-party additions. These are deliberately separate from
+    # ``external_apps``: a native read-only GitHub link and a local document
+    # library are not the Composio account relationship, and one flag must not
+    # govern both.
+    "library": "Knowledge library (index local documents)",
+    "meeting_notes": "Meeting notes (record system audio and microphone)",
+    "home_assistant": "Home Assistant (your own instance)",
+    "github": "GitHub (read-only)",
+    "reverse_engineer": "Reverse engineering (capture and remake software you "
+                        "own or are authorized to examine)",
 }
 
 
@@ -162,6 +182,21 @@ def permission_refusal(
     if name == "pc_control":
         if off("desktop_control"):
             return refusal("desktop_control")
+        # A sequence holds no lock and no switch of its own: every step goes
+        # through this same gate individually, so the exact switch that stopped
+        # a step is the one named in the refusal.
+        if act == "run_sequence":
+            return None
+        if act in _UI_ACTIONS:
+            return (refusal("windows_automation") if off("windows_automation")
+                    else None)
+        if act in _OCR_READ_ACTIONS or act == "click_text":
+            if off("screen_understanding"):
+                return refusal("screen_understanding")
+            # Reading is enough to find the word; clicking it is physical input.
+            if act == "click_text" and off("physical_input"):
+                return refusal("physical_input")
+            return None
         if act in _WINDOW_ACTIONS and off("windows_automation"):
             return refusal("windows_automation")
         if act == "screen_screenshot" and off("screen_understanding"):
@@ -220,6 +255,14 @@ def permission_refusal(
             return None
         return refusal("document_architect") if off("document_architect") else None
 
+    # File control: listing, finding and inspecting are read-only and answer
+    # even when the switch is off. Anything that writes, moves or removes needs
+    # the file permission, and `delete` additionally carries the confirm gate.
+    if name == "file_control":
+        if act in _FILE_READ_ACTIONS:
+            return None
+        return refusal("file_control") if off("file_control") else None
+
     # The globe only draws what the geospatial resolver found, and drawing is a
     # surface on this machine — so it follows desktop control rather than being a
     # capability of its own. The read-only listings answer "what can you place?"
@@ -243,5 +286,40 @@ def permission_refusal(
 
     if name == "live_vision":
         return refusal("live_vision") if off("live_vision") else None
+
+    # ── knowledge, meetings and first-party service links ────────────────────
+    # The library reads files, so ingestion needs BOTH the library relationship
+    # and the existing file-control switch. A status call only reports local
+    # counts and is allowed while the switch is off, so the user can see what
+    # the library holds before deciding to enable it.
+    if name == "library":
+        if act == "status":
+            return None
+        if off("library"):
+            return refusal("library")
+        if act == "ingest" and off("file_control"):
+            return refusal("file_control")
+        return None
+
+    # A recording must always be stoppable, even after the switch is turned
+    # off. ``status`` is also allowed through so the user can see whether a
+    # recording is still live; the module itself withholds transcript previews
+    # while the switch is off.
+    if name == "meeting_notes":
+        if act in ("stop", "status"):
+            return None
+        return refusal("meeting_notes") if off("meeting_notes") else None
+
+    if name == "home_assistant":
+        return refusal("home_assistant") if off("home_assistant") else None
+
+    if name == "github":
+        return refusal("github") if off("github") else None
+
+    # Reverse engineering captures sites/apps and copies app sources; the
+    # switch is the whole relationship, and the module separately requires the
+    # user's explicit authorization for every live target or copy.
+    if name == "reverse_engineer":
+        return refusal("reverse_engineer") if off("reverse_engineer") else None
 
     return None

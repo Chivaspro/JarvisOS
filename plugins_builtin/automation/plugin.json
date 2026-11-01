@@ -1,0 +1,29 @@
+{
+  "id": "automation",
+  "name": "automation",
+  "description": "Run, save and re-run ordered workflows of desktop actions. Steps are executed in order through the same permission, approval and lock path as a single action, and every run is written to a real history file. A step that fails stops the workflow and is reported — a partial run is never presented as complete.",
+  "icon": "⚙",
+  "version": "1.0.0",
+  "category": "automation",
+  "builtin": true,
+  "permissions": ["automation"],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action": {"type": "STRING", "description": "run | save | list | run_saved | history | delete"},
+      "name": {"type": "STRING", "description": "Workflow name (save/run_saved/delete)."},
+      "steps": {"type": "STRING", "description": "JSON array of steps for run/save."},
+      "condition": {"type": "STRING", "description": "Optional gate: a feature flag name that must be enabled."}
+    },
+    "required": ["action"]
+  },
+  "settings": [
+    {"key": "max_steps", "label": "Maximum steps per workflow", "type": "int", "default": 15, "min": 1, "max": 15,
+     "help": "The sequence engine allows at most 15 steps."},
+    {"key": "history_limit", "label": "History entries to keep", "type": "int", "default": 50, "min": 5, "max": 500, "advanced": true,
+     "help": "Older runs are dropped once the limit is reached."},
+    {"key": "default_condition", "label": "Default condition", "type": "string", "default": "", "advanced": true,
+     "help": "A feature flag that must be enabled before a workflow runs (blank = always)."}
+  ],
+  "limits": {"max_calls_per_minute": 20, "timeout_seconds": 300, "max_results": 1}
+}

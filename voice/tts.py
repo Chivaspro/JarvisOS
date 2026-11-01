@@ -66,6 +66,13 @@ def _compress_silence(
     """
     max_samp  = int(max_silence_ms * sample_rate / 1000)
     frame_len = 240                   # ~10 ms at 24 kHz
+    try:
+        # Native bulk pass (Rust when built) — same frame maths, no Python
+        # loop over the audio on the synthesis thread.
+        from core import native as _native
+        return _native.compress_silence_f32(arr, frame_len, max_samp, threshold)
+    except Exception:
+        pass
     out: list[np.ndarray] = []
     silent_acc = 0
 
@@ -82,30 +89,145 @@ def _compress_silence(
     return np.concatenate(out) if out else arr
 
 
+class PlaybackClock:
+    """Seconds of audio the sound card has REALLY played (all engines).
+
+    Every renderer calls :meth:`feed` with the duration of the audio it is
+    about to hand to the device. Playback then runs in real time from the
+    moment it starts, but never past what has been fed: if the device runs
+    dry (network stall, gap between phrases) the clock waits, and resumes
+    when new audio arrives. The word-by-word chat typewriter reads
+    :meth:`position` to reveal each word as it is spoken. Cumulative and
+    monotonic: consumers take differences, so no reset is ever needed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fed = 0.0            # total audio handed to the device (s)
+        self._anchor_wall = None   # wall time playback (re)started
+        self._anchor_pos = 0.0     # clock value at that moment
+
+    def _pos_locked(self, now: float) -> float:
+        if self._anchor_wall is None:
+            return self._fed
+        return min(self._anchor_pos + max(0.0, now - self._anchor_wall),
+                   self._fed)
+
+    def feed(self, duration_s: float, latency_s: float = 0.08) -> None:
+        try:
+            dur = max(0.0, float(duration_s))
+            if dur <= 0.0:
+                return
+            now = time.monotonic()
+            with self._lock:
+                if self._pos_locked(now) >= self._fed - 1e-3:
+                    # device was dry (or never started): this audio starts
+                    # after the output latency
+                    self._anchor_wall = now + max(0.0, float(latency_s))
+                    self._anchor_pos = self._fed
+                self._fed += dur
+        except Exception:
+            pass
+
+    def position(self) -> float:
+        try:
+            with self._lock:
+                return self._pos_locked(time.monotonic())
+        except Exception:
+            return 0.0
+
+    def stop(self) -> None:
+        """Playback was cut (interrupt): everything fed counts as played."""
+        try:
+            with self._lock:
+                self._anchor_wall = time.monotonic()
+                self._anchor_pos = self._fed
+        except Exception:
+            pass
+
+
+playback_clock = PlaybackClock()
+
+
 def _play_np(samples, sample_rate: int) -> None:
     """Play float32 mono (or stereo) audio via sounddevice.
     Accepts numpy arrays or PyTorch tensors.
     """
     arr = _to_numpy(samples)
+    try:
+        playback_clock.feed(arr.shape[0] / float(sample_rate))
+    except Exception:
+        pass
     with _reactive_envelope(arr, sample_rate):
         sd.play(arr, sample_rate)
         sd.wait()
 
 
-def _play_audio_bytes(audio_bytes: bytes) -> None:
-    """Decode MP3/WAV/OGG bytes and play via sounddevice (uses miniaudio)."""
+# ── Fish Audio: one source of truth for the shipped defaults ────────────────
+# The constants live in voice/fish_defaults.py so the settings/migration layer
+# can validate against exactly the same values without importing audio I/O.
+from voice.fish_defaults import (  # noqa: E402  (grouped with the engine code)
+    FISH_DEFAULT_ENDPOINT,
+    FISH_DEFAULT_FORMAT,
+    FISH_DEFAULT_LATENCY,
+    FISH_DEFAULT_MODEL,
+    FISH_DEFAULT_VOICE,
+    FISH_FORMATS,
+    FISH_LATENCIES,
+    FISH_MODELS,
+    looks_like_voice_id,
+)
+
+
+def _decode_audio_to_pcm(audio_bytes: bytes) -> tuple[bytes, int]:
+    """Decode WAV/MP3/Opus/OGG bytes to mono int16 PCM.
+
+    ``soundfile`` (libsndfile) is tried first because it decodes Ogg Opus and
+    MP3 in one code path; miniaudio is the fallback for installs without it.
+    Raises when neither backend can decode the payload.
+    """
+    last_error: Optional[Exception] = None
+    try:
+        import io
+        import soundfile as sf
+        with sf.SoundFile(io.BytesIO(audio_bytes)) as handle:
+            rate = int(handle.samplerate or 24000)
+            frames = handle.read(dtype="float32", always_2d=True)
+        if frames.size:
+            mono = frames.mean(axis=1)
+            pcm = (mono * 32767.0).clip(-32768, 32767).astype(np.int16).tobytes()
+            return pcm, rate
+        last_error = RuntimeError("decoded audio is empty")
+    except Exception as exc:
+        last_error = exc
     try:
         import miniaudio
-    except ImportError:
-        raise RuntimeError("Voice playback needs the 'miniaudio' package. Run: pip install miniaudio")
-    decoded = miniaudio.decode(
-        audio_bytes,
-        output_format=miniaudio.SampleFormat.FLOAT32,
-        nchannels=1,
-    )
-    samples = np.array(decoded.samples, dtype=np.float32)
-    with _reactive_envelope(samples, decoded.sample_rate):
-        sd.play(samples, decoded.sample_rate)
+        decoded = miniaudio.decode(
+            audio_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=24000,
+        )
+        return bytes(decoded.samples), int(decoded.sample_rate or 24000)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Voice playback could not decode the audio ({last_error or exc}). "
+            "Install 'soundfile' (Opus/MP3) or check the Fish Audio format."
+        ) from exc
+
+
+def _play_audio_bytes(audio_bytes: bytes) -> None:
+    """Decode WAV/MP3/Opus bytes and play via sounddevice."""
+    pcm, rate = _decode_audio_to_pcm(audio_bytes)
+    arr = np.frombuffer(pcm, dtype=np.int16)
+    if not arr.size:
+        raise RuntimeError("Voice playback received no audio samples.")
+    try:
+        playback_clock.feed(len(arr) / float(rate))
+    except Exception:
+        pass
+    with _reactive_envelope(arr.astype(np.float32) / 32768.0, rate):
+        sd.play(arr, rate)
         sd.wait()
 
 
@@ -197,10 +319,18 @@ def _push_reactive(pcm_bytes: bytes, sample_rate: int = 24000) -> None:
     """
     try:
         from core import audio_reactive as _ar
-        arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-        if arr.size == 0:
+        if not pcm_bytes:
             return
-        rms = float(np.sqrt(np.mean((arr.astype(np.float32) / 32768.0) ** 2)))
+        try:
+            # Native single pass straight over the bytes (no int16→float32
+            # copy) — this runs once per audio chunk written to the device.
+            from core import native as _native
+            rms = _native.rms_auto(pcm_bytes) / 32768.0
+        except Exception:
+            arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if arr.size == 0:
+                return
+            rms = float(np.sqrt(np.mean((arr.astype(np.float32) / 32768.0) ** 2)))
         _ar.push_output_level(min(1.0, rms * 2.2))
     except Exception:
         pass
@@ -213,7 +343,164 @@ def _open_pcm_stream(sample_rate: int):
     return st
 
 
-def _play_pcm_frames(frames, cancel=None, on_audio=None) -> bool:
+def _stream_latency(stream) -> float:
+    """PortAudio's own output-latency estimate, clamped to sane bounds.
+
+    Feeds ``PlaybackClock``'s anchor so the word-by-word reveal starts in
+    step with the REAL first sound instead of a fixed 0.08 s guess."""
+    try:
+        lat = float(getattr(stream, "latency", 0.0) or 0.0)
+    except Exception:
+        lat = 0.0
+    if not lat:
+        return 0.08
+    return min(0.35, max(0.02, lat))
+
+
+# ── adaptive Fish-realtime pacing (process-wide, thread-safe) ────────────────
+# First audio is ALWAYS immediate (0 prebuffer). Only turns where chunks
+# audibly stalled raise a small prebuffer for the following phrases, and two
+# clean turns decay it back — latency when the network deserves it, never a
+# blind fixed delay.
+
+_FISH_PACE_LOCK = threading.Lock()
+_FISH_PACE = {"prebuffer": 0.0, "clean": 0}
+
+
+def _fish_prebuffer_target() -> float:
+    with _FISH_PACE_LOCK:
+        return float(_FISH_PACE["prebuffer"])
+
+
+def _fish_gap_learn(prebuffer: float, gap_events: int) -> None:
+    """Learn from one turn: stalls raise the prebuffer, clean turns decay it."""
+    try:
+        with _FISH_PACE_LOCK:
+            if gap_events >= 2:
+                _FISH_PACE["prebuffer"] = min(0.25, max(0.15, prebuffer + 0.08))
+                _FISH_PACE["clean"] = 0
+            elif gap_events == 0 and prebuffer > 0.0:
+                _FISH_PACE["clean"] += 1
+                if _FISH_PACE["clean"] >= 2:
+                    _FISH_PACE["prebuffer"] = max(0.0, prebuffer - 0.06)
+                    _FISH_PACE["clean"] = 0
+            elif gap_events:
+                _FISH_PACE["clean"] = 0
+    except Exception:
+        pass
+
+
+def _pcm16_bytes(samples) -> bytes:
+    """float32 samples (numpy or tensor) → mono int16 PCM bytes."""
+    try:
+        arr = _to_numpy(samples)
+        if arr is None:
+            return b""
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return b""
+        np.clip(arr, -1.0, 1.0, out=arr)
+        return (arr * 32767.0).astype(np.int16).tobytes()
+    except Exception:
+        return b""
+
+
+def _write_fade_out(stream, pcm_bytes: bytes, sample_rate: int) -> None:
+    """Taper the tail to silence so an interruption cannot click.
+
+    A hard stop in the middle of a waveform leaves a step on the device; a
+    20 ms linear ramp from the last played sample removes it. Never fatal.
+    """
+    try:
+        arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if arr.size == 0:
+            return
+        last = float(arr[-1]) / 32768.0
+        n = max(1, int(0.02 * int(sample_rate)))
+        stream.write(_pcm16_bytes(np.linspace(last, 0.0, n, dtype=np.float32)))
+    except Exception:
+        pass
+
+
+def _play_np_frames(frames, cancel=None, on_audio=None,
+                    preopen_rate: int | None = None) -> bool:
+    """Play float32 ``(samples, sample_rate)`` frames on ONE open stream.
+
+    The local engines used to call ``sd.play()``/``sd.wait()`` per synthesis
+    chunk: every sentence stopped the device and started it again, which is
+    audible as a seam (and costs a device open each time). One long-lived
+    ``RawOutputStream`` keeps the stream running between chunks — audio is
+    queued back-to-back, so sentences join seamlessly.
+
+    ``preopen_rate`` opens the device before the first frame exists (the local
+    engines know their rate), hiding the open behind synthesis. Never raises:
+    a device failure must not take the voice down.
+    """
+    stream = None
+    rate = 0
+    played = False
+    started = False
+    last_pcm = b""
+    try:
+        if preopen_rate:
+            try:
+                stream = _open_pcm_stream(int(preopen_rate))
+                rate = int(preopen_rate)
+            except Exception:
+                stream, rate = None, 0
+        for samples, sr in frames:
+            if cancel is not None and cancel.is_set():
+                # Interrupted between chunks: taper what was just heard to
+                # silence rather than cutting the device mid-waveform.
+                if played and stream is not None and last_pcm:
+                    _write_fade_out(stream, last_pcm, rate)
+                break
+            pcm = _pcm16_bytes(samples)
+            if not pcm:
+                continue
+            sr = int(sr or 24000)
+            if stream is None or sr != rate:
+                try:
+                    if stream is not None:
+                        stream.stop()
+                        stream.close()
+                except Exception:
+                    pass
+                stream = _open_pcm_stream(sr)
+                rate = sr
+            if not started:
+                started = True
+                if on_audio is not None:
+                    try:
+                        on_audio()
+                    except Exception:
+                        pass
+            playback_clock.feed(len(pcm) / (2.0 * sr),
+                                latency_s=_stream_latency(stream))
+            stream.write(pcm)
+            last_pcm = pcm
+            played = True
+            _push_reactive(pcm, sr)
+            if cancel is not None and cancel.is_set():
+                _write_fade_out(stream, pcm, sr)
+                break
+    except Exception as exc:
+        print(f"[TTS] local stream playback error: {exc}")
+    finally:
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+    return played
+
+
+def _play_pcm_frames(frames, cancel=None, on_audio=None,
+                     preopen_rate: int | None = None) -> bool:
     """Play ``(pcm_bytes, sample_rate)`` frames as they arrive.
 
     One output stream is kept open across the whole reply (re-opened only if a
@@ -227,6 +514,17 @@ def _play_pcm_frames(frames, cancel=None, on_audio=None) -> bool:
     played = False
     started = False
     try:
+        # Pre-open the device BEFORE the first network frame when the caller
+        # KNOWS the rate (ElevenLabs raw PCM is always 24 kHz): the WASAPI
+        # open costs 50-300 ms and used to sit on the time-to-first-audio
+        # path. A rate mismatch on the first real frame still reopens below,
+        # and callers with an unknown rate pass nothing (no wasted open).
+        if preopen_rate:
+            try:
+                stream = _open_pcm_stream(int(preopen_rate))
+                rate = int(preopen_rate)
+            except Exception:
+                stream, rate = None, 0
         for chunk, sr in frames:
             if cancel is not None and cancel.is_set():
                 break
@@ -249,6 +547,8 @@ def _play_pcm_frames(frames, cancel=None, on_audio=None) -> bool:
                         on_audio()
                     except Exception:
                         pass
+            playback_clock.feed(len(chunk) / (2.0 * sr),
+                                latency_s=_stream_latency(stream))
             stream.write(bytes(chunk))
             played = True
             _push_reactive(bytes(chunk), sr)
@@ -268,7 +568,7 @@ def _play_pcm_frames(frames, cancel=None, on_audio=None) -> bool:
 
 
 def _play_sentence_stream(text: str, make_frames, cancel=None,
-                          on_audio=None) -> bool:
+                          on_audio=None, preopen_rate=None) -> bool:
     """Pipeline sentence synthesis against playback.
 
     ``make_frames(sentence)`` returns an iterator of ``(pcm_bytes, sample_rate)``
@@ -310,7 +610,8 @@ def _play_sentence_stream(text: str, make_frames, cancel=None,
             for frame in rest:
                 yield frame
 
-    played = _play_pcm_frames(_frames(), cancel=cancel, on_audio=on_audio)
+    played = _play_pcm_frames(_frames(), cancel=cancel, on_audio=on_audio,
+                              preopen_rate=preopen_rate)
     if errors and not played:
         raise errors[0]
     if errors:
@@ -382,6 +683,15 @@ class _ReactiveEnvelope:
     def _run(self, arr, frame, peak):
         import time as _t
         norm = 32768.0 if np.abs(arr).max() > 4.0 else 1.0  # int16 vs float range
+        # One bulk pass (Rust when available) computes every frame's RMS up
+        # front; the loop below only paces them for the controller, so no
+        # numpy work happens per 40 ms step anymore.
+        env = None
+        try:
+            from core import native as _native
+            env = _native.envelope_auto(arr, frame)
+        except Exception:
+            env = None
         i = 0
         n = arr.size
         step = self._FRAME_S
@@ -391,7 +701,11 @@ class _ReactiveEnvelope:
             if chunk.size == 0:
                 break
             try:
-                rms = float(np.sqrt(np.mean((chunk / norm) ** 2)))
+                k = (i // frame) - 1
+                if env is not None and k < env.size:
+                    rms = float(env[k]) / norm
+                else:
+                    rms = float(np.sqrt(np.mean((chunk / norm) ** 2)))
             except Exception:
                 rms = 0.0
             self._ar.push_output_level(min(1.0, rms * 2.2))
@@ -694,14 +1008,26 @@ class KokoroTTSEngine:
         synth_thread = threading.Thread(target=_synth, daemon=True)
         synth_thread.start()
 
-        # Player runs in this thread so sd.wait() doesn't block the synth thread.
-        while True:
-            arr = audio_q.get()
-            if arr is None:
-                break
-            _play_np(arr, 24000)
+        def _frames():
+            while True:
+                arr = audio_q.get()
+                if arr is None:
+                    return
+                yield arr, 24000
 
-        synth_thread.join()
+        try:
+            # One long-lived output stream: Kokoro's per-paragraph chunks join
+            # seamlessly instead of stopping and restarting the sound device.
+            _play_np_frames(_frames(), preopen_rate=24000)
+        finally:
+            # Playback can end early on a device error; keep draining so the
+            # producer can reach its sentinel instead of blocking forever.
+            while synth_thread.is_alive():
+                try:
+                    audio_q.get(timeout=0.05)
+                except _queue.Empty:
+                    continue
+            synth_thread.join()
 
         if synth_error:
             raise synth_error[0]
@@ -826,7 +1152,8 @@ class ElevenLabsTTSEngine:
         if _streaming_enabled():
             try:
                 if _play_sentence_stream(text, self._frame_iterator,
-                                         cancel=cancel, on_audio=on_audio):
+                                         cancel=cancel, on_audio=on_audio,
+                                         preopen_rate=24000):
                     return
             except Exception as exc:
                 print(f"[TTS] ElevenLabs streaming unavailable: {exc} — "
@@ -842,8 +1169,7 @@ class ElevenLabsTTSEngine:
 
 
 def _looks_like_voice_id(value: str) -> bool:
-    v = (value or "").strip()
-    return len(v) >= 20 and all(ch in "0123456789abcdefABCDEF" for ch in v)
+    return looks_like_voice_id(value)
 
 
 # ── Fish Audio realtime WebSocket (incremental TEXT in, audio out) ────────────
@@ -879,20 +1205,23 @@ def _ws_base_url(endpoint: str) -> str:
 class FishAudioTTSEngine:
     """Fish Audio cloud TTS via the official ``fish-audio-sdk``.
 
-    ``model`` selects the backend (e.g. "s1", "s2.1-pro") and
-    ``reference_id`` selects the voice. Because older setups stored the
-    voice ID in the Model ID field, an ID-shaped model value is treated
-    as the voice and the backend falls back to "s2-pro".
+    ``model`` selects the backend (s1, s2-pro, s2.1-pro, s2.1-pro-free,
+    drama-3) and ``reference_id`` selects the voice. Every default comes from
+    the single ``FISH_DEFAULT_*`` constants above.
+
+    Invalid values are rejected with a clear error instead of being silently
+    rewritten: substituting a different model, voice, format or latency would
+    make the settings panel lie about what is actually spoken.
     """
 
     def __init__(
         self,
         api_key: str,
-        model_id: str = "s2-pro",
-        voice_id: str = "",
+        model_id: str = FISH_DEFAULT_MODEL,
+        voice_id: str = FISH_DEFAULT_VOICE,
         endpoint: str = "https://api.fish.audio/v1/tts",
-        audio_format: str = "mp3",
-        latency: str = "normal",
+        audio_format: str = FISH_DEFAULT_FORMAT,
+        latency: str = FISH_DEFAULT_LATENCY,
     ):
         api_key = (api_key or os.getenv("FISH_API_KEY", os.getenv("FISH_AUDIO_API_KEY", ""))).strip()
         if not api_key:
@@ -900,23 +1229,40 @@ class FishAudioTTSEngine:
         endpoint = (endpoint or "").strip().rstrip("/") or "https://api.fish.audio/v1/tts"
         if not endpoint.startswith(("https://", "http://")):
             raise ValueError("Fish Audio endpoint must be an HTTP(S) URL")
-        model = (model_id or "").strip()
+        model = (model_id or "").strip() or FISH_DEFAULT_MODEL
         ref = (voice_id or "").strip()
-        if not ref and _looks_like_voice_id(model):
-            ref, model = model, "s2-pro"
         if not ref:
             raise ValueError(
                 "Fish Audio needs a voice: fill Voice ID in Control Center → Voice."
             )
+        if _looks_like_voice_id(model):
+            raise ValueError(
+                "Fish Audio model looks like a voice ID. Put the voice in the "
+                f"Voice field and the backend model ({', '.join(FISH_MODELS)}) in Model."
+            )
+        if model not in FISH_MODELS:
+            # Fish falls back to s2.1-pro for an unrecognised model. Sending an
+            # unknown value would therefore speak in a model the user did not
+            # pick, so refuse instead of substituting.
+            raise ValueError(
+                f"Unsupported Fish Audio model '{model}'. "
+                f"Choose one of: {', '.join(FISH_MODELS)}.")
+        fmt = str(audio_format or FISH_DEFAULT_FORMAT).strip().lower()
+        if fmt not in FISH_FORMATS:
+            raise ValueError(
+                f"Unsupported Fish Audio format '{audio_format}'. "
+                f"Choose one of: {', '.join(FISH_FORMATS)}.")
+        lat = str(latency or FISH_DEFAULT_LATENCY).strip().lower()
+        if lat not in FISH_LATENCIES:
+            raise ValueError(
+                f"Unsupported Fish Audio latency '{latency}'. "
+                f"Choose one of: {', '.join(FISH_LATENCIES)}.")
         self.api_key = api_key
-        self.model = model or "s2-pro"
+        self.model = model
         self.reference_id = ref
         self.endpoint = endpoint
-        self.audio_format = audio_format if audio_format in {"mp3", "wav", "opus"} else "mp3"
-        # API accepts "normal" | "balanced" ("low" is mapped to "balanced").
-        self.latency = {"low": "balanced"}.get(latency, latency)
-        if self.latency not in {"normal", "balanced"}:
-            self.latency = "normal"
+        self.audio_format = fmt
+        self.latency = lat
 
     def _convert_sdk(self, text: str) -> bytes:
         from fishaudio import FishAudio
@@ -942,7 +1288,6 @@ class FishAudioTTSEngine:
 
         payload = {
             "text": text,
-            "model": self.model,
             "reference_id": self.reference_id,
             "format": self.audio_format,
             "latency": self.latency,
@@ -954,6 +1299,10 @@ class FishAudioTTSEngine:
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
+                    # Fish's OpenAPI declares ``model`` as a request HEADER.
+                    # Sending it only in the body let the server fall back to
+                    # its own default model — the silent model substitution.
+                    "model": self.model,
                 },
                 timeout=45,
             )
@@ -970,26 +1319,30 @@ class FishAudioTTSEngine:
     def _frame_iterator(self, sentence: str):
         """Stream ONE sentence as ``(pcm_bytes, sample_rate)`` frames.
 
-        Streamed audio is requested as WAV: it is the one Fish format whose
-        sample rate the payload itself declares, so the raw PCM after the header
-        can be written straight to the speaker. The header is read as it
-        arrives and the sample rate comes from its ``fmt `` chunk — nothing is
-        guessed. The first ``next()`` is what opens the request, which is what
-        lets the sentence pipeline hide the network latency behind playback.
+        The configured format is honoured, never substituted:
+
+        * ``pcm`` / ``wav`` stream raw PCM straight to the speaker (WAV's
+          sample rate is read from its own ``fmt `` chunk; Fish PCM is 44.1 kHz).
+        * ``mp3`` / ``opus`` are fetched, decoded to int16 PCM with
+          ``soundfile`` (miniaudio fallback) and yielded in chunks, so the
+          sentence pipeline still overlaps network time with playback.
+
+        The first ``next()`` opens the request, which is what hides the
+        network latency behind the previous sentence.
         """
         import requests
         payload = {
             "text": sentence,
-            "model": self.model,
             "reference_id": self.reference_id,
-            "format": "wav",
+            "format": self.audio_format,
             "latency": self.latency,
         }
         resp = requests.post(
             self.endpoint,
             json=payload,
             headers={"Authorization": f"Bearer {self.api_key}",
-                     "Content-Type": "application/json"},
+                     "Content-Type": "application/json",
+                     "model": self.model},
             timeout=45, stream=True,
         )
         if resp.status_code != 200:
@@ -999,6 +1352,18 @@ class FishAudioTTSEngine:
             )
         try:
             it = resp.iter_content(chunk_size=4096)
+            if self.audio_format in ("mp3", "opus"):
+                data = b"".join(chunk for chunk in it if chunk)
+                pcm, rate = _decode_audio_to_pcm(data)
+                for i in range(0, len(pcm), 8192):
+                    yield (pcm[i:i + 8192], rate)
+                return
+            if self.audio_format == "pcm":
+                for chunk in it:
+                    if chunk:
+                        yield (chunk, 44100)
+                return
+            # WAV: consume until the data chunk, then stream the raw PCM.
             head = b""
             for chunk in it:
                 if chunk:
@@ -1083,7 +1448,25 @@ class FishAudioTTSEngine:
         stream = None
         played = False
         started = False
+        # Adaptive gap smoothing: 0 by default — the first sound is always
+        # immediate; only turns with observed stalls raise the prebuffer, and
+        # it decays after clean turns (see _fish_gap_learn).
+        prebuffer = _fish_prebuffer_target()
+        gap_events = 0
+        gap_ms = 0.0
+        last_arrival = None
+        last_dur = 0.0
+        pending: list = []
+        primed = prebuffer <= 0.0
+        stop_playback = False
+        cancelled = False
         try:
+            # Open the output device NOW — the 50-300 ms device open hides
+            # behind the WebSocket handshake instead of delaying first audio.
+            try:
+                stream = _open_pcm_stream(FISH_WS_SAMPLE_RATE)
+            except Exception:
+                stream = None       # lazy retry on the first chunk below
             audio = client.tts.stream_websocket(
                 text_iter,
                 reference_id=self.reference_id,
@@ -1092,20 +1475,22 @@ class FishAudioTTSEngine:
                 max_workers=4,
                 ws_options=ws_options,
             )
-            for chunk in audio:
-                if cancel is not None and cancel.is_set():
-                    break
-                if not chunk:
-                    continue
+            def _write(data) -> bool:
+                """Write one chunk; False means playback must stop."""
+                nonlocal stream, started, played, stop_playback
                 try:
                     if stream is None:
                         stream = _open_pcm_stream(FISH_WS_SAMPLE_RATE)
-                    stream.write(bytes(chunk))
+                    playback_clock.feed(
+                        len(data) / (2.0 * FISH_WS_SAMPLE_RATE),
+                        latency_s=_stream_latency(stream))
+                    stream.write(data)
                 except Exception as exc:
                     if not played:
                         raise RuntimeError(f"speaker unavailable: {exc}") from exc
                     print(f"[TTS] Fish realtime playback stopped: {exc}")
-                    break
+                    stop_playback = True
+                    return False
                 if not started:
                     started = True
                     if on_audio is not None:
@@ -1114,7 +1499,52 @@ class FishAudioTTSEngine:
                         except Exception:
                             pass
                 played = True
-                _push_reactive(bytes(chunk), FISH_WS_SAMPLE_RATE)
+                _push_reactive(data, FISH_WS_SAMPLE_RATE)
+                return True
+
+            for chunk in audio:
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                    break
+                if not chunk:
+                    continue
+                now = time.monotonic()
+                dur = len(chunk) / (2.0 * FISH_WS_SAMPLE_RATE)
+                if last_arrival is not None:
+                    late = now - (last_arrival + last_dur)
+                    if late > 0.06:
+                        gap_events += 1
+                        gap_ms += late * 1000.0
+                last_arrival, last_dur = now, dur
+                if not primed:
+                    # buffering toward this turn's prebuffer target
+                    pending.append(bytes(chunk))
+                    buffered = sum(len(b) for b in pending) / (2.0 * FISH_WS_SAMPLE_RATE)
+                    if buffered < prebuffer:
+                        continue
+                    primed = True
+                    write_list, pending = pending, []
+                else:
+                    write_list = (bytes(chunk),)
+                if not all(_write(data) for data in write_list):
+                    break
+            # A reply can end before the prebuffer target is reached: never
+            # drop audio that was held for smoothing.
+            if pending and not cancelled and not stop_playback:
+                for data in pending:
+                    if not _write(data):
+                        break
+                pending = []
+            if not cancelled:
+                _fish_gap_learn(prebuffer, gap_events)
+            if gap_events:
+                try:
+                    from voice import turn_timeline
+                    turn_timeline.note("fish_gaps", gap_events)
+                    turn_timeline.note("fish_gap_ms", int(gap_ms))
+                    turn_timeline.note("fish_prebuffer_ms", int(prebuffer * 1000))
+                except Exception:
+                    pass
             return played
         finally:
             if stream is not None:
@@ -1134,9 +1564,10 @@ class FishAudioTTSEngine:
     def speak(self, text: str, cancel=None, on_audio=None) -> None:
         """Speak ``text`` sentence by sentence, streaming each one.
 
-        Falls back to the previous whole-reply path (SDK first, then HTTP) on
-        any streaming failure, so an API change degrades to the old behaviour
-        instead of silence.
+        Falls back to the whole-reply fetch on any streaming failure, so an API
+        change degrades to one blocking request instead of silence. HTTP is
+        tried first because it is the only path that sends ``model`` as a
+        request header — the SDK path could let the server pick its own model.
         """
         text = str(text or "").strip()
         if not text:
@@ -1152,11 +1583,17 @@ class FishAudioTTSEngine:
         if cancel is not None and cancel.is_set():
             return
         try:
-            audio = self._convert_sdk(text)
-        except ImportError:
             audio = self._convert_http(text)
-        except Exception as exc:
-            raise RuntimeError(f"Fish Audio request failed ({exc})") from exc
+        except Exception as http_exc:
+            try:
+                audio = self._convert_sdk(text)
+            except ImportError:
+                raise RuntimeError(
+                    f"Fish Audio request failed ({http_exc})") from http_exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Fish Audio request failed ({http_exc}; SDK: {exc})"
+                ) from exc
         if on_audio is not None:
             try:
                 on_audio()
@@ -1209,8 +1646,10 @@ _VOICE_DEFAULTS: dict = {
     "pitch": 0.0,
     "volume": 1.0,
     "sample_rate": 24000,
-    "output_format": "mp3",
-    "latency": "normal",
+    # Fish Audio is the only engine that consumes these two; they mirror the
+    # shipped FISH_DEFAULT_* values so a fresh voice_config.json is coherent.
+    "output_format": FISH_DEFAULT_FORMAT,
+    "latency": FISH_DEFAULT_LATENCY,
     "execution_provider": "cpu",
 }
 
@@ -1647,20 +2086,22 @@ class OnnxTTSEngine:
         """
         self._load()
         _t0 = time.perf_counter()
-        started = False
+
+        def _on_audio():
+            _set_status(state="PLAYING")
+            if on_audio is not None:
+                try:
+                    on_audio()
+                except Exception:
+                    pass
+
         try:
-            for arr, rate in self.synthesize(text, cancel=cancel):
-                if cancel is not None and cancel.is_set():
-                    break
-                if not started:
-                    started = True
-                    _set_status(state="PLAYING")
-                    if on_audio is not None:
-                        try:
-                            on_audio()
-                        except Exception:
-                            pass
-                _play_np(arr, rate)
+            # ONE stream for the whole line: Piper yields several chunks per
+            # sentence, and stopping/restarting the device between them was
+            # the audible seam in local speech.
+            _play_np_frames(self.synthesize(text, cancel=cancel),
+                            cancel=cancel, on_audio=_on_audio,
+                            preopen_rate=self.sample_rate)
         finally:
             _set_status(state="READY", latency_ms=(time.perf_counter() - _t0) * 1000)
 
@@ -1749,6 +2190,21 @@ class TTSPlayer:
                 self._first_request_seen = True
                 print(f"[TTS] FIRST_REQUEST {self._name}")
             if cancel is not None and cancel.is_set():
+                return
+            # Final markdown gate: direct callers (notices, narration, the
+            # corrected-reply path) hand whole lines straight here — the sink's
+            # streaming filter has already cleaned what IT forwards, and the
+            # filter is idempotent, so this can never double-strip prose.
+            try:
+                from voice.speech_filter import (filter_markdown_for_speech,
+                                                 markdown_speech_enabled)
+                if markdown_speech_enabled():
+                    text = filter_markdown_for_speech(text)
+            except Exception:
+                pass
+            if not str(text or "").strip():
+                # nothing speakable (e.g. a reply that was pure code) — stay
+                # silent rather than reading punctuation into the room
                 return
             if on_start:
                 on_start()
@@ -1903,14 +2359,16 @@ def create_tts_player(config: dict) -> TTSPlayer:
         def _make():
             return FishAudioTTSEngine(
                 api_key=_pv.get("apiKey") or config.get("fish_audio_api_key", ""),
-                model_id=_pv.get("model") or config.get("fish_audio_model_id", "s2-pro"),
-                voice_id=_pv.get("voice") or config.get("fish_audio_voice_id", ""),
+                model_id=(_pv.get("model") or config.get("fish_audio_model_id")
+                          or FISH_DEFAULT_MODEL),
+                voice_id=(_pv.get("voice") or config.get("fish_audio_voice_id")
+                          or FISH_DEFAULT_VOICE),
                 endpoint=(_pv.get("endpoint") or config.get("fish_audio_endpoint")
                           or "https://api.fish.audio/v1/tts"),
                 audio_format=(_pv.get("format") or config.get("fish_audio_format")
-                              or vcfg.get("output_format", "mp3")),
+                              or vcfg.get("output_format", FISH_DEFAULT_FORMAT)),
                 latency=(_pv.get("latency") or config.get("fish_audio_latency")
-                         or vcfg.get("latency", "normal")),
+                         or vcfg.get("latency", FISH_DEFAULT_LATENCY)),
             )
     elif engine_name in {"sapi", "sapi5", "pyttsx3", "windows"}:
         def _make():

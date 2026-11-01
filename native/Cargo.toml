@@ -1,0 +1,38 @@
+# J.A.R.V.I.S. native audio/DSP extension — Rust side of the hybrid app.
+#
+# Built as a Python extension module (jarvis_native.pyd) with maturin, but a
+# plain `cargo build --release` produces a loadable .pyd as well, which is what
+# the development build tool (tools/build_native.py) uses.
+#
+# The module is strictly OPTIONAL at runtime: the Python layer falls back to
+# pure-numpy implementations when it is absent (core/native.py).
+[package]
+name = "jarvis-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Native DSP / real-time audio acceleration for J.A.R.V.I.S. OS"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "jarvis_native"
+# cdylib: the Python extension. rlib: so `cargo test` can link the crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["abi3-py310", "generate-import-lib"] }
+numpy = "0.30"
+rubato = "5.0"
+
+[features]
+default = ["extension-module"]
+# Enabled for the Python extension; disabled for `cargo test` so the test
+# binary can link against libpython.
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,21 @@
+# Wheel-building metadata (maturin). Development builds use
+# tools/build_native.py, which calls cargo directly; this file exists so
+# `maturin build --release` produces a proper installable wheel for releases.
+[build-system]
+requires = ["maturin>=1.16,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "jarvis-native"
+version = "0.1.0"
+description = "Native DSP / real-time audio acceleration for J.A.R.V.I.S. OS (optional; the app falls back to pure Python)"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[tool.maturin]
+module-name = "jarvis_native"

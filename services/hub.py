@@ -200,6 +200,67 @@ SERVICES: tuple[Service, ...] = (
                  "account e-mail and password, or a device password set in the app.",
     ),
     Service(
+        id="github",
+        label="GitHub (read-only)",
+        summary="Native read-only GitHub: notifications, issues, pull requests, "
+                "checks and search. Writes stay with the Composio connector.",
+        switch="github",
+        fields=(("github_token", "Personal access token (read-only)", True, False),
+                ("github_api_url", "API base URL (optional, GitHub Enterprise)",
+                 False, True)),
+        note="This link only issues GET requests. A fine-grained token with "
+             "read-only repository access is enough; the token is stored in "
+             "config/api_keys.json.",
+        probe_name="_probe_github",
+        key_url="https://github.com/settings/tokens?type=beta",
+        help_url="https://docs.github.com/en/rest",
+        key_help="GitHub ▸ Settings ▸ Developer settings ▸ Personal access "
+                 "tokens ▸ Fine-grained tokens. Grant read-only access to the "
+                 "repositories you want J.A.R.V.I.S. to see.",
+    ),
+    Service(
+        id="home_assistant",
+        label="Home Assistant",
+        summary="The user's own Home Assistant instance: devices, scenes and "
+                "scripts over its local REST API.",
+        switch="home_assistant",
+        fields=(("home_assistant_url", "Base URL (e.g. http://homeassistant.local:8123)",
+                 False, False),
+                ("home_assistant_token", "Long-lived access token", True, False),
+                ("home_assistant_verify_tls", "Verify TLS (true/false, default true)",
+                 False, True)),
+        note="Locks, alarms, cameras and arbitrary service calls are read-only "
+             "or refused. The token is sent only to this URL.",
+        probe_name="_probe_home_assistant",
+        help_url="https://developers.home-assistant.io/docs/api/rest/",
+        key_help="Home Assistant ▸ your profile ▸ Security ▸ Long-lived access "
+                 "tokens ▸ Create token. Use http on your LAN or a valid "
+                 "certificate for https.",
+    ),
+    Service(
+        id="library",
+        label="Knowledge library",
+        summary="Local document conversion and SQLite FTS5 search. No cloud, no "
+                "account and no source-file changes.",
+        switch="library",
+        fields=(),
+        note="PDF, Word, Excel and PowerPoint conversion needs the optional "
+             "MarkItDown package; plain text and Markdown work without it.",
+        probe_name="_probe_library",
+    ),
+    Service(
+        id="meeting_notes",
+        label="Meeting notes",
+        summary="Local system-audio and microphone recording with local "
+                "transcription into Markdown notes.",
+        switch="meeting_notes",
+        fields=(("meeting_notes_model", "Whisper model (tiny/base/small/medium)",
+                 False, True),),
+        note="Recording is off by default and every start asks for confirmation "
+             "on the HUD. Audio never leaves this machine.",
+        probe_name="_probe_meeting_notes",
+    ),
+    Service(
         id="connect",
         label="JarvisOS Connect",
         summary="The desktop gateway that lets a paired phone or browser reach "
@@ -744,6 +805,138 @@ def _probe_smart_home(config: dict, timeout: float) -> dict:
     if refused:
         detail += f". No answer from: {', '.join(refused)}"
     return _result("ready", detail + ".", ok=True, reachable=len(reachable))
+
+
+def _probe_github(config: dict, timeout: float) -> dict:
+    """One authenticated GET /user — the cheapest real identity check."""
+    token = _value(config, "github_token")
+    if not token:
+        return _result("missing_key", "No GitHub token is set. Paste a read-only "
+                                      "personal access token in Settings ▸ API ▸ "
+                                      "GitHub.")
+    problem = _credential_shape_problem(token)
+    if problem:
+        return _result("missing_key", f"The GitHub token {problem}.")
+    base = (_value(config, "github_api_url") or "https://api.github.com").rstrip("/")
+    if not base.startswith(("https://", "http://")):
+        return _result("unavailable", "The GitHub API base URL must start with "
+                                      "http:// or https://.")
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28",
+               "User-Agent": "JarvisOS"}
+    try:
+        resp = _get(base + "/user", headers, timeout)
+    except Exception as exc:
+        return _result("unavailable", f"GitHub did not answer: "
+                                      f"{type(exc).__name__}: {exc}")
+    if resp.status_code == 200:
+        try:
+            login = str((resp.json() or {}).get("login") or "the token owner")
+        except Exception:
+            login = "the token owner"
+        return _result("ready", f"GitHub accepted the token for {login}. "
+                                "This link is read-only.", ok=True, login=login)
+    if resp.status_code in (401, 403):
+        return _result("unavailable", "GitHub rejected the token (HTTP "
+                                      f"{resp.status_code}). Check that it is a "
+                                      "valid read-only token and has not expired.")
+    return _result("unavailable", f"GitHub returned HTTP {resp.status_code}.")
+
+
+def _probe_home_assistant(config: dict, timeout: float) -> dict:
+    """GET /api/ on the configured instance; one request, no retries."""
+    url = _value(config, "home_assistant_url").rstrip("/")
+    token = _value(config, "home_assistant_token")
+    if not url or not token:
+        missing = []
+        if not url:
+            missing.append("URL")
+        if not token:
+            missing.append("long-lived token")
+        return _result("missing_key", "Home Assistant needs its " +
+                                      " and ".join(missing) + " in Settings ▸ API.")
+    if not url.startswith(("https://", "http://")):
+        return _result("unavailable", "The Home Assistant URL must start with "
+                                      "http:// or https://.")
+    verify = _value(config, "home_assistant_verify_tls").strip().lower() \
+        not in ("false", "0", "no", "off")
+    try:
+        import requests
+        resp = requests.get(url + "/api/",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=timeout, verify=verify,
+                            allow_redirects=False)
+    except Exception as exc:
+        return _result("unavailable", f"Home Assistant did not answer: "
+                                      f"{type(exc).__name__}: {exc}")
+    if resp.status_code == 200:
+        return _result("ready", "Home Assistant answered and accepted the token.",
+                       ok=True)
+    if resp.status_code in (401, 403):
+        return _result("unavailable", "Home Assistant rejected the token (HTTP "
+                                      f"{resp.status_code}). Create a long-lived "
+                                      "access token on your profile page.")
+    return _result("unavailable", f"Home Assistant returned HTTP "
+                                  f"{resp.status_code}.")
+
+
+def _probe_library(config: dict, timeout: float) -> dict:
+    """Check the three real prerequisites without writing a database."""
+    del config, timeout
+    try:
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE VIRTUAL TABLE probe USING fts5(x)")
+        finally:
+            conn.close()
+        fts = True
+    except Exception:
+        fts = False
+    markitdown = _has_module("markitdown")
+    if not fts:
+        return _result("unavailable", "SQLite on this machine has no FTS5 module, "
+                                      "so the library cannot be searched.")
+    detail = "SQLite FTS5 is available."
+    if markitdown:
+        detail += " MarkItDown is installed for PDF/Office conversion."
+    else:
+        detail += (" MarkItDown is not installed, so PDF, Word, Excel and "
+                   "PowerPoint cannot be converted yet (pip install "
+                   "'markitdown[pdf,docx,xlsx,pptx]'). Plain text and Markdown "
+                   "still work.")
+    return _result("ready" if markitdown else "degraded", detail, ok=True,
+                   fts5=True, markitdown=markitdown)
+
+
+def _probe_meeting_notes(config: dict, timeout: float) -> dict:
+    """Report the real modules; never open the microphone in a probe."""
+    del timeout
+    import sys
+    audio = _has_module("pyaudiowpatch")
+    asr = _has_module("faster_whisper")
+    model = _value(config, "meeting_notes_model") or "base"
+    if sys.platform != "win32":
+        return _result("unavailable", "System-audio loopback capture is "
+                                      "Windows-only; meeting notes cannot record "
+                                      "the other side on this platform.")
+    if not audio and not asr:
+        return _result("unavailable", "Meeting notes needs PyAudioWPatch for "
+                                      "audio capture and faster-whisper for "
+                                      "transcription. Neither is installed.")
+    if not audio:
+        return _result("degraded", "faster-whisper is installed, but "
+                                   "PyAudioWPatch is not, so system audio and "
+                                   "the microphone cannot be captured.")
+    if not asr:
+        return _result("degraded", "PyAudioWPatch is installed and recording "
+                                   "will work, but faster-whisper is missing, so "
+                                   "transcripts cannot be produced yet.")
+    return _result("ready", f"Audio capture and local transcription are ready "
+                            f"(model: {model}). Recording is off until you enable "
+                            "Meeting notes and confirm each start.", ok=True,
+                   model=model)
 
 
 def _probe_connect(config: dict, timeout: float) -> dict:

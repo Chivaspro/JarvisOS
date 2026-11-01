@@ -40,12 +40,22 @@ _ui_spec.loader.exec_module(ui)
 
 
 class _RecChat:
+    """The real surface's contract: the indicator carries the visible word.
+
+    ``_RoundedChatLog.show_typing_indicator(label=None)`` takes the label the
+    watchdog will later withdraw, so the stub takes it too (a stub with the old
+    no-argument signature silently turned every activity into a TypeError that
+    the real code's guard swallowed).
+    """
+
     def __init__(self):
         self.shows = 0
         self.hides = 0
+        self.words: list[str] = []
 
-    def show_typing_indicator(self):
+    def show_typing_indicator(self, label=None):
         self.shows += 1
+        self.words.append(str(label or ''))
 
     def hide_typing_indicator(self):
         self.hides += 1
@@ -69,9 +79,17 @@ def _make_stub():
     st.send_btn = _FakeSend()
     st._busy = False
     src = ui.RefinedCommandWindow
+    # The real lifecycle methods, bound onto the stub. The watchdog methods are
+    # included because the settle path calls _cancel_response_watchdog(): a
+    # missing attribute there would raise INSIDE a QTimer slot, and PyQt aborts
+    # the whole process on an exception escaping a slot (the native 0xC0000409
+    # crash this file used to take the pytest process down with).
     for name in ("set_chat_activity", "clear_chat_activity",
                  "_schedule_indicator_settle", "_cancel_indicator_settle",
-                 "_settle_typing_indicator", "_set_busy", "is_busy"):
+                 "_settle_typing_indicator", "_set_busy", "is_busy",
+                 "_arm_response_watchdog", "_cancel_response_watchdog",
+                 "response_watchdog_active", "_on_response_timeout",
+                 "turn_finished"):
         setattr(st, name, src.__dict__[name].__get__(st, QWidget))
     return st
 
@@ -81,6 +99,8 @@ def test_activity_shows_indicator(qapp):
     st.set_chat_activity("Scanning document")
     assert st.chat.shows == 1
     assert st.chat.hides == 0
+    # The visible word is part of the contract, not just the dots.
+    assert st.chat.words == ["WORKING"]
 
 
 def test_tool_completion_does_not_prematurely_hide(qapp):

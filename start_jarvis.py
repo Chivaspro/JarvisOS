@@ -450,17 +450,51 @@ def console_less(exe) -> Path:
         return exe
 
 
-def launch(exe, on_started=None) -> int:
+def _performance_profile():
+    """Load core/performance_profile.py by path (stdlib only, like the sweep).
+
+    Returns ``None`` when the file is missing or cannot be loaded, in which
+    case the launch simply proceeds with the environment it already has.
+    """
+    module = BASE / "core" / "performance_profile.py"
+    try:
+        if not module.is_file():
+            return None
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "jarvis_performance_profile", str(module))
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        return loaded
+    except Exception:
+        return None
+
+
+def launch(exe, on_started=None, log=None) -> int:
     """Start ``main.py`` in its own process with *exe* and wait for it.
 
     ``on_started()`` runs the moment the process exists (the launch UI closes
     there, rather than lingering until the app exits).
+
+    The child gets the saved CPU profile before it starts: the numerical
+    libraries read ``OMP_NUM_THREADS`` and friends at import time, so the
+    environment has to be in place in ``Popen``, not patched in afterwards. The
+    priority class is then raised on the live child — one call, no restart.
     """
     exe = Path(exe)
     console = _has_console()
     target = exe if console else console_less(exe)
     env = dict(os.environ)
     env[ENV_BOOTSTRAPPED] = "1"
+    perf = _performance_profile()
+    if perf is not None:
+        try:
+            profile = perf.read_profile()
+            for key, value in perf.thread_environment(profile).items():
+                env.setdefault(key, value)
+        except Exception:
+            pass
     kwargs: dict = {"cwd": str(BASE), "env": env}
     if not console:
         flags = _no_window_flags()
@@ -471,8 +505,16 @@ def launch(exe, on_started=None) -> int:
     except Exception as exc:
         dialog(f"J.A.R.V.I.S could not be launched.\n\n"
                f"Interpreter: {target}\nEntry point: {ENTRY}\n\n"
-               f"{type(exc).__name__}: {exc}", "J.A.R.V.I.S — Startup Error")
+               f"{type(exc).__name__}: {exc}", "J.A.R.V.I.S - Startup Error")
         return 1
+    if perf is not None:
+        try:
+            good, detail = perf.apply_priority(
+                perf.read_profile()["cpu_priority"], pid=proc.pid)
+            if log is not None:
+                log(f"SYS: CPU profile — {detail}.")
+        except Exception:
+            pass
     if on_started is not None:
         try:
             on_started()
@@ -732,7 +774,8 @@ def _pipeline(args, prog, ui) -> int:
         if ui is not None:
             ui.finish("J.A.R.V.I.S STARTING")
 
-    return launch(chosen.exe, on_started=started if ui is not None else None)
+    return launch(chosen.exe, on_started=started if ui is not None else None,
+                  log=log)
 
 
 def main(argv=None) -> int:

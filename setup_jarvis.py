@@ -15,8 +15,8 @@ Enter runs, and every letter/number shortcut still works.
                              caches — and a plain report of anything it could
                              not repair
     [2] Install & update     ▸ Python 3.13 · packages · update · wipe .venv ·
-                               Node runtime · Playwright · FFmpeg · Git ·
-                               install ALL missing
+                               Node runtime · Playwright · REA · Laya · FFmpeg ·
+                               Git · Rust native (optional) · install ALL missing
     [3] Keys & providers     ▸ configure API keys (paste-friendly, verified the
                                moment they are typed: '-'=clear, 'test',
                                'open', 'help', 'env') · test connections ·
@@ -34,8 +34,9 @@ Enter runs, and every letter/number shortcut still works.
     [7] Settings editor  NEW model · voice renderer · client VAD · wake word ·
                                sensitivity · proactive speaking · narrator ·
                                Laya — edited from here, without opening the app
-    [8] Clean & maintain     ▸ optimize (logs/cache/bytecode) · compress/shrink ·
-                               reset data (backed up: config/backups/reset_*)
+    [8] Clean & maintain     ▸ optimize (logs/cache/bytecode · precompile ·
+                               CPU priority) · CPU priority & threads ·
+                               compress/shrink · reset data (backed up)
     [9] Build .exe           a Jarvis OS executable that carries its saved data
                              (config, data, memory, assets) — the project
                              folder itself is never moved or deleted
@@ -66,6 +67,8 @@ Non-interactive use
     python setup_jarvis.py --install        # Python dependencies
     python setup_jarvis.py --node           # Node dependencies (Agent TARS)
     python setup_jarvis.py --browser        # Playwright chromium
+    python setup_jarvis.py --native         # build the OPTIONAL Rust extension (jarvis_native)
+    python setup_jarvis.py --native-status  # native backend report (toolchain/build/import)
     python setup_jarvis.py --keys --yes     # write keys from .env, no prompts
     python setup_jarvis.py --test          # test stored keys live
     python setup_jarvis.py --fix-gemini    # repair Gemini (google-genai + key) and verify
@@ -88,6 +91,7 @@ Run it with the interpreter you intend to use::
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import platform
@@ -131,6 +135,18 @@ MIN_PYTHON = (3, 11)
 # moved the failure to the first `npm ci`.
 NODE_MIN = (22, 15, 0)
 NODE_MIN_TEXT = "22.15.0"
+
+#: REA is an npm MCP server, not a Python package. Its pinned release and the
+#: two Node matrices live in ``mcp_host/rea.py``; these copies exist because the
+#: wizard is stdlib-only and must keep working before the project imports. A
+#: unit test pins them to the module so the two can never drift.
+REA_PACKAGE = "rea-agents"
+REA_VERSION = "6.7.0"
+REA_NODE_GATE_TEXT = "Node.js 22.19+, 24.11+, or 26+"
+REA_NODE_RECOMMENDED_TEXT = "Node.js 22.23.4+, 24.22.1+, or 26.12.1+"
+REA_NODE_GATE = {22: (19, 0), 24: (11, 0)}
+REA_NODE_RECOMMENDED = {22: (23, 4), 24: (22, 1), 26: (12, 1)}
+REA_TIMEOUT_S = 240.0
 
 # ── ANSI colours — the J.A.R.V.I.S. HUD palette ──────────────────────────────
 # The wizard speaks the same colour language as the app itself (ui_theme.py's
@@ -705,13 +721,428 @@ def install_python_runtime() -> bool:
 def check_node() -> tuple[bool, str]:
     exe = shutil.which("node")
     if not exe:
-        bad("Node.js not found — needed only for the Agent TARS automation engine")
+        bad("Node.js not found — needed for Agent TARS and REA")
         return False, "node is not on PATH"
     ver = _version_of("node", "--version")
     good = _parse_node_version(ver) >= NODE_MIN
     (ok if good else warn)(f"Node.js {ver or '?'}" +
-        ("" if good else f"  — Agent TARS requires v{NODE_MIN_TEXT} or newer"))
+        ("" if good else f"  - Agent TARS requires v{NODE_MIN_TEXT} or newer"))
     return good, ver
+
+
+def _rea_node_supported(version: str) -> bool:
+    """npm's own ``engines`` gate for ``rea-agents`` (the hard install gate)."""
+    raw = str(version or "").strip().lstrip("vV")
+    if not raw or "-" in raw.split("+", 1)[0]:
+        return False
+    major, minor, _patch = _parse_node_version(raw)
+    if major in (22, 24):
+        return (minor, _patch) >= REA_NODE_GATE[major]
+    return major >= 26 and major % 2 == 0
+
+
+def _rea_node_recommended(version: str) -> bool:
+    """REA's README matrix (a warning, never a hard failure)."""
+    raw = str(version or "").strip().lstrip("vV")
+    if not raw or "-" in raw.split("+", 1)[0]:
+        return False
+    major, minor, patch = _parse_node_version(raw)
+    floor = REA_NODE_RECOMMENDED.get(major)
+    if floor:
+        return (minor, patch) >= floor
+    return major > 26 and major % 2 == 0
+
+
+def _rea_npx_root() -> Path:
+    if _IS_WIN:
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "npm-cache" / "_npx"
+    return Path.home() / ".npm" / "_npx"
+
+
+def _rea_cache_dirs(version: str | None = None) -> list[Path]:
+    """Every npx cache entry that contains a real ``rea-agents`` package."""
+    wanted = str(version or "").strip().lstrip("vV")
+    found: list[Path] = []
+    try:
+        entries = list(_rea_npx_root().iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        package_json = entry / "node_modules" / REA_PACKAGE / "package.json"
+        try:
+            if not package_json.is_file():
+                continue
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+            installed = str(data.get("version") or "").strip().lstrip("vV")
+        except Exception:
+            continue
+        if wanted and installed != wanted:
+            continue
+        found.append(entry)
+    return found
+
+
+def _rea_cached_versions() -> list[str]:
+    versions: list[str] = []
+    for entry in _rea_cache_dirs():
+        try:
+            data = json.loads((entry / "node_modules" / REA_PACKAGE /
+                               "package.json").read_text(encoding="utf-8"))
+            value = str(data.get("version") or "").strip().lstrip("vV")
+        except Exception:
+            continue
+        if value and value not in versions:
+            versions.append(value)
+    return sorted(versions)
+
+
+def check_rea() -> tuple[bool, str]:
+    """Probe REA's real prerequisites without starting the MCP server."""
+    section("REA (Reverse Engineer Anything)")
+    node_exe = shutil.which("node")
+    npx_exe = shutil.which("npx")
+    if not node_exe:
+        bad(f"Node.js not found — REA needs {REA_NODE_GATE_TEXT}.")
+        return False, "node is not on PATH"
+    version = _version_of("node", "--version")
+    if not _rea_node_supported(version):
+        bad(f"Node.js {version or '?'} is not supported by REA — "
+            f"needs {REA_NODE_GATE_TEXT}.")
+        return False, f"unsupported node {version}"
+    if not npx_exe:
+        bad("npx not found — it ships with npm/Node.js.")
+        return False, "npx is not on PATH"
+    if not _rea_node_recommended(version):
+        warn(f"Node.js {version} installs REA but is below its tested matrix "
+             f"({REA_NODE_RECOMMENDED_TEXT}).")
+    cached = _rea_cache_dirs(REA_VERSION)
+    if cached:
+        ok(f"REA {REA_VERSION} is cached in npx ({len(cached)} entr"
+           f"{'y' if len(cached) == 1 else 'ies'}).")
+    else:
+        info(f"REA {REA_VERSION} is not cached yet — the first start downloads it.")
+    return True, version
+
+
+def _rea_repair_cache() -> None:
+    """Remove a broken npx entry for the pinned release.
+
+    A partial ``_npx`` extraction (the measured failure was a missing
+    ``@jridgewell/sourcemap-codec`` ESM file) makes Node exit before the MCP
+    handshake. Deleting only that entry is safe: npx re-extracts it.
+    """
+    for entry in _rea_cache_dirs(REA_VERSION):
+        info(f"Removing the partial npx entry {entry.name}…")
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+def _rea_handshake() -> tuple[bool, str]:
+    """Start the real server through the venv and prove the protocol works."""
+    py = Path(_venv_python())
+    if not py.is_file():
+        return False, "the venv is missing — run [2] Python packages first"
+    script = (
+        "import json\n"
+        "from mcp_host import rea\n"
+        "from mcp_host.session import McpSession\n"
+        "s = McpSession(rea.rea_server_spec())\n"
+        "ok = s.start()\n"
+        "if not ok:\n"
+        "    print(json.dumps({'ok': False, 'error': s.error}))\n"
+        "    raise SystemExit(1)\n"
+        "names = [t.name for t in s.tools]\n"
+        "r = s.call_tool('binary_session', {}, timeout=120)\n"
+        "print(json.dumps({'ok': bool(r.ok), 'tools': len(names),\n"
+        "                  'curated': len(rea.REA_DEFAULT_TOOLS),\n"
+        "                  'missing': sorted(set(rea.REA_DEFAULT_TOOLS) - set(names)),\n"
+        "                  'protocol': s.protocol_version, 'error': r.error}))\n"
+        "s.close('setup probe done')\n"
+    )
+    result = _run([str(py), "-c", script], timeout=REA_TIMEOUT_S, capture=True)
+    if not result:
+        return False, "the handshake process could not be started"
+    text = (result.stdout or "").strip().splitlines()
+    payload = {}
+    for line in reversed(text):
+        try:
+            payload = json.loads(line)
+            break
+        except Exception:
+            continue
+    if result.returncode != 0 or not payload.get("ok"):
+        detail = payload.get("error") or (result.stderr or "").strip()
+        return False, (detail.splitlines()[-1] if detail else "the server did not answer")
+    missing = payload.get("missing") or []
+    if missing:
+        return False, f"the server is missing curated tools: {', '.join(missing[:5])}"
+    return True, (f"{payload.get('tools', 0)} tools, "
+                  f"{payload.get('curated', 0)} curated, "
+                  f"protocol {payload.get('protocol', '?')}")
+
+
+def _rea_prewarm() -> tuple[bool, str]:
+    """Extract the pinned release into the npx cache and prove a handshake.
+
+    ``npm cache add`` only fills npm's content-addressable cache; npx still has
+    to extract the package. One real ``--version`` run does that extraction and
+    is fast once warm, so the handshake afterwards measures the actual server
+    rather than a cache that merely exists.
+    """
+    npx_exe = shutil.which("npx")
+    if not npx_exe:
+        return False, "npx is not on PATH (it ships with npm/Node.js)"
+
+    info("Verifying the npm cache…")
+    r = _run([_npm_exe(), "cache", "verify"], timeout=300)
+    if r and r.returncode != 0:
+        warn("npm cache verify reported a problem — continuing with a clean add.")
+
+    info(f"Caching {REA_PACKAGE}@{REA_VERSION} (one download, then npx reuses it)…")
+    r = _npm_run(["cache", "add", f"{REA_PACKAGE}@{REA_VERSION}"], timeout=600)
+    if not r or r.returncode != 0:
+        warn("The package could not be cached.")
+        _npm_tail(r)
+        return False, "the package could not be downloaded"
+
+    info("Extracting it into the npx cache (this is what the server launches)…")
+    extract = _run([npx_exe, "-y", f"{REA_PACKAGE}@{REA_VERSION}", "--version"],
+                   timeout=REA_TIMEOUT_S)
+    version_text = ((extract.stdout or "") if extract else "").strip().splitlines()
+    if version_text:
+        info(f"npx reports {version_text[-1].strip()}")
+    if not _rea_cache_dirs(REA_VERSION):
+        detail = ((extract.stderr or "").strip() if extract else "") or \
+                 "npx did not leave an extracted package behind"
+        return False, detail.splitlines()[-1][:200] if detail else detail
+
+    info("Starting the real MCP server once to prove the handshake…")
+    good, detail = _rea_handshake()
+    if not good:
+        warn(f"First handshake failed: {detail}")
+        info("Repairing the npx extraction and retrying once…")
+        _rea_repair_cache()
+        good, detail = _rea_handshake()
+    return good, detail
+
+
+def install_rea(confirm: bool = True) -> bool:
+    """Pre-warm the pinned REA package and prove a real MCP handshake.
+
+    Nothing is enabled here: REA ships opt-in (``enabled=False``), so this
+    makes it *ready* without spawning it on every boot. The user enables it in
+    Settings ▸ MCP (or with the ``mcp`` tool) when they want it.
+    """
+    section(f"REA {REA_VERSION}  (npm · MCP stdio)")
+    good, detail = check_rea()
+    if not good:
+        return False
+    if confirm and not _confirm(
+            f"Download and verify {REA_PACKAGE}@{REA_VERSION} now?", default=True):
+        info("Skipped — REA will download on its first start instead.")
+        return False
+
+    good, detail = _rea_prewarm()
+    if good:
+        ok(f"REA is ready — {detail}.")
+        info("REA stays opt-in: enable it in Settings ▸ MCP when you need it.")
+        return True
+    bad(f"REA could not start: {detail}")
+    info(f"Manual check: npx -y {REA_PACKAGE}@{REA_VERSION} mcp")
+    return False
+
+
+def test_rea() -> bool:
+    """Diagnose ▸ Test REA — the same real handshake, without reinstalling."""
+    section(f"Test REA {REA_VERSION}")
+    good, detail = check_rea()
+    if not good:
+        return False
+    good, detail = _rea_handshake()
+    if good:
+        ok(f"REA answered — {detail}.")
+    else:
+        bad(f"REA did not answer: {detail}")
+        info("Run Install & update ▸ REA to repair the npx cache.")
+    return good
+
+
+# ── Laya AI (local decision model) ───────────────────────────────────────────
+
+#: The Python package and the checkpoint the project ships/detects. Kept in
+#: step with ``requirements.txt``, ``app/installer.py`` and
+#: ``core/laya_decision.py``; the model itself is data, not a pip package.
+LAYA_PACKAGE = "laya==0.4.14"
+LAYA_REQUIREMENTS = (LAYA_PACKAGE, "transformers>=4.48.0")
+LAYA_MODEL_CANDIDATES = (("models", "laya-multilingual"),
+                         ("laya-multilingual",))
+LAYA_REQUIRED_FILES = ("rl_agent_config.json", "model.safetensors")
+LAYA_REQUIRED_DIRS = ("tokenizer", "encoder")
+
+
+def _laya_model_dir() -> tuple[Path | None, list[str]]:
+    """Locate the checkpoint and list exactly what is missing (never guesses)."""
+    for parts in LAYA_MODEL_CANDIDATES:
+        path = ROOT.joinpath(*parts)
+        if not path.is_dir():
+            continue
+        missing = [name for name in LAYA_REQUIRED_FILES
+                   if not (path / name).is_file()]
+        missing += [f"{name}/" for name in LAYA_REQUIRED_DIRS
+                    if not (path / name).is_dir()]
+        return path, missing
+    return None, ["laya-multilingual/"]
+
+
+def _laya_import_probe() -> tuple[bool, str]:
+    """Prove the venv can import Laya's runtime, without loading the model."""
+    py = Path(_venv_python())
+    if not py.is_file():
+        return False, "the .venv is missing — run [2] Python packages first"
+    result = _run([
+        str(py), "-c",
+        "import laya, transformers; "
+        "print(laya.__version__, transformers.__version__)"],
+        timeout=120)
+    if result and result.returncode == 0:
+        text = (result.stdout or "").strip().splitlines()
+        return True, (text[-1] if text else "laya and transformers import")
+    detail = ((result.stderr or "").strip().splitlines()[-1]
+              if result and (result.stderr or "").strip() else "")
+    return False, detail[:200] or "laya/transformers could not be imported"
+
+
+def check_laya() -> tuple[bool, str]:
+    """Report the checkpoint and the two runtime packages, truthfully."""
+    section("Laya AI  (local decision model)")
+    model_dir, missing = _laya_model_dir()
+    if model_dir is None:
+        bad("laya-multilingual/ was not found in models/ or the project root.")
+        info("The checkpoint is data, not a pip package: restore the model folder first.")
+        return False, "model not found"
+    if missing:
+        bad(f"The checkpoint at {model_dir} is incomplete: {', '.join(missing)}")
+        return False, "model files missing: " + ", ".join(missing)
+    ok(f"Checkpoint found at {model_dir.relative_to(ROOT)}.")
+    ready, detail = _laya_import_probe()
+    if ready:
+        ok(f"Runtime packages import ({detail}).")
+    else:
+        warn(f"Runtime packages are missing ({detail}).")
+        info("Run Install & update ▸ Laya AI runtime to add laya + transformers.")
+    return ready, detail
+
+
+def _install_laya_packages() -> bool:
+    """Install Laya's two runtime packages into the project venv."""
+    if not ensure_venv():
+        return False
+    vpy = _venv_python()
+    info(f"Installing {' + '.join(LAYA_REQUIREMENTS)} into {VENV.name}/ …")
+    result = _run_with_progress(
+        [vpy, "-m", "pip", "install", *LAYA_REQUIREMENTS,
+         "--disable-pip-version-check"],
+        label="Installing Laya AI", timeout=1800,
+        env={"PIP_PROGRESS_BAR": "on", "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+    )
+    if not result or result.returncode != 0:
+        bad("The Laya runtime packages could not be installed — see pip's output above.")
+        return False
+    ready, detail = _laya_import_probe()
+    if not ready:
+        bad(f"Installed, but the import still fails: {detail}")
+        return False
+    ok(f"Laya runtime installed ({detail}).")
+    return True
+
+
+def _laya_handshake() -> tuple[bool, str]:
+    """Load the real checkpoint and make one real decision (slow, honest)."""
+    py = Path(_venv_python())
+    if not py.is_file():
+        return False, "the .venv is missing — run [2] Python packages first"
+    model_dir, missing = _laya_model_dir()
+    if model_dir is None or missing:
+        return False, ("model not found" if model_dir is None
+                       else "model incomplete: " + ", ".join(missing))
+    script = (
+        "import json, sys, time\n"
+        "import laya\n"
+        "from core.laya_decision import _QUESTIONS\n"
+        "t = time.monotonic()\n"
+        "agent = laya.load(sys.argv[1], device='cpu')\n"
+        "load_s = time.monotonic() - t\n"
+        "t = time.monotonic()\n"
+        "out = agent.predict('Open Chrome', _QUESTIONS)\n"
+        "predict_s = time.monotonic() - t\n"
+        "answer = ((out or {}).get('answers') or {}).get('action') or {}\n"
+        "print(json.dumps({'ok': bool(answer.get('choice')),\n"
+        "                  'choice': answer.get('choice') or '',\n"
+        "                  'confidence': answer.get('confidence'),\n"
+        "                  'load_s': round(load_s, 1),\n"
+        "                  'predict_s': round(predict_s, 2)}))\n"
+    )
+    result = _run([str(py), "-c", script, str(model_dir)],
+                  timeout=900, capture=True)
+    if not result:
+        return False, "the Laya probe process could not be started"
+    payload = {}
+    for line in reversed((result.stdout or "").strip().splitlines()):
+        try:
+            payload = json.loads(line)
+            break
+        except Exception:
+            continue
+    if result.returncode != 0 or not payload.get("ok"):
+        detail = ((result.stderr or "").strip().splitlines()[-1]
+                  if (result.stderr or "").strip() else "no decision returned")
+        return False, detail[:240]
+    return True, (f"{payload.get('choice')} "
+                  f"(confidence {float(payload.get('confidence') or 0):.2f}, "
+                  f"{payload.get('load_s')}s load, "
+                  f"{payload.get('predict_s')}s decision)")
+
+
+def install_laya(confirm: bool = True) -> bool:
+    """Install Laya's runtime packages, then prove a real CPU decision."""
+    section(f"Laya AI  ({LAYA_PACKAGE} · CPU)")
+    model_dir, missing = _laya_model_dir()
+    if model_dir is None or missing:
+        bad("The laya-multilingual checkpoint is not available.")
+        if model_dir is not None:
+            info("Missing: " + ", ".join(missing))
+        info("Restore models/laya-multilingual/ first — the package alone cannot decide.")
+        return False
+    if confirm and not _confirm(
+            f"Install {' + '.join(LAYA_REQUIREMENTS)} and run a real test?",
+            default=True):
+        info("Skipped — Settings ▸ Laya AI will report the missing packages.")
+        return False
+    if not _install_laya_packages():
+        return False
+    info("Loading the checkpoint and making one real decision (CPU, up to a minute)…")
+    good, detail = _laya_handshake()
+    if good:
+        ok(f"Laya is ready — {detail}.")
+        info("Laya stays advisory: every turn routes normally while it loads.")
+        return True
+    bad(f"Laya could not decide: {detail}")
+    return False
+
+
+def test_laya() -> bool:
+    """Diagnose ▸ Test Laya — a real load + decision, without reinstalling."""
+    section("Test Laya AI")
+    good, detail = check_laya()
+    if not good:
+        return False
+    good, detail = _laya_handshake()
+    if good:
+        ok(f"Laya decided — {detail}.")
+    else:
+        bad(f"Laya did not decide: {detail}")
+        info("Run Install & update ▸ Laya AI runtime to repair the packages.")
+    return good
 
 
 def check_tool(name: str, args: tuple[str, ...], why: str, required: bool = False) -> bool:
@@ -800,7 +1231,9 @@ def report_env() -> dict:
     git_ok = bool(shutil.which("git"))
     ffmpeg_ok = bool(shutil.which("ffmpeg"))
     tars_ok = _node_modules_ready()
+    rea_ok = bool(node_ok and _rea_cache_dirs(REA_VERSION))
     venv_ok = Path(_venv_python()).is_file()
+    native_ok = _native_pyd_is_fresh()
 
     requirements_ok = REQUIREMENTS.is_file()
     env_ok = ENV_FILE.is_file()
@@ -813,10 +1246,12 @@ def report_env() -> dict:
         "git": git_ok,
         "ffmpeg": ffmpeg_ok,
         "node_modules": tars_ok,
+        "rea": rea_ok,
         "venv": venv_ok,
         "requirements": requirements_ok,
         "env_file": env_ok,
         "config": config_ok,
+        "native": native_ok,
     }
 
     py_value = (
@@ -838,6 +1273,10 @@ def report_env() -> dict:
          "ok" if ffmpeg_ok else "warn"),
         ("Agent TARS", "Ready" if tars_ok else "Not installed",
          "ok" if tars_ok else "warn"),
+        ("REA", f"Cached ({REA_VERSION})" if rea_ok else "Not cached",
+         "ok" if rea_ok else "opt"),
+        ("Native", "Rust — built" if native_ok else "Optional — not built",
+         "ok" if native_ok else "opt"),
     ]
 
     # Three-state rows: FFmpeg is genuinely optional, so it is not alarming.
@@ -860,6 +1299,8 @@ def report_env() -> dict:
         print("  " + faint("requirements.txt  ·  missing"))
     if not venv_ok:
         print("  " + faint(".venv/  ·  not created — run option [2] to create and populate it"))
+    if not native_ok:
+        print("  " + faint("native backend  ·  optional — add it via [2] ▸ Native Rust backend"))
     if not env_ok or not config_ok:
         print("  " + faint("configuration  ·  not initialized"))
 
@@ -945,6 +1386,180 @@ def install_python_deps() -> bool:
     return good
 
 
+# ── 2b. Native Rust backend (OPTIONAL — the app runs fully without it) ────────
+#
+# Hybrid design: Python owns the AI, orchestration, voice providers and UI; an
+# OPTIONAL Rust extension (native/, built by tools/build_native.py) accelerates
+# the PCM hot paths — mic-block RMS/level, reactive envelopes, silence
+# compression, resampling and the int16 playback ring. This wizard never makes
+# it look required: every state degrades to the working pure-Python backend
+# (core/native.py), and a compiler is never installed without asking.
+#
+# Rust requirements, when someone chooses to build:
+#   cargo/rustc  — rustup (winget install Rustlang.Rustup)
+#   a linker     — MSVC (Visual Studio Build Tools) OR the GNU toolchain
+#                  (rustup toolchain install stable-x86_64-pc-windows-gnu)
+#   dlltool      — binutils, needed by the GNU path for Python linking
+#                  (winget install BrechtSanders.WinLibs.POSIX.UCRT)
+
+NATIVE_TOOL = ROOT / "tools" / "build_native.py"
+NATIVE_DIR = ROOT / "native"
+NATIVE_PYD = NATIVE_DIR / "jarvis_native.pyd"
+GNU_RUST_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+
+
+def _cargo_exe() -> str | None:
+    """cargo from PATH, else the rustup default location (fresh installs)."""
+    found = shutil.which("cargo")
+    if found:
+        return found
+    guess = (Path(os.environ.get("USERPROFILE", "")) / ".cargo" / "bin"
+             / ("cargo.exe" if _IS_WIN else "cargo"))
+    return str(guess) if guess.is_file() else None
+
+
+def _native_python() -> str:
+    """The interpreter the extension must load in — the venv when it exists."""
+    vpy = _venv_python()
+    return vpy if Path(vpy).is_file() else sys.executable
+
+
+def _native_pyd_is_fresh() -> bool:
+    """True when jarvis_native.pyd exists and is newer than every source file."""
+    if not NATIVE_PYD.is_file():
+        return False
+    try:
+        built = NATIVE_PYD.stat().st_mtime
+        sources = [NATIVE_DIR / "Cargo.toml", NATIVE_DIR / "build.rs"]
+        sources += list((NATIVE_DIR / "src").glob("*.rs"))
+        newest = max((p.stat().st_mtime for p in sources if p.is_file()), default=0.0)
+        return built >= newest
+    except OSError:
+        return True  # stat trouble is not worth nagging about
+
+
+def _dlltool_installed() -> bool:
+    """binutils dlltool on PATH or in a default WinLibs install (GNU builds need it)."""
+    if shutil.which("dlltool"):
+        return True
+    pattern = str(Path(os.environ.get("LOCALAPPDATA", "")) /
+                  "Microsoft" / "WinGet" / "Packages" /
+                  "BrechtSanders.WinLibs*" / "**" / "bin" / "dlltool.exe")
+    return any(Path(hit).is_file() for hit in glob.glob(pattern, recursive=True))
+
+
+def native_backend_report() -> bool:
+    """Print the native backend status: toolchain · build · import."""
+    section("Native Rust backend  (optional performance extension)")
+    if not NATIVE_TOOL.is_file():
+        warn(f"Build tool missing: {NATIVE_TOOL} — native backend unavailable.")
+        info("The app keeps running on the pure-Python backend — nothing is lost.")
+        return False
+    r = _run([_native_python(), str(NATIVE_TOOL), "--check"], timeout=300)
+    text = ((r.stdout or "") + (r.stderr or "")) if r else ""
+    for line in text.strip().splitlines():
+        print("      " + faint(line))
+    active = bool(r and r.returncode == 0)
+    if active:
+        ok("Native backend active — Rust accelerates the audio hot paths.")
+    else:
+        info("Native backend not active — the app runs the pure-Python backend.")
+        if _cargo_exe():
+            info("Build it via  [2] ▸ Native Rust backend  (or --native).")
+        else:
+            info("Rust is not installed (optional). The menu row can set it up.")
+    return active
+
+
+def install_rust_toolchain() -> bool:
+    """Install Rust + a linker, entirely user-scope (no admin rights needed).
+
+    rustup via winget; the GNU toolchain (which needs no Visual Studio); and
+    WinLibs for the binutils ``dlltool`` that Rust's raw-dylib Python linking
+    requires on GNU targets.
+    """
+    section("Install Rust toolchain  (only needed to BUILD the extension)")
+    if not _IS_WIN:
+        info("Install rustup from https://rustup.rs, then run: python setup_jarvis.py --native")
+        return False
+    if not shutil.which("winget"):
+        bad("winget is not available — install Rust manually from https://rustup.rs")
+        info("(Windows: rustup-installer.exe; it needs no admin rights.)")
+        return False
+
+    if not _cargo_exe():
+        info("Installing rustup with winget — this may take a few minutes…")
+        r = _run_with_progress(
+            ["winget", "install", "--id", "Rustlang.Rustup", "-e",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            label="Installing Rust (rustup)", timeout=1800,
+        )
+        if not (r and r.returncode == 0) or not _cargo_exe():
+            bad("rustup could not be installed automatically.")
+            info("Install from https://rustup.rs, then re-run this option.")
+            return False
+        ok("rustup installed.")
+
+    cargo = _cargo_exe()
+    rustup = Path(cargo).with_name("rustup.exe" if _IS_WIN else "rustup")
+    if rustup.is_file():
+        info("Adding the GNU toolchain (works without Visual Studio Build Tools)…")
+        r = _run_with_progress(
+            [str(rustup), "toolchain", "install", GNU_RUST_TOOLCHAIN, "--profile", "minimal"],
+            label="Installing the GNU Rust toolchain", timeout=1800,
+        )
+        (ok if r and r.returncode == 0 else warn)(
+            "GNU toolchain ready." if r and r.returncode == 0
+            else "GNU toolchain step reported a problem — MSVC may still work.")
+
+    if not _dlltool_installed():
+        info("Installing WinLibs — provides dlltool (binutils) for the GNU build…")
+        r = _run_with_progress(
+            ["winget", "install", "--id", "BrechtSanders.WinLibs.POSIX.UCRT", "-e",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            label="Installing WinLibs (binutils)", timeout=1800,
+        )
+        (ok if r and r.returncode == 0 else warn)(
+            "binutils ready." if r and r.returncode == 0
+            else "WinLibs install reported a problem — MSVC linker may still work.")
+    else:
+        ok("binutils dlltool already available.")
+
+    ok("Rust toolchain ready — build the extension next:  [2] ▸ Native Rust backend")
+    return True
+
+
+def build_native_extension() -> bool:
+    """Build / rebuild the optional jarvis_native extension in release mode."""
+    section("Build native Rust extension  (optional · release mode)")
+    if not NATIVE_TOOL.is_file():
+        bad(f"Build tool missing: {NATIVE_TOOL}")
+        return False
+    if not _cargo_exe():
+        warn("Rust is not installed on this machine (it is optional).")
+        if _confirm("Install the Rust toolchain now (winget, no admin needed)?",
+                    default=True):
+            if not install_rust_toolchain():
+                return False
+        else:
+            info("Skipped — the app keeps using the pure-Python backend.")
+            return False
+
+    r = _run_with_progress(
+        [_native_python(), str(NATIVE_TOOL), "--quiet"],
+        label="Building jarvis_native (cargo release)", timeout=2400,
+    )
+    good = bool(r and r.returncode == 0)
+    if good:
+        ok("Native extension built — Rust now accelerates the audio hot paths.")
+    else:
+        bad("Native build failed — the app keeps using the pure-Python backend.")
+        tail = ((r.stdout or "") + (r.stderr or "")) if r else ""
+        for line in tail.strip().splitlines()[-6:]:
+            print("      " + faint(line))
+    return good
+
+
 # ── 3. Node runtime (Agent TARS) ─────────────────────────────────────────────
 
 NPM_TIMEOUT = 2400
@@ -999,7 +1614,6 @@ def install_node_runtime() -> bool:
         return good
     warn(f"winget is not available — install Node.js {NODE_MIN_TEXT}+ from https://nodejs.org")
     return False
-
 
 def _repair_npm(has_lock: bool) -> None:
     """Clear the two things that actually break an npm install, then retry."""
@@ -1129,6 +1743,12 @@ EXTRA_KEYS: list[tuple[str, str, bool, str]] = [
     ("instagram_password",  "Instagram password    (optional)", True, ""),
     ("smart_home_username", "Kasa/Tapo username    (optional, local network)", False, ""),
     ("smart_home_password", "Kasa/Tapo password    (optional)", True, ""),
+    ("github_token",        "GitHub token          (optional, read-only)", True,
+     "https://github.com/settings/tokens?type=beta"),
+    ("home_assistant_url",  "Home Assistant URL    (optional, e.g. http://homeassistant.local:8123)", False, ""),
+    ("home_assistant_token", "Home Assistant token (optional, long-lived)", True,
+     "https://www.home-assistant.io/docs/authentication/"),
+    ("home_assistant_verify_tls", "Home Assistant TLS check (true/false, default true)", False, ""),
 ]
 
 
@@ -1690,6 +2310,37 @@ def _feature_rows() -> list[dict]:
 
 
 def _install_feature(feature: str) -> tuple[bool, str]:
+    """Install one optional feature through the installer inside ``.venv``.
+
+    The wizard may be launched by a system interpreter, while
+    ``app.installer`` installs with ``sys.executable``. Importing it here would
+    therefore put the package in the wrong environment. A tiny subprocess runs
+    the SAME installer with the venv's Python, so every install lands in the
+    environment J.A.R.V.I.S. actually runs from.
+    """
+    py = Path(_venv_python())
+    if py.is_file():
+        script = (
+            "import json, sys\n"
+            "from app.installer import install_feature\n"
+            "ok, sentence = install_feature(\n"
+            "    sys.argv[1], log=lambda m: print('      ' + str(m), flush=True))\n"
+            "print('__JARVIS_FEATURE__' + json.dumps([bool(ok), str(sentence)]))\n"
+        )
+        result = _run([str(py), "-c", script, feature], timeout=1800,
+                      capture=True)
+        if result is not None:
+            for line in reversed((result.stdout or "").splitlines()):
+                if line.startswith("__JARVIS_FEATURE__"):
+                    try:
+                        ok, sentence = json.loads(line[len("__JARVIS_FEATURE__"):])
+                        return bool(ok), str(sentence)
+                    except Exception:
+                        break
+            stderr = (result.stderr or "").strip().splitlines()
+            detail = f" ({stderr[-1][:160]})" if stderr else ""
+            return False, f"{feature}: the installer did not report a result{detail}"
+    # No venv yet (or a test harness): fall back to the in-process probe.
     try:
         sys.path.insert(0, str(ROOT))
         from app.installer import install_feature
@@ -1710,35 +2361,54 @@ def install_all_missing() -> bool:
 
     show_progress("Overall setup", 0, "Preparing downloads")
     python_ok = install_python_deps()
-    show_progress("Overall setup", 30, "Python dependencies finished")
+    show_progress("Overall setup", 25, "Python dependencies finished")
 
-    info("Step 2/4 — Gemini engine repair (google-genai package + key)")
+    # Optional native backend: report-only in this sweep — an "install missing"
+    # pass must never implicitly install a compiler or start a minute-long
+    # cargo build. Building is an explicit action: [2] ▸ Native Rust backend.
+    if _native_pyd_is_fresh():
+        ok("Native Rust backend: built.")
+    else:
+        info("Native Rust backend: optional, not built — "
+             "add it via [2] ▸ Native Rust backend.")
+
+    info("Step 2/5 — Gemini engine repair (google-genai package + key)")
     gemini_ok, _gemini_detail = fix_gemini()
-    show_progress("Overall setup", 45, "Gemini repair finished")
+    show_progress("Overall setup", 35, "Gemini repair finished")
 
-    info("Step 3/4 — optional feature packages")
+    info("Step 3/5 — optional feature packages")
     rows = _feature_rows()
     if not rows:
         warn("Feature probe unavailable — skipping the optional packages.")
-    pending = sorted({r["feature"] for r in rows if not r.get("ready") and r.get("module") != "node"})
+    pending = sorted({r["feature"] for r in rows
+                      if not r.get("ready")
+                      and r.get("module") not in {"node", "rea"}})
     if rows and not pending:
         ok("Every optional feature package is already installed.")
     for index, feature in enumerate(pending, start=1):
         good, sentence = _install_feature(feature)
         (ok if good else warn)(sentence)
-        show_progress("Overall setup", 45 + (15 * index / max(1, len(pending))), feature)
-    show_progress("Overall setup", 60, "Optional packages finished")
+        show_progress("Overall setup", 35 + (20 * index / max(1, len(pending))), feature)
+    show_progress("Overall setup", 55, "Optional packages finished")
 
-    info("Step 4/4 — Node runtime (Agent TARS) and Playwright browser")
+    info("Step 4/5 — Node runtime (Agent TARS) and Playwright browser")
     node_ok = install_node_deps()
-    show_progress("Overall setup", 80, "Node runtime finished")
+    show_progress("Overall setup", 70, "Node runtime finished")
     browser_ok = install_playwright_browser()
+    show_progress("Overall setup", 80, "Playwright browser finished")
+
+    info("Step 5/5 — REA reverse-engineering MCP server")
+    rea_ok = install_rea(confirm=False) if node_ok else False
+    if not node_ok:
+        info("Skipped — REA needs the Node runtime above.")
     show_progress("Overall setup", 100, "All install steps finished")
     print()
 
     rule()
     if not gemini_ok:
         warn("Gemini still needs attention — run [x] Fix Gemini or [5] API keys.")
+    if node_ok and not rea_ok:
+        warn("REA is not cached yet — run [2] ▸ REA to retry, or let npx fetch it on first start.")
     good = python_ok and node_ok and browser_ok
     (ok if good else warn)("Install pass finished — run [9] Diagnose & repair to confirm." if good
                            else "Install pass finished with one or more problems.")
@@ -2140,20 +2810,696 @@ def _fix_gemini_entry():
     return None
 
 
-# ── 8. Optimize (housekeeping via core/maintenance.py) ───────────────────────
+# ── 8. Optimize (housekeeping + precompile + CPU profile) ───────────────────
+
+#: Trees that are never precompiled: vendored runtimes, the model store, user
+#: data, VCS metadata and the test suite (not imported at runtime).
+_COMPILE_SKIP_DIRS = {
+    ".venv", "venv", "env", "node_modules", "models", "data", ".git",
+    "tests", "AgentReach", "UI-TARS", "site-packages", ".freebuff",
+    ".pytest_cache", "build", "dist", "__pycache__", ".cache",
+}
+
+
+def _performance_profile():
+    """The stdlib-only CPU/thread profile shared with start_jarvis.py."""
+    sys.path.insert(0, str(ROOT))
+    from core import performance_profile
+    return performance_profile
+
+
+def _python_sources_in_scope() -> list[Path]:
+    """Project ``.py`` files that the runtime actually imports."""
+    sources: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _COMPILE_SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(".py"):
+                sources.append(Path(dirpath) / name)
+    return sources
+
+
+def _fresh_bytecode(started: float) -> int:
+    """Count ``.pyc`` files written strictly after *started* (real measurement)."""
+    count = 0
+    prune = _COMPILE_SKIP_DIRS - {"__pycache__"}
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in prune]
+        if os.path.basename(dirpath) != "__pycache__":
+            continue
+        dirnames[:] = []
+        for name in filenames:
+            if not name.endswith(".pyc"):
+                continue
+            try:
+                if (Path(dirpath) / name).stat().st_mtime > started:
+                    count += 1
+            except OSError:
+                continue
+    return count
+
+
+def compile_project() -> dict:
+    """Precompile the project's own modules so first imports skip parsing.
+
+    Bytecode is written next to each source (``__pycache__``), which is exactly
+    what a normal import does — this only moves the cost from the first launch
+    after an update to the setup run the user already expects to be slow.
+    ``compile_file`` skips a module whose bytecode is already current, so repeat
+    runs are cheap. Never raises: a compile failure is reported and Python falls
+    back to compiling that module on import.
+    """
+    sources = _python_sources_in_scope()
+    if not sources:
+        return {"ok": False, "sources": 0, "updated": 0, "seconds": 0.0}
+    started_wall = time.time()
+    started = time.monotonic()
+    failures = 0
+    try:
+        import compileall
+    except Exception as exc:                     # pragma: no cover - stdlib
+        warn(f"Precompile could not run: {type(exc).__name__}: {exc}")
+        return {"ok": False, "sources": len(sources), "updated": 0, "seconds": 0.0}
+    for path in sources:
+        try:
+            if not compileall.compile_file(str(path), quiet=1, force=False):
+                failures += 1
+        except Exception:
+            failures += 1
+    elapsed = round(time.monotonic() - started, 2)
+    return {"ok": failures == 0, "sources": len(sources),
+            "updated": _fresh_bytecode(started_wall), "failures": failures,
+            "seconds": elapsed}
+
+
+def _lock_pid() -> int | None:
+    """The PID a running J.A.R.V.I.S. published, or None."""
+    try:
+        text = (ROOT / "data" / "runtime" / "jarvis.lock").read_text(
+            encoding="utf-8").strip()
+        pid = int(text.splitlines()[0])
+        return pid if pid > 0 and pid != os.getpid() else None
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when *pid* is a live process; unsure counts as dead."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        handle = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87      # 87 = no such process
+        try:
+            code = ctypes.c_ulong(0)
+            k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p,
+                                               ctypes.POINTER(ctypes.c_ulong)]
+            ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return (not ok) or code.value == 259      # 259 = STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def apply_priority_to_running() -> tuple[bool | None, str]:
+    """Apply the saved priority to a live J.A.R.V.I.S., if there is one.
+
+    ``None`` means "no running instance" — not a failure. Changing a process's
+    priority class needs no restart, so an Optimize run takes effect at once
+    when the app is open.
+    """
+    pid = _lock_pid()
+    if pid is None or not _pid_alive(pid):
+        return None, "J.A.R.V.I.S. is not running"
+    perf = _performance_profile()
+    level = perf.read_profile()["cpu_priority"]
+    good, detail = perf.apply_priority(level, pid=pid)
+    return (bool(good), f"pid {pid}: {detail}")
+
+
+def configure_performance() -> bool:
+    """Choose the CPU priority and numerical thread budget (saved profile)."""
+    section("CPU priority & thread budget")
+    perf = _performance_profile()
+    profile = perf.read_profile()
+    auto_cap = perf.default_thread_cap()
+    info(f"Current: {perf.describe(profile)}")
+    info("Above normal keeps the UI and microphone responsive while a model "
+         "loads; high can starve the desktop on a small machine.")
+
+    priority_rows = {
+        "1": "idle", "2": "below_normal", "3": "normal",
+        "4": "above_normal", "5": "high",
+    }
+    current_num = {v: k for k, v in priority_rows.items()}.get(
+        profile["cpu_priority"], "4")
+    choice = ask("  priority [1 idle · 2 below normal · 3 normal · "
+                 f"4 above normal · 5 high] ({current_num}) > ", current_num)
+    profile["cpu_priority"] = priority_rows.get(choice.strip(), profile["cpu_priority"])
+
+    cap_default = str(profile["thread_cap"])
+    cap_text = ask(f"  numerical thread cap [0 = auto ({auto_cap}), 1-16] "
+                   f"({cap_default}) > ", cap_default).strip()
+    try:
+        cap = int(cap_text)
+        if 0 <= cap <= 64:
+            profile["thread_cap"] = cap
+    except ValueError:
+        warn(f"'{cap_text}' is not a number — keeping {cap_default}.")
+
+    if not perf.write_profile(profile):
+        bad(f"Could not write the profile to {CONFIG_FILE.relative_to(ROOT)}.")
+        return False
+    ok(f"Saved — {perf.describe(profile)}.")
+    info("start_jarvis applies this to every launch (environment + process).")
+
+    if _confirm("Switch the Windows power plan to High performance now? "
+                "(system-wide, stays until changed)", default=False):
+        good, detail = perf.set_power_plan("high")
+        (ok if good else warn)(detail)
+    return True
+
+
+# ── Windows graphics & performance suite (reversible, Windows-only) ─────────
+#
+# The Optimize pass does not stop at Python: on Windows the same click should
+# also point the machine at performance. Two halves, both reversible:
+#
+# * core/joptimizer.jarvis_ultimate_optimize — the ported HI+ Optimizer suite
+#   (power plan, visual effects for performance, transparency off, Game DVR
+#   capture off, Game Mode on, widgets off, privacy extras, JARVIS caches). It
+#   snapshots every touched registry value + service start type first, and [u]
+#   restores that snapshot exactly.
+# * The per-app graphics preference (Settings ▸ Display ▸ Graphics): the Python
+#   executables that run J.A.R.V.I.S. are pointed at the high-performance GPU
+#   instead of whatever Windows picks. The previous value of every entry is
+#   backed up before it is written.
+
+#: Windows' per-app GPU preference store. The value NAME is the executable's
+#: full path; the DATA is "GpuPreference=N;" where 0 = power saving and
+#: 2 = high performance (an absent value means "let Windows decide").
+_GPU_PREF_PATH = r"Software\Microsoft\DirectX\UserGpuPreferences"
+_WINDOWS_TUNING_FILE = "data/runtime/windows_tuning.json"
+
+
+def _joptimizer():
+    """The reversible Windows maintenance backend, loaded by path.
+
+    ``core/joptimizer.py`` imports only the standard library at module level
+    (psutil is imported lazily inside its metric helpers), so this wizard keeps
+    its stdlib-only rule while reusing every tested Windows operation.
+    """
+    sys.path.insert(0, str(ROOT))
+    from core import joptimizer
+    return joptimizer
+
+
+def _tuning_file() -> Path:
+    return ROOT / _WINDOWS_TUNING_FILE
+
+
+def _tuning_backup() -> dict:
+    try:
+        data = json.loads(_tuning_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_tuning_backup(data: dict) -> bool:
+    try:
+        path = _tuning_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _gpu_targets() -> list[Path]:
+    """The Python executables that actually run J.A.R.V.I.S. (real paths only)."""
+    out: list[Path] = []
+    for name in ("python.exe", "pythonw.exe"):
+        candidate = ROOT / ".venv" / "Scripts" / name
+        if candidate.is_file():
+            out.append(candidate)
+    for name in ("python.exe", "pythonw.exe"):
+        try:
+            found = shutil.which(name)
+        except Exception:
+            found = None
+        if found:
+            out.append(Path(found))
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in out:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def gpu_preference_state() -> list[tuple[str, str]]:
+    """(executable, preference label) from the real registry; [] off-Windows."""
+    try:
+        j = _joptimizer()
+        winreg = j.winreg
+    except Exception:
+        return []
+    if not getattr(j, "IS_WINDOWS", False):
+        return []
+    rows: list[tuple[str, str]] = []
+    for exe in _gpu_targets():
+        value = ""
+        try:
+            found = j.registry_read(winreg.HKEY_CURRENT_USER, _GPU_PREF_PATH,
+                                    str(exe))
+            if found.get("exists"):
+                value = str(found.get("value") or "")
+        except Exception:
+            value = ""
+        if "2;" in value:
+            label = "high performance"
+        elif "0;" in value:
+            label = "power saving"
+        else:
+            label = "system default"
+        rows.append((str(exe), label))
+    return rows
+
+
+def apply_gpu_preference(high: bool = True) -> tuple[bool, str]:
+    """Point Windows' per-app graphics preference at the Python processes.
+
+    Reversible: the previous value of every entry is saved first, and
+    :func:`restore_gpu_preference` puts it back (or removes the entry we added).
+    """
+    try:
+        j = _joptimizer()
+        winreg = j.winreg
+    except Exception as exc:
+        return False, f"registry access unavailable ({type(exc).__name__})"
+    if not getattr(j, "IS_WINDOWS", False):
+        return False, "Windows-only"
+    targets = _gpu_targets()
+    if not targets:
+        return False, "no python.exe/pythonw.exe was found to point at"
+    backup = _tuning_backup()
+    previous = dict(backup.get("gpu_preferences") or {})
+    wanted = "GpuPreference=2;" if high else "GpuPreference=0;"
+    written = 0
+    for exe in targets:
+        key = str(exe)
+        if key not in previous:
+            try:
+                before = j.registry_read(winreg.HKEY_CURRENT_USER,
+                                         _GPU_PREF_PATH, key)
+                previous[key] = (str(before.get("value"))
+                                 if before.get("exists") else None)
+            except Exception:
+                previous[key] = None
+        try:
+            j.registry_write(winreg.HKEY_CURRENT_USER, _GPU_PREF_PATH, key,
+                             wanted, winreg.REG_SZ)
+            written += 1
+        except Exception:
+            continue
+    backup["gpu_preferences"] = previous
+    _save_tuning_backup(backup)
+    if not written:
+        return False, "Windows refused every graphics-preference write"
+    return True, (f"{written} Python executable(s) set to "
+                  f"{'high performance' if high else 'power saving'} "
+                  "(Settings ▸ Display ▸ Graphics)")
+
+
+def restore_gpu_preference() -> tuple[bool, str]:
+    """Put back (or remove) every graphics-preference entry we wrote."""
+    try:
+        j = _joptimizer()
+        winreg = j.winreg
+    except Exception as exc:
+        return False, f"registry access unavailable ({type(exc).__name__})"
+    if not getattr(j, "IS_WINDOWS", False):
+        return False, "Windows-only"
+    backup = _tuning_backup()
+    previous = dict(backup.get("gpu_preferences") or {})
+    if not previous:
+        return False, "no graphics-preference backup exists"
+    restored = 0
+    for exe, value in previous.items():
+        try:
+            if value:
+                j.registry_write(winreg.HKEY_CURRENT_USER, _GPU_PREF_PATH, exe,
+                                 str(value), winreg.REG_SZ)
+            else:
+                j.registry_delete_value(winreg.HKEY_CURRENT_USER,
+                                        _GPU_PREF_PATH, exe)
+            restored += 1
+        except Exception:
+            continue
+    backup.pop("gpu_preferences", None)
+    _save_tuning_backup(backup)
+    return (restored > 0,
+            f"{restored} graphics-preference entr(y/ies) restored")
+
+
+def _broadcast_setting_change() -> None:
+    """Tell Windows a visual setting changed so it applies without sign-out."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+            ctypes.c_wchar_p("VisualEffects"), SMTO_ABORTIFHUNG, 3000,
+            ctypes.byref(result))
+    except Exception:
+        pass
+
+
+def _windows_tuning_rows() -> list[tuple[str, str, str]]:
+    """(label, value, state) read from the real registry/powercfg — no guesses."""
+    try:
+        j = _joptimizer()
+        winreg = j.winreg
+    except Exception as exc:
+        return [("Windows tuning", f"unavailable ({type(exc).__name__})", "warn")]
+    if not getattr(j, "IS_WINDOWS", False):
+        return [("Windows tuning", "Windows-only", "opt")]
+
+    def _value(target: str, name: str):
+        root, path, _ = j.REGISTRY_TARGETS[target]
+        found = j.registry_read(root, path, name)
+        return found.get("value") if found.get("exists") else None
+
+    visual = _value("visual_effects", "VisualFXSetting")
+    visual_label = {0: "let Windows choose", 1: "best appearance",
+                    2: "best performance", 3: "custom"}.get(visual)
+    rows = [("Visual effects", visual_label or "let Windows choose",
+             "ok" if visual == 2 else "opt")]
+    transparency = _value("transparency", "EnableTransparency")
+    rows.append(("UI transparency", "off" if transparency == 0 else "on",
+                 "ok" if transparency == 0 else "opt"))
+    dvr = _value("game_dvr", "GameDVR_Enabled")
+    rows.append(("Game DVR capture", "off" if dvr == 0 else "on",
+                 "ok" if dvr == 0 else "opt"))
+    mode = _value("game_mode", "AutoGameModeEnabled")
+    rows.append(("Game Mode", "on" if mode == 1 else "off",
+                 "ok" if mode == 1 else "opt"))
+    plan = ""
+    try:
+        plan = str(j.get_active_power_plan() or "")
+    except Exception:
+        plan = ""
+    high = ("high" in plan.lower() or "ultimate" in plan.lower())
+    rows.append(("Power plan", plan.split("(")[-1].rstrip(")")[:26] or "unknown",
+                 "ok" if high else "opt"))
+    return rows
+
+
+def _print_windows_tuning() -> None:
+    """The read-only Windows tuning state (settings + per-app graphics)."""
+    print(_panel_top("WINDOWS TUNING", "read-only"))
+    for label, value, state in _windows_tuning_rows():
+        print(_env_card_row(label, str(value)[:26], state))
+    print(_panel_bottom())
+    gpu_rows = gpu_preference_state()
+    if gpu_rows:
+        print(_panel_top("GRAPHICS PREFERENCE", "per app"))
+        for exe, label in gpu_rows[:4]:
+            path = Path(exe)
+            # Two installs share the basename "python.exe": the folder is what
+            # tells the venv interpreter apart from the system one.
+            name = f"{path.parent.name}/{path.name}"
+            print(_env_card_row(name[:26], label,
+                                "ok" if label == "high performance" else "opt"))
+        print(_panel_bottom())
+
+
+def apply_windows_performance(confirm: bool = True) -> tuple[bool, str]:
+    """Apply the reversible Windows performance suite (snapshot first).
+
+    The suite is ``core/joptimizer.jarvis_ultimate_optimize`` — HKCU + power
+    plan only, every touched value snapshotted, J.A.R.V.I.S. caches cleared —
+    plus the per-app graphics preference for the Python processes. Nothing here
+    is irreversible; ``undo_windows_performance`` restores both halves.
+    """
+    try:
+        j = _joptimizer()
+    except Exception as exc:
+        return False, f"the Windows tuning backend is unavailable ({exc})"
+    if not getattr(j, "IS_WINDOWS", False):
+        return False, "Windows-only"
+    # Default NO on purpose: a non-interactive run (a script, CI, pythonw)
+    # must never change machine-wide graphics or power settings by accident.
+    # The prompt names the big-ticket changes so consent is informed.
+    if confirm and not _confirm(
+            "Apply the reversible Windows performance suite now? "
+            "(power plan High performance · visual effects for performance · "
+            "high-performance GPU for Python · snapshot first; [u] undoes it)",
+            default=False):
+        info("Skipped — nothing changed.")
+        return False, "skipped"
+    try:
+        text = j.jarvis_ultimate_optimize()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    for line in str(text).splitlines():
+        print("  " + line)
+    good, detail = apply_gpu_preference(high=True)
+    if good:
+        ok(detail + ".")
+    else:
+        info(f"Graphics preference left alone — {detail}.")
+    _broadcast_setting_change()
+    return True, "applied"
+
+
+def configure_windows_performance() -> bool:
+    """Menu row: show the current state, then offer the reversible suite."""
+    section("Windows graphics & performance  (reversible)")
+    _print_windows_tuning()
+    info("The suite applies: power plan High performance · visual effects for "
+         "performance · transparency off · Game DVR capture off · Game Mode on · "
+         "widgets off · privacy extras · JARVIS caches cleared · high-performance "
+         "GPU for the Python processes.")
+    info("A snapshot of every touched value and service start type is saved "
+         "first, so [u] restores the machine exactly.")
+    applied, detail = apply_windows_performance(confirm=True)
+    if applied:
+        ok("Windows performance suite applied.")
+    elif detail == "skipped":
+        return False
+    else:
+        warn(f"Windows performance suite not applied — {detail}.")
+    return applied
+
+
+def undo_windows_performance() -> bool:
+    """Menu row: restore the last snapshot and the graphics preference.
+
+    One gate covers both halves, and its default is NO: a non-interactive run
+    (a script, a test, pythonw) must never restore machine state by accident —
+    the probe that caught the previous default also proved a bare pytest-created
+    snapshot was sitting in the real snapshot folder.
+    """
+    section("Undo Windows optimization")
+    try:
+        j = _joptimizer()
+    except Exception as exc:
+        bad(f"Restore unavailable: {exc}")
+        return False
+    if not getattr(j, "IS_WINDOWS", False):
+        info("Windows-only — nothing to undo on this platform.")
+        return False
+    snaps = j.list_snapshots()
+    backup = _tuning_backup().get("gpu_preferences") or {}
+    if not snaps and not backup:
+        info("Nothing to undo yet — the Windows performance suite has not run "
+             "(no snapshot and no graphics-preference backup).")
+        return False
+    if snaps:
+        info(f"Latest snapshot: {snaps[0].name}")
+    if backup:
+        info(f"Graphics preference: {len(backup)} entr(y/ies) to restore.")
+    if not _confirm("Restore the last Windows optimization now? "
+                    "(registry values + service start types + graphics "
+                    "preference)", default=False):
+        info("Skipped — nothing was restored.")
+        return False
+    restored_any = False
+    if snaps:
+        line = str(j.jarvis_revert_latest())
+        (warn if "warning" in line.lower() else ok)(line)
+        restored_any = True
+    good, detail = restore_gpu_preference()
+    if good:
+        ok(detail + ".")
+        restored_any = True
+    elif "no graphics-preference backup" not in detail:
+        info(detail)
+    return restored_any
+
+
+def windows_performance_report() -> None:
+    """Menu row: read-only state + host health from the real machine."""
+    section("System health  (read-only)")
+    _print_windows_tuning()
+    try:
+        j = _joptimizer()
+        summary = j.get_system_summary()
+        score = j.health_score(summary)
+        rows = [
+            ("Health", f"{score}/100", "ok" if score >= 80 else "warn"),
+            ("CPU", f"{summary['cpu']:.0f}%",
+             "ok" if summary["cpu"] < 80 else "warn"),
+            ("RAM", f"{summary['ram']:.0f}%  of {summary['ram_gb']} GB",
+             "ok" if summary["ram"] < 80 else "warn"),
+            ("Disk free", f"{summary['disk_free_gb']} GB",
+             "ok" if summary["disk_free_gb"] > 10 else "warn"),
+        ]
+        print(_panel_top("HOST", "now"))
+        for label, value, state in rows:
+            print(_env_card_row(label, str(value)[:26], state))
+        print(_panel_bottom())
+        for line in j.top_processes(6):
+            print("  " + faint(line))
+    except Exception as exc:
+        # psutil is a venv dependency, not a setup one: run the same scan on the
+        # interpreter J.A.R.V.I.S. actually uses instead of reporting "no data".
+        scanned = _venv_smart_scan()
+        if scanned:
+            ok(scanned)
+        else:
+            warn(f"Live metrics need the venv's psutil "
+                 f"({type(exc).__name__}: {exc}).")
+            info("Run [5] Speed doctor for the measured latency panel instead.")
+
+
+def _venv_smart_scan() -> str:
+    """core.joptimizer.smart_scan on the venv interpreter ("" when it cannot)."""
+    try:
+        vpy = _venv_python()
+        if not Path(vpy).is_file():
+            return ""
+        proc = subprocess.run(
+            [vpy, "-c",
+             "from core import joptimizer; print(joptimizer.smart_scan())"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        text = (proc.stdout or "").strip()
+        return text if proc.returncode == 0 and text else ""
+    except Exception:
+        return ""
+
 
 def optimize() -> dict:
-    section("Optimize  (logs · cache · bytecode)")
+    """The full optimization pass, in one deliberate click.
+
+      1. rotate logs / expire cache / drop stale bytecode (core.maintenance)
+      2. precompile the project's own modules (first-import cost moves to now)
+      3. save the CPU priority & thread profile and apply it to a live instance
+         (the priority class Task Manager shows)
+      4. the reversible Windows performance suite: graphics/visual effects for
+         performance, transparency, Game DVR, Game Mode, power plan and the
+         high-performance GPU for the Python processes — snapshot first, so [u]
+         restores the machine exactly
+      5. a read-only summary of what is now in effect
+    """
+    section("Optimize  (logs · cache · bytecode · CPU · Windows graphics)")
+    report: dict = {}
+
+    info("Step 1/5 — rotate logs, expire cache, drop stale bytecode")
     try:
         sys.path.insert(0, str(ROOT))
         from core.maintenance import run_maintenance, format_report
         report = run_maintenance()
         for line in format_report(report).splitlines():
             print("  " + line)
-        return report
     except Exception as exc:
         bad(f"Maintenance could not run: {type(exc).__name__}: {exc}")
-        return {}
+
+    info("Step 2/5 — precompile the project's own modules")
+    compiled = compile_project()
+    report["compile"] = compiled
+    if compiled.get("ok"):
+        ok(f"{compiled['sources']} source module(s) verified, "
+           f"{compiled['updated']} bytecode file(s) refreshed "
+           f"in {compiled['seconds']}s.")
+    elif compiled.get("sources"):
+        warn("Some modules could not be precompiled — Python will compile them "
+             "on import instead.")
+    else:
+        warn("No source modules were found to precompile.")
+
+    info("Step 3/5 — CPU priority & thread budget")
+    try:
+        perf = _performance_profile()
+        profile = perf.read_profile()
+        if perf.write_profile(profile):
+            ok(f"Profile saved — {perf.describe(profile)}.")
+        else:
+            warn("The performance profile could not be saved; defaults still apply.")
+        applied, detail = apply_priority_to_running()
+        if applied is None:
+            info("J.A.R.V.I.S. is not running — this applies at the next launch.")
+        elif applied:
+            ok(f"Running J.A.R.V.I.S. updated — {detail}.")
+        else:
+            warn(f"Could not raise the running instance's priority — {detail}.")
+        report["performance"] = {"profile": profile, "applied": applied,
+                                 "detail": detail}
+        # Task Manager shows the class this profile produces; state it plainly
+        # so "is the priority really set?" is answerable without guessing.
+        pid = _lock_pid()
+        current_fn = getattr(perf, "current_priority", None)
+        if pid is not None and _pid_alive(pid) and callable(current_fn):
+            current = current_fn(pid)
+            if current:
+                info(f"pid {pid} runs at '{current.replace('_', ' ')}' priority "
+                     "(Task Manager ▸ Details ▸ Base priority).")
+    except Exception as exc:
+        warn(f"CPU profile unavailable: {type(exc).__name__}: {exc}")
+
+    info("Step 4/5 — Windows graphics & performance suite")
+    try:
+        applied_win, win_detail = apply_windows_performance(confirm=True)
+        report["windows"] = {"applied": applied_win, "detail": win_detail}
+        if not applied_win and win_detail not in ("skipped", "Windows-only"):
+            warn(f"Windows tuning left unchanged — {win_detail}.")
+        elif win_detail == "Windows-only":
+            info("Windows-only step — skipped on this platform.")
+    except Exception as exc:
+        warn(f"Windows tuning unavailable: {type(exc).__name__}: {exc}")
+        report["windows"] = {"applied": False, "detail": str(exc)}
+
+    info("Step 5/5 — what is in effect now")
+    try:
+        _print_windows_tuning()
+    except Exception as exc:
+        warn(f"Tuning state unavailable: {type(exc).__name__}: {exc}")
+
+    rule()
+    info("Undo the Windows changes with [u]; re-tune the CPU profile with [p]; "
+         "see host health with [j].")
+    return report
 
 
 # ── L. Launch ────────────────────────────────────────────────────────────────
@@ -2561,6 +3907,40 @@ def _playwright_chromium_ready() -> bool:
     return False
 
 
+def _heal_laya() -> tuple[bool | None, str]:
+    """Repair Laya's runtime packages when its checkpoint is present."""
+    model_dir, missing = _laya_model_dir()
+    if model_dir is None:
+        return None, "laya-multilingual/ not found (optional: local decision AI)"
+    if missing:
+        return False, ("the checkpoint is incomplete: " + ", ".join(missing)
+                       + " — restore it from the Laya release")
+    ready, detail = _laya_import_probe()
+    if ready:
+        return True, f"Laya runtime ready ({detail})"
+    info(f"Laya runtime is missing ({detail}) — installing the two packages.")
+    if _install_laya_packages():
+        return True, "Laya runtime packages installed"
+    return False, "Laya runtime packages could not be installed"
+
+
+def _heal_rea() -> tuple[bool | None, str]:
+    """Repair the pinned REA npx cache when its Node runtime is usable."""
+    if not shutil.which("node") or not shutil.which("npx"):
+        return None, "Node.js/npx not installed (optional: REA MCP server)"
+    version = _version_of("node", "--version")
+    if not _rea_node_supported(version):
+        return None, (f"Node.js {version or '?'} is unsupported by REA "
+                      f"(needs {REA_NODE_GATE_TEXT}; optional)")
+    if _rea_cache_dirs(REA_VERSION):
+        return True, f"REA {REA_VERSION} is cached"
+    info(f"REA {REA_VERSION} is not cached — pre-warming it now.")
+    good, detail = _rea_prewarm()
+    if good:
+        return True, f"REA {REA_VERSION} installed ({detail})"
+    return False, f"REA could not be prepared: {detail}"
+
+
 def _heal_caches() -> tuple[bool, str]:
     """Purge regenerable bytecode/temp output and keep the single .cache home."""
     for sub in CACHE_SUBDIRS:
@@ -2618,6 +3998,8 @@ AUTO_HEAL_STEPS: tuple[tuple[str, str, object], ...] = (
     ("databases", "SQLite databases",             _heal_databases),
     ("crashes",   "Stale locks & crash markers",  _heal_crashes),
     ("node",      "Node runtime (Agent TARS)",    _heal_node_runtime),
+    ("rea",       "REA MCP server (npm)",         _heal_rea),
+    ("laya",      "Laya AI decision model",       _heal_laya),
     ("browser",   "Playwright Chromium",          _heal_playwright),
     ("cache",     "Cache & bytecode",             _heal_caches),
 )
@@ -2754,6 +4136,13 @@ def build_pyinstaller_args(name: str, *, mode: str = "onedir",
         path = ROOT / folder
         if path.exists():
             args += ["--add-data", f"{path}{os.pathsep}{folder}"]
+    # The optional native extension ships as a single file — never the whole
+    # native/ tree (that holds the multi-GB cargo target dir). Resolved from
+    # the CURRENT ROOT so callers that point ROOT elsewhere stay exact.
+    native_pyd = Path(ROOT) / "native" / NATIVE_PYD.name
+    if native_pyd.is_file():
+        args += ["--hidden-import", "jarvis_native",
+                 "--add-data", f"{native_pyd}{os.pathsep}native"]
     args.append(str(ROOT / entry))
     return args
 
@@ -3167,6 +4556,55 @@ def build_executable(name: str = "", *, mode: str = "",
     return True
 
 
+def _fresh_config() -> dict:
+    """The configuration a data reset leaves behind.
+
+    Everything else falls back to the shipped defaults on read; Fish Audio and
+    the microphone DSP are seeded explicitly so a fresh install knows its model,
+    voice, Opus output and real microphone filters before the user ever opens
+    Settings, and a later save round-trips the exact values the engines use.
+    """
+    from voice.fish_defaults import (
+        FISH_DEFAULT_ENDPOINT,
+        FISH_DEFAULT_FORMAT,
+        FISH_DEFAULT_LATENCY,
+        FISH_DEFAULT_MODEL,
+        FISH_DEFAULT_VOICE,
+    )
+
+    fish = {
+        "apiKey": "",
+        "endpoint": FISH_DEFAULT_ENDPOINT,
+        "model": FISH_DEFAULT_MODEL,
+        "voice": FISH_DEFAULT_VOICE,
+        "format": FISH_DEFAULT_FORMAT,
+        "latency": FISH_DEFAULT_LATENCY,
+    }
+    return {
+        "fish_audio_api_key": "",
+        "fish_audio_endpoint": fish["endpoint"],
+        "fish_audio_model_id": fish["model"],
+        "fish_audio_voice_id": fish["voice"],
+        "fish_audio_format": fish["format"],
+        "fish_audio_latency": fish["latency"],
+        # Microphone input processing (Settings ▸ VOICE ▸ MICROPHONE INPUT,
+        # applied by voice/mic_dsp.py). Seeded so a fresh install starts with
+        # the same real filters the panel shows.
+        "input_device": "",
+        "mic_gain_percent": 100,
+        "mic_noise_suppression": True,
+        "mic_noise_suppression_amount": 60,
+        "mic_noise_gate": False,
+        "mic_noise_gate_db": -45,
+        "mic_compressor": False,
+        "mic_compressor_amount": 50,
+        "mic_limiter": True,
+        "mic_limiter_ceiling_db": -1.0,
+        "mic_monitoring": False,
+        "voice": {"providers": {"fishAudio": dict(fish)}},
+    }
+
+
 def reset_data(*, yes: bool = False) -> bool:
     """Back up, then return J.A.R.V.I.S. to a fresh start."""
     section("Reset data  ·  fresh start (everything is backed up first)")
@@ -3227,10 +4665,11 @@ def reset_data(*, yes: bool = False) -> bool:
         except Exception as exc:
             warn(f"the vault memory notes could not be archived: {exc}")
 
-    # 1) Fresh API keys in config/api_keys.json
+    # 1) Fresh API keys in config/api_keys.json — seeded with the shipped Fish
+    # Audio defaults so the first launch already has the verified voice.
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps({}, indent=4), encoding="utf-8")
+        CONFIG_FILE.write_text(json.dumps(_fresh_config(), indent=4), encoding="utf-8")
     except Exception as exc:
         bad(f"the configuration could not be reset: {exc}")
         return False
@@ -3507,7 +4946,7 @@ def view_logs() -> None:
 MAIN_MENU: list[tuple[str, str, str, object]] = [
     ("1", "Quick setup",        "keys → packages → Gemini → Node → browser → test", _quick_setup),
     ("h", "Auto heal",          "one pass: every known failure diagnosed & fixed", auto_heal),
-    ("2", "Install & update",   "Python · Node · Playwright · FFmpeg · Git", "install-menu"),
+    ("2", "Install & update",   "Python · Node · Rust · Playwright · REA · Laya · FFmpeg · Git", "install-menu"),
     ("3", "Keys & providers",   "configure · test · fix Gemini · authorize", "keys-menu"),
     ("4", "Diagnose & fix",     "environment · crashes · logs · project folder", "diag-menu"),
     ("5", "Speed doctor",       "find & fix what slows replies down", speed_doctor),
@@ -3524,10 +4963,13 @@ SUBMENUS: dict[str, list[tuple[str, str, str, object]]] = {
     "install-menu": [
         ("p", "Install Python",      "auto-install Python 3.13 via winget", install_python_runtime),
         ("2", "Python packages",     "requirements.txt → isolated .venv/", install_python_deps),
+        ("n", "Native Rust backend", "optional: build jarvis_native (release)", build_native_extension),
         ("u", "Update packages",     "pip upgrade all .venv packages", update_python_deps),
         ("v", "Wipe .venv",          "delete .venv/ for a clean reinstall", wipe_venv),
         ("3", "Node runtime",        "Agent TARS browser + PC automation", install_node_deps),
         ("4", "Playwright browser",  "chromium binary for browser_action", install_playwright_browser),
+        ("r", "REA (reverse engineering)", "pin, cache & verify the rea-agents MCP server", install_rea),
+        ("a", "Laya AI runtime",     "install laya + transformers and make one real decision", install_laya),
         ("f", "Install FFmpeg",      "auto-install FFmpeg via winget", install_ffmpeg),
         ("g", "Install Git",         "auto-install Git via winget", install_git),
         ("7", "Install ALL missing", "every optional feature package", install_all_missing),
@@ -3541,13 +4983,20 @@ SUBMENUS: dict[str, list[tuple[str, str, str, object]]] = {
     "diag-menu": [
         ("h", "Auto heal (fix everything)", "one pass over every known failure", auto_heal),
         ("1", "Environment check",   "Python · pip · Node · git · FFmpeg · .venv", report_env),
+        ("n", "Native backend status", "Rust extension: toolchain · build · import", native_backend_report),
         ("i", "Inspect & fix crash", "debug run_jarvis crashes & fix", inspect_crashes),
         ("9", "Diagnose & repair",   "report, then fix what is missing", diagnose),
+        ("r", "Test REA",            "real MCP handshake with the pinned REA server", test_rea),
+        ("y", "Test Laya AI",        "load the checkpoint and make one real decision", test_laya),
         ("t", "View logs",           "tail dependency_install, setup_error, jarvis logs", view_logs),
         ("d", "Open project folder", "open the JARVIS OS folder in Explorer", open_project_folder),
     ],
     "maintain-menu": [
-        ("8", "Optimize",            "rotate logs, expire cache, drop bytecode", optimize),
+        ("8", "Optimize",            "full pass: logs · cache · bytecode · CPU priority · Windows graphics", optimize),
+        ("p", "CPU priority & threads", "choose the priority class and numerical thread budget", configure_performance),
+        ("w", "Windows graphics & effects", "GPU preference + visual effects + Game DVR + power (reversible)", configure_windows_performance),
+        ("u", "Undo Windows optimization", "restore the last snapshot and the graphics preference", undo_windows_performance),
+        ("j", "System health report", "health score · top processes · current tuning state", windows_performance_report),
         ("s", "Compress / Shrink",   "reduce folder size · clean cache & builds", shrink_workspace),
         ("r", "Reset data",          "fresh start — keys, memory, cache (backed up)", reset_data),
     ],
@@ -3706,6 +5155,8 @@ python setup_jarvis.py --check         environment report only
 python setup_jarvis.py --install       install / repair the Python dependencies
 python setup_jarvis.py --node          install the Node runtime (Agent TARS)
 python setup_jarvis.py --browser       install the Playwright chromium binary
+python setup_jarvis.py --native        build the OPTIONAL Rust extension (release)
+python setup_jarvis.py --native-status native backend report (toolchain · build · import)
 python setup_jarvis.py --keys          configure API keys (.env + api_keys.json)
 python setup_jarvis.py --authorize     open the provider sign-up / key pages
 python setup_jarvis.py --test          test every stored key against its provider
@@ -3748,6 +5199,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="install the Node runtime (Agent TARS)")
     parser.add_argument("--browser", action="store_true",
                         help="install the Playwright chromium binary")
+    parser.add_argument("--native", action="store_true",
+                        help="build/rebuild the optional native Rust extension "
+                             "(jarvis_native) — the app also runs without it")
+    parser.add_argument("--native-status", dest="native_status", action="store_true",
+                        help="report the native Rust backend (toolchain, build, import)")
     parser.add_argument("--keys", action="store_true",
                         help="configure API keys")
     parser.add_argument("--group", default="core",
@@ -3847,6 +5303,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.browser:
         install_playwright_browser()
+        did_something = True
+
+    if args.native_status:
+        native_backend_report()
+        did_something = True
+
+    if args.native:
+        build_native_extension()
         did_something = True
 
     if args.test:

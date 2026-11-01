@@ -459,7 +459,11 @@ def _pcm_level(samples) -> float:
         # This is display-only gain. PCM sent to Gemini is never altered.
         if float(np.max(np.abs(x))) <= 2.0:
             x *= 32768.0
-        rms = float(np.sqrt(np.mean(x * x)))
+        try:
+            from core import native as _native
+            rms = float(_native.rms_f32(x))  # single Rust pass when built
+        except Exception:
+            rms = float(np.sqrt(np.mean(x * x)))
     except Exception:
         return 0.0
     # Normal speech from laptop/headset microphones is often below the old

@@ -39,7 +39,13 @@ from security.rules import RiskTier, classify                            # noqa:
 
 def test_every_declared_action_has_a_real_handler():
     """A declared action without a handler would be a silent dead end."""
-    assert set(registry.names("pc_control")) <= set(desktop._HANDLERS)
+    from capabilities import files, ocr, uia, windows_ext
+
+    pc_handlers = (set(desktop._HANDLERS) | set(ocr._HANDLERS)
+                   | set(uia._HANDLERS) | {"run_sequence"})
+    assert set(registry.names("pc_control")) <= pc_handlers
+    assert set(registry.names("file_control")) <= set(files._HANDLERS)
+    assert set(registry.names("window_control")) <= set(windows_ext._HANDLERS)
     assert set(registry.names("browser_action")) <= set(browser_pw._HANDLERS)
     assert set(registry.TOOLS) == set(actions._RUNNERS)
     # visual_control is served by the grounding layer; its pointer actions and
@@ -48,6 +54,36 @@ def test_every_declared_action_has_a_real_handler():
         assert name in uitars._POINTER_ACTIONS
     for name in ("type", "hotkey", "press", "scroll", "drag", "wait", "finished"):
         assert name in _visual_execute_branches()
+
+
+#: The only legitimate one-letter parameters: screen coordinates.
+_ONE_LETTER_PARAMS = {"x", "y"}
+
+
+def test_no_tool_schema_leaks_junk_properties():
+    """`optional="instruction"` (a string, not a tuple) iterates character-wise
+    and leaks 'i', 'n', 's', … into the model-facing schema. It happened once;
+    this pins it shut. x/y are real coordinates and stay legal."""
+    for tool in registry.TOOLS:
+        props = registry.parameters(tool)["properties"]
+        junk = sorted(k for k in props
+                      if len(k) == 1 and k not in _ONE_LETTER_PARAMS)
+        assert junk == [], f"{tool} declares junk properties {junk}"
+
+
+def test_every_declared_parameter_is_a_named_tuple_member():
+    for action in registry.ACTIONS:
+        for field_name in ("required", "optional"):
+            value = getattr(action, field_name)
+            assert isinstance(value, tuple), (action.tool, action.name, field_name)
+            for key in value:
+                assert isinstance(key, str) and key, \
+                    (action.tool, action.name, field_name, key)
+                if len(key) == 1:
+                    assert key in _ONE_LETTER_PARAMS, \
+                        (action.tool, action.name, field_name, key)
+                assert key in registry.PARAM_HELP, \
+                    (action.tool, action.name, field_name, key)
 
 
 def _visual_execute_branches() -> set[str]:

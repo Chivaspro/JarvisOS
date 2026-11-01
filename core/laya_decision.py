@@ -127,9 +127,13 @@ DECISION_AI_LABEL = "Laya 322M CPU"
 
 STATE_DISABLED = "disabled"
 STATE_NOT_FOUND = "model_not_found"
+STATE_MISSING_DEPENDENCY = "missing_dependency"
 STATE_LOADING = "loading"
 STATE_READY = "ready"
 STATE_ERROR = "error"
+#: Enabled, model present, but no load has started yet. This is a real state —
+#: NOT "detecting" (which implied work that was not happening) and NOT "ready".
+STATE_IDLE = "idle"
 
 _lock = threading.RLock()
 _agent = None                       # loaded laya Agent (heavy; created once)
@@ -616,6 +620,22 @@ def _log(level: str, message: str) -> None:
         print(f"[JARVIS] Laya: {message}")
 
 
+def dependency_available() -> bool:
+    """Is the ``laya`` runtime package importable in this interpreter?
+
+    Checked WITHOUT importing torch/laya (``find_spec`` only), so Settings and
+    the first request can report a missing dependency in microseconds instead
+    of paying a multi-second import to discover it.
+    """
+    try:
+        import importlib.util as _ilu
+        return _ilu.find_spec("laya") is not None
+    except Exception:
+        # Unknown must not masquerade as missing: the load path will report the
+        # real outcome if it fails.
+        return True
+
+
 def _load_blocking(detection: dict | None = None) -> None:
     """Import laya + load the checkpoint on THIS thread. Guarded end to end;
     the outcome is visible via get_state()/status().
@@ -655,15 +675,11 @@ def _load_blocking(detection: dict | None = None) -> None:
     # missing 'laya' used to cost a full torch import (~10 s, GBs of native
     # memory) on a background thread and then fail anyway (the startup log's
     # "No module named 'laya'"). Probe first; unknown result keeps old path.
-    try:
-        import importlib.util as _ilu
-        _laya_installed = _ilu.find_spec("laya") is not None
-    except Exception:
-        _laya_installed = True
-    if not _laya_installed:
+    if not dependency_available():
         with _lock:
-            _state = STATE_ERROR
-            _state_detail = "ModuleNotFoundError: No module named 'laya'"
+            _state = STATE_MISSING_DEPENDENCY
+            _state_detail = ("the 'laya' package is not installed "
+                             "(pip install laya==0.4.14 transformers>=4.48.0)")
             _agent = None
         _log("ERROR", "model load failed — falling back to existing AI "
                       "routing (ModuleNotFoundError: No module named 'laya')")
@@ -800,8 +816,15 @@ def _safe_init(detection: dict | None = None) -> None:
 
 def get_state() -> str:
     with _lock:
-        return _state if _state != "uninitialized" else (
-            "detecting" if config_enabled() else STATE_DISABLED)
+        if _state != "uninitialized":
+            return _state
+    # Enabled but nothing has started yet: say exactly that. The old
+    # "detecting" implied a probe was running when none was.
+    if not config_enabled():
+        return STATE_DISABLED
+    if not dependency_available():
+        return STATE_MISSING_DEPENDENCY
+    return STATE_IDLE
 
 
 def enabled() -> bool:
@@ -850,6 +873,7 @@ _SKIP_EXPLANATION = {
     "too short":       "too short to decide on",
     "model loading":   "decision model still loading on CPU",
     "model unavailable": "decision model unavailable — existing routing in charge",
+    "missing dependency": "the laya package is not installed — run setup ▸ Laya AI",
     "busy":            "another decision is still running",
     "no model":        "decision model not initialized",
     "inference failed": "decision failed — existing routing handled it",
@@ -913,11 +937,14 @@ def classify_task(text: str, *, record: bool = True,
                      confidence=hit.get("confidence"))
         return hit
     state = get_state()
-    if state in ("uninitialized", "detecting"):
+    if state in ("uninitialized", STATE_IDLE):
         # Background only — the 78-164 s load must never land in a turn.
         state = initialize(background=True)
     if state == STATE_LOADING:
         _skip("model loading", t_recv)
+        return None
+    if state == STATE_MISSING_DEPENDENCY:
+        _skip("missing dependency", t_recv)
         return None
     if state != STATE_READY:
         _skip("model unavailable" if state in (STATE_NOT_FOUND, STATE_ERROR)
@@ -1076,8 +1103,11 @@ def status_brief() -> str:
         laya_line = "Laya AI: ENABLED / READY (local decision AI — active in the pipeline)"
     elif d["state"] == STATE_LOADING:
         laya_line = "Laya AI: ENABLED / LOADING (model starting on CPU)"
+    elif d["state"] == STATE_MISSING_DEPENDENCY:
+        laya_line = ("Laya AI: ENABLED but MISSING DEPENDENCY (the 'laya' "
+                     "package is not installed) — run setup ▸ Laya AI")
     else:
-        # uninitialized / detecting: a file on disk is NOT a running model.
+        # idle / uninitialized: a file on disk is NOT a running model.
         laya_line = (f"Laya AI: ENABLED but NOT ACTIVE (state={d['state']}) — "
                      "existing routing is in charge as the fallback")
     gen_line = (f"{g['provider'].capitalize()}: "
@@ -1159,10 +1189,14 @@ def status() -> dict:
         line, detail = "Enabled", "Loading model…"
     elif state == STATE_NOT_FOUND:
         line, detail = "Enabled", "Model not found — fallback active"
+    elif state == STATE_MISSING_DEPENDENCY:
+        line, detail = ("Enabled",
+                        "Python package 'laya' not installed — fallback active "
+                        "(install from setup ▸ Laya AI)")
     elif state == STATE_ERROR:
         line, detail = "Enabled", f"Load failed — fallback active ({_state_detail})"
     else:
-        # uninitialized / detecting: a file on disk is NOT a running model.
+        # idle / uninitialized: a file on disk is NOT a running model.
         # "Ready" is reserved for STATE_READY only (Settings spec §11).
         line = "Enabled"
         detail = ("Model detected — not initialized yet"

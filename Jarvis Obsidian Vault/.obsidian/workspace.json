@@ -4,17 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "f846d5e950dece36",
+        "id": "9a0dd005a41bb4fb",
         "type": "tabs",
         "children": [
           {
-            "id": "eeba98acdb6d615b",
+            "id": "c307bec5a1e676ce",
             "type": "leaf",
             "state": {
-              "type": "empty",
+              "type": "graph",
               "state": {},
-              "icon": "lucide-file",
-              "title": "New tab"
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
             }
           }
         ]
@@ -75,8 +75,7 @@
               "title": "Bookmarks"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "horizontal",
@@ -170,8 +169,8 @@
             "state": {
               "type": "calendar",
               "state": {},
-              "icon": "calendar-with-checkmark",
-              "title": "Calendar"
+              "icon": "lucide-ghost",
+              "title": "calendar"
             }
           }
         ]
@@ -183,7 +182,6 @@
   },
   "left-ribbon": {
     "hiddenItems": {
-      "templater-obsidian:Templater": false,
       "switcher:Open quick switcher": false,
       "graph:Open graph view": false,
       "canvas:Create new canvas": false,
@@ -191,12 +189,15 @@
       "templates:Insert template": false,
       "command-palette:Open command palette": false,
       "bases:Create new base": false,
+      "templater-obsidian:Templater": false,
       "terminal:Open terminal": false
     }
   },
-  "active": "eeba98acdb6d615b",
+  "active": "c307bec5a1e676ce",
   "lastOpenFiles": [
     "Untitled.md",
+    "Memory/System/Memory Index.md",
+    "Memory/Guardian/Guardian Overview.md",
     "2026-10-04.md",
     "Welcome.md"
   ]

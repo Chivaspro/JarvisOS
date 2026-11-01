@@ -1,0 +1,1630 @@
+{
+  "title": "Onlook \u2014 The Developer Tool for Visual Engineers",
+  "url": "https://www.onlook.com/",
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "elements": [
+    {
+      "tag": "a",
+      "id": "",
+      "classes": "hover:opacity-80 text-foreground-primary py-4 pr-2",
+      "text": "",
+      "rect": {
+        "x": 76,
+        "y": 2,
+        "width": 106,
+        "height": 44
+      },
+      "styles": {
+        "color": "rgb(255, 255, 255)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "400",
+        "lineHeight": "20px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "16px 8px 16px 0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "button",
+      "id": "",
+      "classes": "text-sm text-foreground-secondary hover:text-foreground-primary flex items-center gap-1 py-1.5 transition-colors",
+      "text": "Product",
+      "rect": {
+        "x": 210,
+        "y": 8,
+        "width": 72,
+        "height": 32
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "400",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "6px 0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "4px"
+      }
+    },
+    {
+      "tag": "button",
+      "id": "",
+      "classes": "text-sm text-foreground-secondary hover:text-foreground-primary flex items-center gap-1 py-1.5 transition-colors",
+      "text": "Resources",
+      "rect": {
+        "x": 298,
+        "y": 8,
+        "width": 90,
+        "height": 32
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "400",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "6px 0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "4px"
+      }
+    },
+    {
+      "tag": "button",
+      "id": "",
+      "classes": "text-sm text-foreground-secondary hover:text-foreground-primary flex items-center gap-1 py-1.5 transition-colors",
+      "text": "About",
+      "rect": {
+        "x": 404,
+        "y": 8,
+        "width": 59,
+        "height": 32
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "400",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "6px 0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "4px"
+      }
+    },
+    {
+      "tag": "a",
+      "id": "",
+      "classes": "flex items-center gap-1.5 text-sm text-foreground-secondary hover:text-foreground-primary py-1.5 transition-colors",
+      "text": "27.1k",
+      "rect": {
+        "x": 479,
+        "y": 8,
+        "width": 57,
+        "height": 32
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "400",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "6px 0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "6px"
+      }
+    },
+    {
+      "tag": "a",
+      "id": "",
+      "classes": "inline-flex items-center justify-center whitespace-nowrap text-sm font-medium disabled:pointer-events-none disabled:opac",
+      "text": "Download Onlook",
+      "rect": {
+        "x": 1062,
+        "y": 8,
+        "width": 142,
+        "height": 32
+      },
+      "styles": {
+        "color": "rgb(255, 255, 255)",
+        "backgroundColor": "oklab(0.999994 0.0000455678 0.0000200868 / 0.06)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "500",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px 12px",
+        "margin": "0px",
+        "borderRadius": "8px",
+        "gap": "6px"
+      }
+    },
+    {
+      "tag": "a",
+      "id": "",
+      "classes": "github-stars-pill relative pointer-events-auto inline-flex items-center gap-2 rounded-full border border-transparent bg-",
+      "text": "Onlook just crossed 27,000 stars on GitHub!",
+      "rect": {
+        "x": 479,
+        "y": 144,
+        "width": 321,
+        "height": 30
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "oklab(0.999994 0.0000455678 0.0000200868 / 0.03)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "12px",
+        "fontWeight": "400",
+        "lineHeight": "16px",
+        "display": "flex",
+        "position": "relative",
+        "textAlign": "center",
+        "padding": "6px 12px",
+        "margin": "0px",
+        "borderRadius": "3.35544e+07px",
+        "gap": "8px"
+      }
+    },
+    {
+      "tag": "h1",
+      "id": "",
+      "classes": "hero-intro text-center text-[min(2.25rem,9vw)] !leading-[1.04] sm:text-6xl font-light tracking-[-0.04em] text-balance",
+      "text": "The Developer Tool forVisual Engineers",
+      "rect": {
+        "x": 347,
+        "y": 218,
+        "width": 587,
+        "height": 125
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "60px",
+        "fontWeight": "300",
+        "lineHeight": "62.4px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "a",
+      "id": "",
+      "classes": "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium disabled:pointer-events-n",
+      "text": "Download Onlook",
+      "rect": {
+        "x": 565,
+        "y": 451,
+        "width": 150,
+        "height": 36
+      },
+      "styles": {
+        "color": "rgb(0, 0, 0)",
+        "backgroundColor": "rgb(255, 255, 255)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "14px",
+        "fontWeight": "500",
+        "lineHeight": "20px",
+        "display": "flex",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "8px 16px",
+        "margin": "0px",
+        "borderRadius": "8px",
+        "gap": "8px"
+      }
+    },
+    {
+      "tag": "h3",
+      "id": "",
+      "classes": "text-foreground-secondary text-xs",
+      "text": "Villainterest - Product Notes",
+      "rect": {
+        "x": 146,
+        "y": 609,
+        "width": 112,
+        "height": 12
+      },
+      "styles": {
+        "color": "rgb(153, 153, 153)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "12px",
+        "fontWeight": "400",
+        "lineHeight": "16px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-80",
+      "text": "",
+      "rect": {
+        "x": 878,
+        "y": 576,
+        "width": 14,
+        "height": 14
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 394,
+        "y": 601,
+        "width": 93,
+        "height": 124
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 394,
+        "y": 734,
+        "width": 93,
+        "height": 70
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 394,
+        "y": 813,
+        "width": 93,
+        "height": 93
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 496,
+        "y": 601,
+        "width": 93,
+        "height": 93
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 496,
+        "y": 703,
+        "width": 93,
+        "height": 117
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 496,
+        "y": 828,
+        "width": 93,
+        "height": 124
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 598,
+        "y": 601,
+        "width": 93,
+        "height": 124
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 598,
+        "y": 734,
+        "width": 93,
+        "height": 70
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 598,
+        "y": 813,
+        "width": 93,
+        "height": 93
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 700,
+        "y": 601,
+        "width": 93,
+        "height": 93
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 700,
+        "y": 703,
+        "width": 93,
+        "height": 117
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 700,
+        "y": 828,
+        "width": 93,
+        "height": 124
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 802,
+        "y": 601,
+        "width": 93,
+        "height": 124
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover relative z-10 transition-transform duration-300 group-hover:scale-[1.02]",
+      "text": "",
+      "rect": {
+        "x": 802,
+        "y": 837,
+        "width": 93,
+        "height": 70
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "relative",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 997,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 1026,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 1056,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 1085,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 1115,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 363,
+        "y": 1144,
+        "width": 17,
+        "height": 17
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 551,
+        "y": 972,
+        "width": 14,
+        "height": 14
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "block h-auto w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 543,
+        "y": 1074,
+        "width": 92,
+        "height": 92
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-70",
+      "text": "",
+      "rect": {
+        "x": 731,
+        "y": 972,
+        "width": 14,
+        "height": 14
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-60",
+      "text": "",
+      "rect": {
+        "x": 774,
+        "y": 1077,
+        "width": 29,
+        "height": 29
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "center",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 943,
+        "y": 612,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 943,
+        "y": 700,
+        "width": 64,
+        "height": 48
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 943,
+        "y": 751,
+        "width": 64,
+        "height": 64
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 943,
+        "y": 818,
+        "width": 64,
+        "height": 80
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 943,
+        "y": 901,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1010,
+        "y": 612,
+        "width": 64,
+        "height": 48
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1010,
+        "y": 663,
+        "width": 64,
+        "height": 80
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1010,
+        "y": 746,
+        "width": 64,
+        "height": 64
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1010,
+        "y": 813,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1010,
+        "y": 901,
+        "width": 64,
+        "height": 48
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover opacity-80",
+      "text": "",
+      "rect": {
+        "x": 1172,
+        "y": 602,
+        "width": 33,
+        "height": 33
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1123,
+        "y": 737,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1123,
+        "y": 826,
+        "width": 64,
+        "height": 48
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1123,
+        "y": 877,
+        "width": 64,
+        "height": 64
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1123,
+        "y": 944,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1190,
+        "y": 737,
+        "width": 64,
+        "height": 80
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1190,
+        "y": 820,
+        "width": 64,
+        "height": 48
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1190,
+        "y": 871,
+        "width": 64,
+        "height": 85
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "h-full w-full object-cover",
+      "text": "",
+      "rect": {
+        "x": 1190,
+        "y": 960,
+        "width": 64,
+        "height": 64
+      },
+      "styles": {
+        "color": "rgba(0, 0, 0, 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Geist, \"Geist Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "img",
+      "id": "",
+      "classes": "",
+      "text": "",
+      "rect": {
+        "x": 76,
+        "y": 640,
+        "width": 16,
+        "height": 16
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "textarea",
+      "id": "",
+      "classes": "w-full resize-none bg-transparent text-foreground-primary outline-none",
+      "text": "",
+      "rect": {
+        "x": 980,
+        "y": 1185,
+        "width": 225,
+        "height": 64
+      },
+      "styles": {
+        "color": "rgb(255, 255, 255)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "12px",
+        "fontWeight": "400",
+        "lineHeight": "18px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "section",
+      "id": "what-you-can-do",
+      "classes": "mx-auto w-full max-w-4xl px-6 py-32",
+      "text": "Your product, your taste, real code.No mockups to rebuild, no creative limits.Th",
+      "rect": {
+        "x": 192,
+        "y": 1384,
+        "width": 896,
+        "height": 1379
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "128px 24px",
+        "margin": "0px 192px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "h2",
+      "id": "",
+      "classes": "text-3xl leading-[1.15] font-light tracking-[-0.035em] text-balance md:text-4xl",
+      "text": "Your product, your taste, real code.No mockups to rebuild, no creative limits.",
+      "rect": {
+        "x": 216,
+        "y": 1512,
+        "width": 848,
+        "height": 83
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "36px",
+        "fontWeight": "300",
+        "lineHeight": "41.4px",
+        "display": "block",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    },
+    {
+      "tag": "ul",
+      "id": "",
+      "classes": "mt-16 grid grid-cols-2 gap-x-6 gap-y-10 sm:mt-24 sm:gap-x-16 sm:gap-y-16 md:gap-y-20",
+      "text": "The canvas is the appEvery frame is a working page, not a picture of one. What y",
+      "rect": {
+        "x": 216,
+        "y": 1691,
+        "width": 848,
+        "height": 944
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "grid",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "96px 0px 0px",
+        "borderRadius": "0px",
+        "gap": "80px 64px"
+      }
+    },
+    {
+      "tag": "li",
+      "id": "",
+      "classes": "",
+      "text": "The canvas is the appEvery frame is a working page, not a picture of one. What y",
+      "rect": {
+        "x": 216,
+        "y": 1691,
+        "width": 392,
+        "height": 120
+      },
+      "styles": {
+        "color": "lab(98.26 0 0)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "fontFamily": "Inter, \"Inter Fallback\"",
+        "fontSize": "16px",
+        "fontWeight": "400",
+        "lineHeight": "24px",
+        "display": "list-item",
+        "position": "static",
+        "textAlign": "start",
+        "padding": "0px",
+        "margin": "0px",
+        "borderRadius": "0px",
+        "gap": "normal"
+      }
+    }
+  ]
+}

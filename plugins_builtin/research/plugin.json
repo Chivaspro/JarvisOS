@@ -1,0 +1,28 @@
+{
+  "id": "research",
+  "name": "research",
+  "description": "Research a topic across the web, news and YouTube. Every line is a real source returned by a real backend (Agent Reach or the built-in search); results carry their links and channels, and a licensing caveat is stated when YouTube media is involved. Nothing is invented.",
+  "icon": "🔎",
+  "version": "1.0.0",
+  "category": "research",
+  "builtin": true,
+  "permissions": ["network"],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "query": {"type": "STRING", "description": "What to research."},
+      "platform": {"type": "STRING", "description": "web (default), news or youtube."},
+      "max_results": {"type": "INTEGER", "description": "How many sources to return."}
+    },
+    "required": ["query"]
+  },
+  "settings": [
+    {"key": "max_results", "label": "Maximum sources", "type": "int", "default": 6, "min": 1, "max": 25,
+     "help": "How many sources to return per run."},
+    {"key": "include_youtube", "label": "Include YouTube results", "type": "bool", "default": true,
+     "help": "Search YouTube alongside the web when the platform is not specified."},
+    {"key": "licensing_note", "label": "State the media licensing caveat", "type": "bool", "default": true, "advanced": true,
+     "help": "Adds a reminder that linked media belongs to its owner and reuse needs a licence."}
+  ],
+  "limits": {"max_calls_per_minute": 20, "timeout_seconds": 150, "max_results": 25}
+}

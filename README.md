@@ -27,15 +27,26 @@ Capabilities that exist in the source today (not aspirational):
 | Files | Read/search/organise files, documents (Excel/PDF/Word) | `actions/`, `documents/` |
 | Web research | Grounded Gemini search with a DuckDuckGo fallback and honest failure reporting | `actions/web_search.py` |
 | Browser / PC control | Playwright browser actions and Windows UI automation (opt-in) | `capabilities/`, `coding/` |
+| Reverse engineering | Capture a site you own or are authorized to examine (DOM, styles, screenshot, HAR), list the API surface its traffic revealed, synthesise a clean verified remake, or copy an app folder's sources into a readable tree — always behind the user's explicit authorization and an audit log | `capabilities/reverse_engineer.py` |
 | Coding agents | Generated projects built in an isolated folder + venv; code helpers | `actions/dev_agent.py`, `actions/code_helper.py` |
 | Automation engines | Agent TARS (Node) and MCP servers over stdio | `capabilities/`, `mcp_host/` |
 | Connectors | One route to external apps via Composio sessions | `connectors/` |
+| Knowledge library | Local document library: MarkItDown or stdlib conversion + SQLite FTS5 search with title/heading citations; source files are never modified | `knowledge/library.py` |
+| Meeting notes | Local system-audio + microphone capture, local faster-whisper transcript, Markdown notes and summaries | `capabilities/meeting_notes.py` |
+| Home Assistant | Native control of your own instance — lights, switches, fans, booleans, scenes and confirmation-gated scripts | `capabilities/home_assistant.py` |
+| GitHub (read-only) | Notifications, issues, PRs, checks and search over GET-only REST; every GitHub write stays with Composio | `capabilities/github.py` |
 | Memory | Local memory + an optional Obsidian vault | `memory/`, `Jarvis Obsidian Vault/` |
 | Tasks | Task engine with approval questions and a progress panel | `brain/task_engine.py`, `ui_task_panel.py` |
 | Diagnostics | Health/feature probes and a redacted diagnostic export | `observability/`, `capabilities/health.py` |
 
 Everything destructive or account-affecting is gated behind a permission switch
 **and** a confirmation prompt.
+
+Optional extras stay optional: `markitdown[pdf,docx,xlsx,pptx]` for PDF/Office
+conversion in the library, `PyAudioWPatch` (system audio) and `faster-whisper`
+(local transcription) for meeting notes. They are offered from Settings ▸
+Dependencies; when one is missing the feature names the package and the exact
+`pip install` command instead of failing silently.
 
 ---
 
@@ -152,6 +163,13 @@ Never paste a real key into an issue, a log, or a test.
 Selection order: environment variable → `config/api_keys.json`. Diagnostics and
 logs redact every credential-shaped field (`config.settings.redact_secrets`).
 
+Optional first-party links read a few more fields from the same file:
+`github_token` (a fine-grained, read-only token) and `github_api_url`;
+`home_assistant_url`, `home_assistant_token` and `home_assistant_verify_tls`.
+The library and meeting notes need no account at all — the local transcription
+model is chosen with `meeting_notes_model` (`base` by default). Every one of
+these appears in Settings ▸ API with its GET API KEY page and TEST button.
+
 ---
 
 ## Feature switches
@@ -162,8 +180,16 @@ authorise a desktop, terminal, file, camera or account action.
 
 * Toggle them in **Settings ▸ Permissions**; defaults live in `FEATURE_DEFAULTS`
   in `config/settings.py`.
+* The four first-party additions each have their own switch: **Knowledge
+  library**, **Home Assistant** and **GitHub (read-only)** default **on** (each
+  is inert until pointed at a file/folder, a URL/token or a token), and
+  **Meeting notes** defaults **off** — every start confirms on the HUD, and
+  `stop`/`status` keep answering even if the switch is turned off mid-meeting.
+  Library `ingest` additionally requires **File control**, because it reads
+  files.
 * High-impact actions additionally show a confirmation card (e.g. coding tasks,
-  file writes, posts/messages, process termination).
+  file writes, posts/messages, process termination, meeting start/delete and
+  Home Assistant scripts).
 * Coding/agent work is separate: **Settings ▸ AI** picks models, and generated
   projects are written to `%USERPROFILE%\Desktop\JarvisProjects\<name>` in their
   own virtual environment.
@@ -174,6 +200,20 @@ authorise a desktop, terminal, file, camera or account action.
 
 * **Local-first storage.** Memory, logs, config and the optional Obsidian vault
   live under `data/`, `config/`, `memory/` and `Jarvis Obsidian Vault/`.
+* **Meeting audio and the document library never leave the machine.** Meeting
+  recordings are written to `data/meetings/<id>` and transcribed locally; only
+  when you ask for a summary does the transcript *text* go to the active AI
+  model — the audio does not. The library indexes files under `data/library/`
+  and only the passages retrieved enter the conversation; source files are never
+  renamed, rewritten or deleted.
+* **The GitHub link is GET-only.** It cannot comment, merge, close, label or
+  push; the model is told so, and those operations stay with the Composio
+  connector.
+* **Home Assistant control is a fixed allowlist.** Lights, switches, fans, input
+  booleans, scenes and scripts only; locks, alarms, cameras and covers are
+  refused by name, there is no arbitrary service call, every command is read
+  back from the instance before success is claimed, and `run_script` confirms on
+  the HUD first.
 * **What leaves the machine (only when the matching feature is on):** live audio
   and, for vision features, screen frames/images are sent to Google Gemini; web
   research queries go to Gemini/DuckDuckGo; connector actions go through
@@ -263,10 +303,9 @@ build green — document why if an assertion is genuinely wrong.
 ## Roadmap (not shipped)
 
 Larger ideas that are explicitly **not** in this build: adopting async
-(NON_BLOCKING) Live tool calling, a permissioned read-only GitHub toolset, a
-workflow-automation builder, per-server MCP governance, a user-facing memory
-browser with retention controls, a local-only/cloud-disabled mode, and an
-opt-in redacted telemetry pipeline.
+(NON_BLOCKING) Live tool calling, a workflow-automation builder, per-server MCP
+governance, a user-facing memory browser with retention controls, a
+local-only/cloud-disabled mode, and an opt-in redacted telemetry pipeline.
 
 ---
 

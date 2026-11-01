@@ -83,7 +83,14 @@ def test_the_ready_strip_says_what_is_set_and_what_is_missing(settings):
     # A blank required key is named rather than hidden.
     assert "Gemini" not in text or "required" not in text  # gemini is set here
     ready, blockers, notes = settings._ready_summary()
-    assert ready + blockers == len(settings._key_rows)
+    # Every row is in exactly one bucket. A row whose service switch is off
+    # (meeting notes ships switched off) is "disabled", deliberately neither a
+    # credential set nor a blocker: switching the feature off must not leave a
+    # permanent "1 still needed" nag, and switching it on must.
+    from services import hub
+    states = hub.status_targets(settings._hub_config())
+    disabled = sum(1 for row in states if row.get("state") == "disabled")
+    assert ready + blockers + disabled == len(settings._key_rows)
     assert blockers == len(notes) or blockers > 4
 
 

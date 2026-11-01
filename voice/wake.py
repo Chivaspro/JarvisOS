@@ -136,14 +136,24 @@ class WakeState(StrEnum):
 
 
 def _rms(samples) -> float:
-    """Root-mean-square of an int16 PCM block (0..32767)."""
+    """Root-mean-square of an int16 PCM block (0..32767).
+
+    Runs per mic block on the PortAudio callback thread: the native backend
+    (``core.native``) computes it in one Rust pass straight over the bytes,
+    with the identical numpy formula and then the pure-Python loop as
+    fallbacks. All three paths return the same figure.
+    """
     try:
         import numpy as np
 
-        x = np.frombuffer(samples, dtype=np.int16).astype(np.float32)
-        if x.size == 0:
-            return 0.0
-        return float(math.sqrt(float(np.mean(x * x))))
+        try:
+            from core import native as _native
+            return float(_native.rms_auto(samples))
+        except Exception:
+            x = np.frombuffer(samples, dtype=np.int16).astype(np.float32)
+            if x.size == 0:
+                return 0.0
+            return float(math.sqrt(float(np.mean(x * x))))
     except Exception:
         if not samples:
             return 0.0

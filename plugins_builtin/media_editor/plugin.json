@@ -1,0 +1,36 @@
+{
+  "id": "media_editor",
+  "name": "media_editor",
+  "description": "Work with the media tools actually installed on this PC: list the editors that are present, open a file in one of them, or probe a clip's real streams and duration with ffprobe. The plugin is only offered when at least one editor exists, so it can never promise a tool this machine does not have.",
+  "icon": "🎞",
+  "version": "1.0.0",
+  "category": "media",
+  "builtin": true,
+  "permissions": ["filesystem", "desktop"],
+  "requires_any": ["ffmpeg", "davinci_resolve", "premiere", "after_effects",
+                   "photoshop", "gimp", "inkscape", "krita", "audacity",
+                   "blender", "obs", "vlc"],
+  "parameters": {
+    "type": "OBJECT",
+    "properties": {
+      "action": {"type": "STRING", "description": "editors | open | probe"},
+      "path": {"type": "STRING", "description": "Media file path (open/probe)."},
+      "editor": {"type": "STRING", "description": "Editor token to open with (optional)."}
+    },
+    "required": ["action"]
+  },
+  "settings": [
+    {"key": "default_editor", "label": "Preferred editor", "type": "choice", "default": "",
+     "choices": [["", "Auto-detect"],
+                 ["davinci_resolve", "DaVinci Resolve"], ["premiere", "Premiere Pro"],
+                 ["after_effects", "After Effects"], ["photoshop", "Photoshop"],
+                 ["gimp", "GIMP"], ["inkscape", "Inkscape"], ["krita", "Krita"],
+                 ["audacity", "Audacity"], ["blender", "Blender"], ["obs", "OBS Studio"],
+                 ["vlc", "VLC"]],
+     "help": "Which editor OPEN uses when the request does not name one."},
+    {"key": "ffprobe_timeout", "label": "Probe timeout (seconds)", "type": "int",
+     "default": 15, "min": 3, "max": 60, "advanced": true,
+     "help": "How long ffprobe may take on a large file."}
+  ],
+  "limits": {"max_calls_per_minute": 30, "timeout_seconds": 90, "max_results": 1}
+}

@@ -1,0 +1,12 @@
+{
+  "kind": "capture",
+  "target": "https://www.onlook.com/",
+  "at": 1793437965.3887908,
+  "at_iso": "2026-10-31T09:12:45.388798+00:00",
+  "tool": "reverse_engineer",
+  "domain": "www.onlook.com",
+  "capture_dir": "C:\\Users\\CHIV4S\\Documents\\JarvisOS Main\\data\\workspaces\\rea\\www.onlook.com\\20261031-171143\\capture",
+  "endpoints": 16,
+  "requests": 115,
+  "browser_detail": "Captured https://www.onlook.com/ \u2014 115 network record(s), DOM 2028095 chars, styles for 60 element(s) (the network did not go fully quiet before the capture)"
+}
